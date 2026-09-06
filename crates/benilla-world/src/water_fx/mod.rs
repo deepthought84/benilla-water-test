@@ -57,7 +57,7 @@
 //! avatar + streamed units, the record pool, and one additive effect-stream draw per
 //! (chunk, category) with live records (fog OFF — the reference's verified foam render state).
 
-mod params;
+pub(crate) mod params;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::entity::EntityHashMap;
@@ -416,6 +416,10 @@ fn drive_unit(
 #[allow(clippy::too_many_arguments)] // the emitter's real input set; the index ride-along tipped it
 fn emit_water_foam(
     time: Res<Time>,
+    // Optional: this module's own tests drive the emitter without the liquid plugin, and the
+    // absent resource means the same as its default — the reference look, where these decals ARE
+    // the wake.
+    style: Option<Res<crate::liquid::WaterStyle>>,
     materials: Option<Res<FoamAssets>>,
     mut foam: ResMut<WaterFoam>,
     viewer: Res<crate::view::Viewer>,
@@ -425,6 +429,19 @@ fn emit_water_foam(
     index: Res<WaterIndex>,
 ) {
     if materials.is_none() {
+        return;
+    }
+    // **The stylised look has its own wake and it is not painted.** These decals are the 1.12
+    // client's `CWater0Ripple` and they stay exactly as they are on the reference lane; under
+    // `waterStyle` Stylised the water is a live height field instead
+    // (`benilla_world::liquid::ripple_sim`), a swimmer is a moving source in it, and drawing a
+    // stencil of a wake on top of a wake would be two of them. Emission stops here rather than at
+    // the draw so the pool empties as well: the records already alive are left to age out, which
+    // is a second of fade rather than a frame of pop when the player flips the setting.
+    if style.is_some_and(|s| *s == crate::liquid::WaterStyle::Stylised) {
+        for uf in foam.units.values_mut() {
+            uf.active = false;
+        }
         return;
     }
     let now = time.elapsed_secs();
@@ -720,6 +737,79 @@ mod tests {
         assert!(
             live[0] >= SELF_SLOTS,
             "a streamed unit allocates from the other partition"
+        );
+    }
+
+    /// The stylised look silences these decals, because it has a real wave field instead
+    /// (`liquid::ripple_sim`) and two wakes on one swimmer is one too many. The fence matters
+    /// because the failure is invisible from the code: the emitter still runs, the pool still
+    /// exists, and the only symptom is a painted ring drawn over a simulated one.
+    #[test]
+    fn the_stylised_look_emits_no_painted_decals() {
+        let live = |style: Option<crate::liquid::WaterStyle>| {
+            let mut app = App::new();
+            app.init_resource::<Time>()
+                .init_resource::<WaterIndex>()
+                .init_resource::<WaterFoam>()
+                .init_resource::<crate::view::Viewer>()
+                .insert_resource(FoamAssets {
+                    ring: Handle::default(),
+                    wake: Handle::default(),
+                })
+                .add_systems(
+                    Update,
+                    (crate::liquid::maintain_water_index, emit_water_foam).chain(),
+                );
+            if let Some(style) = style {
+                app.insert_resource(style);
+            }
+            let mut positions = Vec::new();
+            for j in 0..3 {
+                for i in 0..3 {
+                    positions.push([i as f32 * 5.0, j as f32 * 5.0, 5.0]);
+                }
+            }
+            app.world_mut().spawn((
+                WaterChunkInfo::new(
+                    crate::liquid::LiquidSource::AdtChunk,
+                    benilla_formats::LiquidKind::Still,
+                    [3, 3],
+                    positions,
+                    vec![true; 4],
+                ),
+                FoamPatch,
+            ));
+            app.world_mut().spawn((
+                Transform::from_translation(wow_to_bevy([2.0, 2.0, 3.5])),
+                WorldUnit {
+                    wades: true,
+                    scale: 1.0,
+                    height: 2.0,
+                    bound: None,
+                },
+            ));
+            app.update();
+            app.world()
+                .resource::<WaterFoam>()
+                .pool
+                .iter()
+                .filter(|r| r.is_some())
+                .count()
+        };
+        assert_eq!(
+            live(Some(crate::liquid::WaterStyle::Reference)),
+            1,
+            "the reference look is what these decals ARE — they must still fire"
+        );
+        assert_eq!(
+            live(None),
+            1,
+            "no resource means the default, which is the reference look"
+        );
+        assert_eq!(
+            live(Some(crate::liquid::WaterStyle::Stylised)),
+            0,
+            "the stylised look draws its wake from the wave simulation, not from a stencil"
         );
     }
 

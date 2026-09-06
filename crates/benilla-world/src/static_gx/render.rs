@@ -96,17 +96,38 @@ pub(crate) struct GxCellDraw {
     pub sets: Vec<std::sync::Arc<[u16]>>,
 }
 
-/// Marks the ONE view the retained pass draws into — the world camera. Without this the node
-/// would run for EVERY Core3d view, including the portrait-booth bakes, and paint world cells
-/// into a portrait with the booth's view matrices (the cull list is the world camera's).
+/// Marks the views the retained pass draws into — the world camera, and the water's mirrored
+/// camera when the stylised look is on. Without this the node would run for EVERY Core3d view,
+/// including the portrait-booth bakes, and paint world cells into a portrait with the booth's view
+/// matrices (the cull list is the world camera's).
+///
+/// **The mirror draws the world camera's cull list**, which is an approximation and a knowing one:
+/// this lane's visibility is a CPU per-cell walk against ONE camera's frustum, farclip and exterior
+/// window ([`super::cull::cull_cells`]), and a second walk for the mirror would double that cost to
+/// fix the edges of a half-resolution image sampled through a rippling normal. What the mirror
+/// therefore misses is geometry the main view cannot see at all — a wall behind the camera that
+/// reflects toward it. What it gains is Stormwind: WMO group geometry lives entirely on this lane,
+/// so without the marker a city reflects its trees and its people and none of its buildings.
 #[derive(Component, Clone, Copy, Default, ExtractComponent)]
 pub(crate) struct StaticGxView;
 
-/// Insert the marker on the world camera (idempotent — the camera can respawn).
-fn mark_world_camera(
-    mut commands: Commands,
-    cam: Query<Entity, (With<crate::view::WorldCamera>, Without<StaticGxView>)>,
-) {
+/// The views that take the retained pass, before they have been marked: the world camera and the
+/// water's mirror.
+type UnmarkedPassViews<'w, 's> = Query<
+    'w,
+    's,
+    Entity,
+    (
+        Or<(
+            With<crate::view::WorldCamera>,
+            With<crate::liquid::ReflectionCamera>,
+        )>,
+        Without<StaticGxView>,
+    ),
+>;
+
+/// Insert the marker on the views that take the pass (idempotent — either camera can respawn).
+fn mark_world_camera(mut commands: Commands, cam: UnmarkedPassViews) {
     for e in &cam {
         commands.entity(e).insert(StaticGxView);
     }

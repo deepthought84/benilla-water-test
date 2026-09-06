@@ -86,10 +86,6 @@
 //!   through. The once-a-frame askers keep the plain walk.
 //! * [`surface`] — **the Bevy render glue.** The per-kind animated materials, the two spawn paths
 //!   (MCLQ and WMO MLIQ), the flat mesh build, and the 24 fps frame cycler.
-//! * [`drift`] — **the underwater drift cloud**: the 4000-mote field the reference draws while the
-//!   camera eye is inside a liquid (decision 1814). It is here rather than under `weather` because
-//!   the reference keeps it that way too — the pool is CWorld's, not the weather manager's, and
-//!   the two share no state and no code — and because [`Underwater`] is its whole trigger.
 //!
 //! The one cross-feed runs query → lighting: `detect_submersion` publishes WHICH liquid the eye is
 //! in, and `lighting::update_time_lighting` selects the whole submerged atmosphere from it.
@@ -104,6 +100,10 @@ mod drift;
 mod query;
 #[cfg(test)]
 mod real_data;
+mod reflect;
+mod depth;
+mod ripple;
+mod ripple_sim;
 mod spatial;
 mod surface; // the against-real-client-files tests — they span both halves
 
@@ -115,14 +115,79 @@ mod surface; // the against-real-client-files tests — they span both halves
 // the day something needs it". Decision 1652 is that day: the exterior-window cull counts liquid
 // apart from the rest of the scene, because a few dozen surfaces summed into tens of thousands of
 // terrain cells is a leg that could reach nothing at all and never show it.
+/// **Which water look the client draws** — the `waterStyle` CVar's knob, and the only setting in
+/// this subsystem that is a matter of taste rather than of fidelity.
+///
+/// [`WaterStyle::Reference`] is the default and is what every other line under `liquid/` is about:
+/// the 1.12 client's own combine, its swatch, its sheet, its opacity. [`WaterStyle::Stylised`] is
+/// benilla's own — an animated surface normal, a specular glitter path, a Fresnel sky mix and shore
+/// foam, ported from the `water-test` sandbox and described in `liquid.wgsl`'s `stylised_water`. It
+/// keeps the zone's colours, depth and lighting and changes only what is done with them, so it
+/// follows the world's day/night and its zones exactly as the faithful path does.
+///
+/// The switch is a **uniform write**, not a rebuild: [`surface::apply_water_style`] rewrites
+/// `path.y` on the handful of shared liquid materials when this resource changes, so a player
+/// flipping the dropdown pays one uniform upload and no reload.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaterStyle {
+    /// The 1.12 client's water, which is what the rest of this subsystem implements.
+    Reference,
+    /// benilla's own stylised water.
+    Stylised,
+}
+
+/// `$WOW_WATER_STYLE=1` boots into the stylised look — the A/B lever, in the mould of
+/// `$WOW_RENDER_SCALE` and `$WOW_CLUTTER_DENSITY`, and the only way to reach this look from the
+/// world viewer, which has no CVar host to read a config with. Session-only: `cvars` marks the row
+/// env-overridden so a comparison run cannot pin itself into `config.toml`.
+impl Default for WaterStyle {
+    fn default() -> Self {
+        match std::env::var("WOW_WATER_STYLE").as_deref() {
+            Ok("1") => Self::Stylised,
+            _ => Self::Reference,
+        }
+    }
+}
+
+impl WaterStyle {
+    /// The CVar's parse. Anything that is not the stylised lane reads as the reference — the same
+    /// posture `FollowStyle::from_cvar` takes, and the right one for a look: an unknown value must
+    /// land on what the client would draw with no setting at all, never on a dead surface.
+    pub fn from_cvar(v: f32) -> Self {
+        if v != 0.0 {
+            Self::Stylised
+        } else {
+            Self::Reference
+        }
+    }
+
+    /// What `GetCVar("waterStyle")` answers for this state.
+    pub fn cvar(self) -> &'static str {
+        match self {
+            Self::Reference => "0",
+            Self::Stylised => "1",
+        }
+    }
+
+    /// The shader lane (`LiquidParams.path.y`).
+    pub(crate) fn shader_flag(self) -> f32 {
+        match self {
+            Self::Reference => 0.0,
+            Self::Stylised => 1.0,
+        }
+    }
+}
+
 pub use query::{
     camera_claim, describe_at, liquid_at, player_claim, surfaces_at, unit_claim, water_surface_at,
     EyeLiquid, FoamPatch, LiquidClaim, LiquidHit, LiquidSource, RoomPlacements, SubmergedEye,
     Underwater, WaterChunkInfo, WmoPool,
 };
+pub(crate) use reflect::ReflectionCamera;
+pub use reflect::{UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER};
 pub(crate) use spatial::{maintain_water_index, WaterIndex};
 pub(crate) use surface::{
-    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface,
+    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WetLattice,
 };
 
 /// `WOW_FORCE_SUB=<frames>` — **hold the camera-eye verdict submerged for the first `<frames>`
@@ -179,6 +244,7 @@ impl Plugin for LiquidPlugin {
             .init_resource::<Underwater>()
             .init_resource::<SubmergedEye>()
             .init_resource::<WaterIndex>()
+            .init_resource::<WaterStyle>()
             // PreUpdate: surfaces stream in/out via Update-side commands, so the edge is visible
             // here the frame after — before any of that frame's consumers ask. A despawn's stale
             // entry in between self-filters at the consumer (`Query::get` misses).
@@ -195,6 +261,11 @@ impl Plugin for LiquidPlugin {
                     query::detect_submersion
                         .after(crate::wmo_portal::WmoPvsSet)
                         .in_set(SubmersionVerdict),
+                    // The look toggle: change-gated, so the steady state schedules nothing and a
+                    // flip touches the shared materials once. It runs on the frame the CVar lands
+                    // and on the first frame after startup, which is what carries a persisted
+                    // `waterStyle` from `config.toml` onto materials built before it was read.
+                    surface::apply_water_style.run_if(resource_changed::<WaterStyle>),
                 ),
             )
             // The surface-render kill-switch (see [`hide_liquid_surfaces`]) — inert without the env
@@ -228,5 +299,14 @@ impl Plugin for LiquidPlugin {
         // The underwater drift cloud — the one thing in this subsystem that RENDERS because the
         // eye is submerged, rather than answering where the liquid is (see the layout note above).
         drift::register(app);
+        // The stylised look's planar reflection — a whole subsystem of its own, and inert unless
+        // that look is selected.
+        reflect::register(app);
+        // ...and its wave simulation, which is the same story: a second subsystem, inert on the
+        // reference lane, where the client's own painted splash decals are the wake instead.
+        ripple_sim::register(app);
+        // ...and the scene depth it reads to know what is behind it, on the same terms: a second
+        // geometry pass, attached only while the stylised look is selected.
+        depth::register(app);
     }
 }

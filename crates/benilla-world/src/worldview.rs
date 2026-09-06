@@ -345,8 +345,35 @@ struct ViewCam {
     speed: f32,
 }
 
+/// A `"x,y,z"` env var in **WoW world coordinates**, or `None` if it is unset or unparseable.
+fn env_xyz(name: &str) -> Option<[f32; 3]> {
+    let raw = std::env::var(name).ok()?;
+    let n: Vec<f32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    match n[..] {
+        [x, y, z] => Some([x, y, z]),
+        _ => {
+            warn!("{name} must be `x,y,z` in WoW world coords (got {raw:?})");
+            None
+        }
+    }
+}
+
+/// Spawn the free-fly camera. [`view_start`] already honours `WOW_WORLDVIEW_AT`;
+/// `WOW_WORLDVIEW_LOOK=x,y,z` (optional) aims the eye at a second WoW-space point so capture
+/// cameras can be quoted verbatim — without it the camera stands off the start point and looks
+/// back, which is what frames the Abbey.
 fn spawn_view_camera(mut commands: Commands, msaa: Res<crate::view::MsaaSetting>) {
     let start = wow_to_bevy(view_start());
+    let (eye, target) = match env_xyz("WOW_WORLDVIEW_LOOK") {
+        Some(look) => (start, wow_to_bevy(look)),
+        None => (
+            start + Vec3::new(0.0, VIEW_START_HEIGHT, VIEW_START_HEIGHT),
+            start,
+        ),
+    };
     let far = crate::view::CAM_FAR;
     commands.spawn((
         Camera3d::default(),
@@ -361,8 +388,7 @@ fn spawn_view_camera(mut commands: Commands, msaa: Res<crate::view::MsaaSetting>
         Hdr,
         Tonemapping::None,
         crate::ffx_glow::FfxGlow::WORLD,
-        Transform::from_translation(start + Vec3::new(0.0, VIEW_START_HEIGHT, VIEW_START_HEIGHT))
-            .looking_at(start, Vec3::Y),
+        Transform::from_translation(eye).looking_at(target, Vec3::Y),
         ViewCam {
             yaw: 0.0,
             pitch: -0.5,

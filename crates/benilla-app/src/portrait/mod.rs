@@ -272,6 +272,15 @@ const _: () = assert!(
     PAPERDOLL_LAYER > PORTRAIT_LAYER_BASE + SLOTS.len() - 1,
     "booth layers must not overlap the per-slot portrait layers"
 );
+// The one layer index claimed OUTSIDE this ladder: the engine puts liquid surfaces on their own
+// layer so the stylised water's mirrored camera can leave them out
+// (`benilla_world::liquid::WATER_RENDER_LAYER`). It sits far above the ladder's head, and this is
+// the assert that keeps it there — a booth sharing water's layer would render the world's lakes
+// into a portrait and, worse, silently take water out of the reflection's exclusion.
+const _: () = assert!(
+    MINIMAP_COMPOSITE_LAYER < benilla_world::liquid::WATER_RENDER_LAYER,
+    "the booth ladder must stay clear of the liquid render layer"
+);
 /// The baked image is high-res (vs the ref's 64²) — the crisp modern look. Square; the UI quad
 /// shader cuts the inscribed circle at draw time (`ui_quad.wgsl`'s `circular`, the ref's stencil).
 const PORTRAIT_SIZE: u32 = 256;

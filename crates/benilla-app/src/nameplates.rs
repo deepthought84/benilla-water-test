@@ -56,6 +56,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use bevy::camera::visibility::RenderLayers;
 
 use benilla_protocol::EntityKind;
 use benilla_ui::script::{JustifyH, JustifyV, Outline};
@@ -638,7 +639,16 @@ pub(crate) fn drive_nameplates(
                     scale: Vec3::splat(scale),
                 };
                 let plate = commands
-                    .spawn((Mesh3d(mesh), MeshMaterial3d(material), place, NamePlate))
+                    .spawn((
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material),
+                        place,
+                        NamePlate,
+                        // Off layer 0, so the water's mirrored camera cannot draw it — a name is
+                        // attached to the viewer's eye and has no reflection
+                        // (`benilla_world::liquid::UNMIRRORED_RENDER_LAYER`).
+                        RenderLayers::layer(benilla_world::liquid::UNMIRRORED_RENDER_LAYER),
+                    ))
                     .id();
                 plates.live.insert(entity, (plate, lines, color));
             }

@@ -51,6 +51,30 @@ pub(super) struct FoamParams {
 /// — decision 0489); `depth` = surface − feet (yd, > 0 in water). `None` when the depth gate
 /// rejects: not in water, or dived deeper than ~2 body heights — surface swimming (rest depth
 /// ~0.75·h) stays well inside and emits.
+/// The reference's own **depth gate and its attenuation**, for consumers outside the decal pool.
+///
+/// `gate = max(2 × collisionHeight, 1.0)` (`[unit+0x297]`, ≈4.06 yd for a human — decision 0489),
+/// and past half of it everything ramps linearly toward ×0.5 before the gate cuts it. Returns the
+/// strength a disturbance at `depth` (surface − feet) carries, or `None` where the reference emits
+/// nothing at all: out of the water, or dived past about two body heights.
+///
+/// Published rather than restated because this project has been bitten by copied laws going stale
+/// (the same reason `pack_model_core_rows` is a function and not a comment): the stylised water's
+/// wave simulation asks the identical question — is this body ON the surface or under it — and an
+/// answer that drifted from the decals' would put a wake where the reference has none.
+pub(crate) fn depth_strength(height: f32, depth: f32) -> Option<f32> {
+    let gate = (2.0 * height).max(1.0);
+    if depth <= 0.0 || depth >= gate {
+        return None;
+    }
+    let half = gate * 0.5;
+    Some(if depth > half {
+        0.5 + 0.5 * (gate - depth) / half
+    } else {
+        1.0
+    })
+}
+
 pub(super) fn foam_params(
     state: WadeState,
     oneshot: bool,
@@ -230,6 +254,33 @@ mod tests {
             assert!((0.028..=0.036).contains(&w), "wake@cap {w}");
         }
         assert!(RING_INTERVAL.0 >= 0.4 && RING_INTERVAL.1 <= 0.45);
+    }
+
+    /// The published gate, which the stylised water's wave simulation now shares: a surface
+    /// swimmer disturbs the water and a diver does not, at the reference's own line.
+    #[test]
+    fn depth_strength_is_the_reference_gate() {
+        let h = 2.03; // a human's collision height; gate = 4.06 yd
+        assert_eq!(depth_strength(h, -0.1), None, "out of the water");
+        assert_eq!(depth_strength(h, 0.0), None, "exactly at the surface");
+        assert_eq!(
+            depth_strength(h, 1.52),
+            Some(1.0),
+            "a floating swimmer sits at full strength, well inside the gate"
+        );
+        assert_eq!(
+            depth_strength(h, 2.03),
+            Some(1.0),
+            "half the gate is the last depth carrying full strength"
+        );
+        let k = depth_strength(h, 3.0).expect("still inside the gate");
+        assert!((0.5..1.0).contains(&k), "past half it ramps toward a half: {k}");
+        assert_eq!(depth_strength(h, 4.06), None, "a dive past two body heights");
+        // A short unit's gate FLOORS at one yard rather than following 2·h down to nothing, so a
+        // critter in ankle-deep water still disturbs it (attenuated — 0.9 is most of its gate)
+        // while anything past the floor is under.
+        assert!(depth_strength(0.2, 0.9).is_some_and(|k| k < 1.0));
+        assert_eq!(depth_strength(0.2, 1.1), None);
     }
 
     /// The depth gate and its attenuation: reject outside (0, radius2), attenuate past half.

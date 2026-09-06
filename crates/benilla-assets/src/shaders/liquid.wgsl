@@ -92,12 +92,57 @@
 #import bevy_pbr::{
     mesh_functions,
     forward_io::Vertex,
-    view_transformations::position_world_to_clip,
+    view_transformations::{position_world_to_clip, frag_coord_to_uv, depth_ndc_to_view_z},
     mesh_view_bindings::{view, globals},
 }
+#ifdef DEPTH_PREPASS
+// The opaque scene's depth, written before anything transparent draws — what is BEHIND the water.
+// Present only while the stylised look is on; see `benilla_world::liquid::depth`.
+#import bevy_pbr::prepass_utils::prepass_depth
+#endif
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var frames: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var frames_samp: sampler;
+// The STYLISED look's ripple map (see `stylised_water` at the bottom of this file, and
+// `benilla_world::liquid::ripple`): R/G = a tiling slope field, B = the height it came from.
+// Bound always, sampled only under `w.path.y`.
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var ripples: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var ripples_samp: sampler;
+// The stylised look's PLANAR REFLECTION: the world as a camera mirrored through the water plane
+// saw it (`benilla_world::liquid::reflect`), with **alpha as coverage**.
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var reflection_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var reflection_samp: sampler;
+
+// The live wave field (`benilla_world::liquid::ripple_sim`) — a window of simulated water carried
+// along with the viewer. R/G = surface slope, B = the foam the disturbance has whipped up.
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var wake_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(109) var wake_samp: sampler;
+
+struct WaterReflect {
+    // x = the mirror plane's world Y; y = strength (0 = no reflection this frame — the look is off,
+    // no water is near, or the eye is under the surface); z = UV distortion; w = the plane
+    // tolerance a surface must be within to take the image.
+    params: vec4<f32>,
+    // The sun the PLAYER CAN SEE, which is not `wow_light.light_sun`: xyz = the celestial to-sun
+    // direction, w = how much of it gets through (horizon x clouds x terrain — the lens flare's own
+    // envelope, republished as `benilla_world::sun::SunVisibility`). Written every frame, including
+    // the frames the mirror above is off.
+    sun: vec4<f32>,
+    // The sky dome's own gradient stops, zenith and horizon (`WowLighting.sky` rows 0 and 4) — the
+    // colours the dome overhead is actually drawn with, so the water agrees with the sky above it
+    // at every hour and in every zone. `w` unused on both.
+    sky_zenith: vec4<f32>,
+    sky_horizon: vec4<f32>,
+    // The wave simulation's window: xy = its lower corner in world XZ yards, z = one over its side
+    // length, w = strength — 0 on the reference lane, where the client's own painted splash decals
+    // are the wake instead of this.
+    sim: vec4<f32>,
+    // The white moon, the same pair as `sun`: xyz = the to-moon direction, w = how much of it gets
+    // through. Water reflects moonlight as readily as sunlight and the first pass had it reflecting
+    // none.
+    moon: vec4<f32>,
+};
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var<storage, read> water_reflect: WaterReflect;
 
 struct LiquidParams {
     // x = fullbright (magma/slime); y = ocean swatch; z = interior fog; w = sun-sheen shininess.
@@ -149,12 +194,20 @@ struct LiquidVsOut {
     // colour — the reference's own interior water vertex carries a colour dword for exactly this.
     // White on every other lane (and on any mesh with no colour attribute), where nothing reads it.
     @location(5) vcolor: vec4<f32>,
+    /// Distance from this vertex to the waterline in yards, for the shore foam. Packed into UV1.y
+    /// by the mesh builder; see the foam block in `stylised_water`.
+    @location(6) shore: f32,
+    /// Offset from this fragment to the nearest point on the waterline, world XZ yards. Its LENGTH
+    /// is the distance the foam band is drawn from — taken here rather than interpolated, because
+    /// distance to a curve has a crease along the curve and an interpolated crease is a wrong
+    /// crease. See `benilla_assets::materials::ATTRIBUTE_WOW_SHORE_OFFSET`.
+    @location(7) shore_offset: vec2<f32>,
     // The per-frame INTERIOR FOG lane for this surface's own room (decision 1787): the client's
     // `[0xca7f00]`, which gates the WMO liquid pass's block-2 submit (`0x6b6323`–`0x6b6342`)
     // exactly as it gates the geometry pass — so a pool and the walls around it can never
     // disagree about which fog they wear. Carried on `MeshTag` bit 30, read once in the vertex
     // stage and flat-interpolated (the whole surface is one instance).
-    @location(6) @interpolate(flat) room_fog: u32,
+    @location(8) @interpolate(flat) room_fog: u32,
 }
 
 // Sun sheen (`secondary`): a Blinn highlight of the sun on the flat water surface — the glint that's
@@ -263,8 +316,682 @@ fn apply_fog(rgb: vec3<f32>, world_pos: vec3<f32>, room_fog: u32) -> vec3<f32> {
     return mix(fog_color.xyz, rgb, factor);
 }
 
+// ── The stylised look (`waterStyle` = 1) ────────────────────────────────────────────────────────
+//
+// **Not the reference, and it does not pretend to be.** Everything above this line reproduces what
+// 1.12 draws; this is an alternative the player picks in Options → Graphics → Water Style, ported
+// from the `water-test` sandbox's "Basic" preset. It replaces the *treatment* of the surface, not
+// the world's own water data: the zone's `Light.dbc` swatch still supplies both colours, the same
+// depth `V` still drives colour and opacity, the same lighting, the same fog — every input the
+// world already decides is kept, and only what is done with them changes.
+//
+// What it does that `ocean0_s.bls` does not:
+//
+//   * **An animated surface normal.** Three layers of the generated slope map at unrelated scales
+//     and drift directions. Three rather than two matters: two scrolling copies of one texture beat
+//     against each other at a visible period, and a third at an unrelated scale hides it.
+//   * **A real specular off that normal.** The reference's `secondary` is a Blinn highlight on a
+//     FLAT plane, so it is a broad wash that the ripple *alpha* modulates. Here the ripples are in
+//     the normal itself, so the same highlight breaks into a glitter path — which is what actually
+//     reads as water in motion.
+//   * **A Fresnel sky mix.** Water reflects almost nothing looking straight down and almost
+//     everything at a glancing angle, and that ramp is most of why a lake reads as a lake. There is
+//     no environment map on this path, so the sky is stood in for by the scene fog colour — which
+//     is the horizon's colour, tracks the zone and the clock, and is already on this buffer.
+//   * **Shore foam.** The depth ramp the reference uses for colour doubles as a shoreline: a band
+//     that concentrates at the waterline, broken up at two scales by the map's height channel so it
+//     reads as surf gathering rather than as an outline drawn around the water.
+//
+// The wavelengths are in YARDS of world space (the sandbox's metres, taken across at face value —
+// the two units differ by less than a ripple).
+
+/// How far out from the waterline the solid part of the line reaches, in yards. Thin on purpose:
+/// this is a line drawn where the water meets the land, not a surf zone.
+const FOAM_LINE_YARDS: f32 = 0.15;
+
+/// How white the line gets at its strongest. Under 1 so the water's own colour still shows through
+/// even at the very edge — the line is meant to be read as foam lying ON water, and a fully opaque
+/// white one reads as a stroke drawn around the lake in a paint program.
+const FOAM_LINE_LEVEL: f32 = 0.50;
+
+/// How much the line's own width wavers along the shore, as a fraction of that width. Small — the
+/// line wants to read as an even edge, and the broken-up look belongs to the bubbles behind it, not
+/// to the line itself.
+const FOAM_EDGE_WARP: f32 = 0.22;
+
+/// How far past the line the bubbles carry before there is only water, in yards.
+const FOAM_BUBBLE_YARDS: f32 = 0.62;
+
+/// **The swell** — how far the waterline runs up and back down the shore, in yards, and how long
+/// one breath of it takes, in seconds.
+///
+/// The band was fixed in world space, which is the one thing a shoreline never is: the water's edge
+/// is the most obviously *still* part of a frame that is otherwise moving. Advancing and retreating
+/// the whole band along its own gradient costs nothing — it is the same distance field, read at a
+/// moving threshold — and it is what makes a coast read as tidal rather than painted on.
+///
+/// Deliberately small against the band's own width: this is a swell lapping, not a tide coming in.
+const TAU: f32 = 6.2831855;
+const SHORE_RUNUP_YARDS: f32 = 0.16;
+const SHORE_SWELL_SECS: f32 = 5.5;
+
+/// How far apart two stretches of coast are before they breathe out of step, in yards. Without this
+/// every shoreline on the map advances and retreats in unison, which reads as the whole world
+/// pulsing rather than as water; a slow phase drift along the coast makes each bay its own.
+const SHORE_SWELL_SPREAD: f32 = 70.0;
+
+/// How bright the bubbles are against the solid line.
+const FOAM_BUBBLE_LEVEL: f32 = 0.30;
+
+/// The foam's own colour — spray, so near-white with the faintest cool cast.
+const FOAM_COLOR: vec3<f32> = vec3<f32>(0.88, 0.94, 0.96);
+
+/// How reflective the water is allowed to get at a grazing angle. Below Schlick's 1.0 on purpose —
+/// see its use.
+const REFLECT_MAX: f32 = 0.44;
+
+/// The specular lobe's exponent and weight — **the water's roughness, in the only two numbers this
+/// shader has for it.**
+///
+/// These were 160 and 0.55, and together with a near-mirror reflection they are what made the
+/// surface read as "someone poured oil into the water": a very tight lobe is a very smooth surface,
+/// and a smooth surface returns the sun as a small hard disc sitting *on* the water rather than a
+/// sheen scattered through it. Oil is smoother than water; that is the whole difference, and it is
+/// this exponent.
+///
+/// Broadened and dialled back, the highlight spreads into the ripples instead of sliding over them.
+/// A microfacet model would derive both from one roughness and from the same normal distribution
+/// the reflection uses; this is the stylised path, so it is two numbers and an eye.
+///
+/// Broadened again, from 42/0.30, against the "oily" report: at 42 the lobe still resolved into
+/// hard bright chips on the ripple crests, and a hard chip on a smooth crest is exactly the read of
+/// a film on the surface rather than light coming off the water. The other half of that report is
+/// answered by the reflection ceiling above and by the finest ripple layer's weight below — a
+/// surface looks oily when it is smooth, mirror-like and finely crinkled all at once, and all three
+/// had to come down together.
+/// How hard the ambient ripples tilt the surface — see the normal's construction.
+const NORMAL_STRENGTH: f32 = 1.35;
+
+const SPEC_POWER: f32 = 24.0;
+const SPEC_WEIGHT: f32 = 0.22;
+
+/// The moon's own glitter, relative to the sun's. Moonlight IS sunlight at about a millionth the
+/// intensity, but it lands on a scene lit at a millionth too — what actually differs on screen is
+/// that the eye is scotopic, so the path reads dimmer, cooler and softer-edged than the sun's, and
+/// that is what these three do.
+const MOON_SPEC_WEIGHT: f32 = 0.55;
+const MOON_SPEC_POWER: f32 = 34.0;
+const MOON_SPEC_COLOR: vec3<f32> = vec3<f32>(0.62, 0.70, 0.86);
+
+/// How far along the swatch's shallow→deep ramp the body is allowed to travel.
+///
+/// Under 1 on purpose. The 1.12 water palettes were authored for a surface with no reflection and
+/// no glitter on it, and several zones' deep row is nearly black — Stranglethorn's is why the
+/// report named Booty Bay. Multiplied by `lit` and then fogged, that row reads as tar rather than
+/// as deep water. Capping the ramp keeps the lift inside the ZONE'S OWN pair of colours: deep water
+/// is still the deep end of Booty Bay's green, one step back up its own ramp, and never a wash of
+/// grey mixed in from outside the palette.
+const BODY_DEPTH_MAX: f32 = 0.72;
+
+/// How hard the ripples are carved into the water's own body, as a ± fraction of its colour.
+///
+/// The body is otherwise a constant, and a constant is exactly what you see when you look STEEPLY
+/// down at water close to you: Fresnel goes to nothing at that angle, so the sky mix and the
+/// mirrored image both fall away and the swatch is all that is left — a flat sheet of paint under a
+/// surface that is visibly moving everywhere else in the frame. That is the near half of "not
+/// enough activity in the water"; the far half is the long swell and the sky gradient.
+///
+/// The tilt is measured along the **sun's compass bearing**, which is fixed all day, rather than
+/// along the sun vector itself: at noon the sun is nearly overhead, every facet faces it about
+/// equally, and a term built on the full vector would go flat at exactly midday. Taken this way the
+/// shading is zero on flat water — it darkens one face of each wave and lightens the other by the
+/// same amount, so it carves the surface without changing the zone's colour.
+const BODY_RIPPLE_SHADE: f32 = 0.20;
+
+/// How far in from the wave window's edge the simulation is faded out, as a fraction of its side.
+/// It matches the absorbing band on the CPU (`ripple_sim::EDGE_ABSORB`), so a wave is already down
+/// to nothing by the time this has finished hiding it — the two together are what keep the window
+/// from having a visible square edge in the water.
+/// How near the waterline the exact per-fragment distance is used instead of the interpolated
+/// scalar, in yards, and how far the two may disagree before the scalar is trusted instead. The
+/// reach is comfortably past everything the band draws; the trust bound is what keeps a channel's
+/// midline ridge from producing a false line. See the use.
+/// Over how many yards of water column the surface fades out where something passes through it.
+///
+/// Without it every rock, pier and hull meets the water on a hard aliased line, because the water's
+/// alpha knows nothing about what is behind it; with it the surface closes around the intersection
+/// the way real water does. It is the cheapest thing depth buys and probably the most visible.
+///
+/// **Short on purpose.** This is a fade against an INTERSECTION, not a model of shallow water. At
+/// half a yard it stopped being one: a knee-deep lagoon went transparent across its whole floor,
+/// because a shallow bar seen at a grazing angle covers a great deal of screen, and the result was
+/// a flat pale plateau rather than water. A hand's breadth closes the seam at a rock and leaves
+/// water that is merely shallow looking like water.
+const SOFT_EDGE_YARDS: f32 = 0.22;
+
+/// **Beer–Lambert extinction per yard of water, per channel.** Red is gone within a couple of
+/// yards, green carries further, blue furthest — which is the whole reason deep water is blue and
+/// why a two-colour lerp of the zone swatch could never look like water at any depth but the one it
+/// was tuned at.
+///
+/// The palette is still the zone's: these decide how fast the shallow row gives way to the deep
+/// one, not what either colour is. What changes is that the answer now comes from the real distance
+/// through the water rather than from the authored depth byte, so a hull sitting in six inches of it
+/// reads as six inches.
+const WATER_EXTINCTION: vec3<f32> = vec3<f32>(0.46, 0.16, 0.09);
+
+/// How deep the water is allowed to count as, in yards, when the scene behind it is further away
+/// than the far plane's honest answer — sky through a gap, or an unloaded chunk. Without a cap a
+/// missing background reads as infinitely deep water and the shallows go black at tile edges.
+const WATER_MAX_THICKNESS: f32 = 24.0;
+
+const SHORE_EXACT_REACH: f32 = 3.0;
+const SHORE_EXACT_TRUST: f32 = 0.75;
+
+const WAKE_EDGE_FADE: f32 = 0.08;
+
+/// How white a simulated wake's crest goes. Below the shoreline foam's own level: a wake is
+/// aerated water, a breaking waterline is foam sitting on top of it.
+const WAKE_FOAM_LEVEL: f32 = 0.14;
+
+/// The wake slope at which foam starts, and how fast it arrives after that.
+///
+/// The floor is high and the level low because the reference is much subtler than it first seems:
+/// in the 1.14.2 footage a swimmer's trail is almost entirely a TONAL streak — the water simply a
+/// shade different along the track — with white only in a fleck at the body itself. Most of what
+/// reads as a wake there is not foam at all, which is why the body-depth term below carries the
+/// trail and this only tips the crest nearest the swimmer. Derived from the SLOPE
+/// rather than carried in its own channel: a surface only aerates where it is steep, the slope is
+/// the quantity with the range to say so (the curvature this first used peaks twenty times smaller
+/// than the height and vanished into the bottom of a byte), and taking it from the same two
+/// channels that bend the normal means the white always lands on the face the light does.
+const WAKE_FOAM_FLOOR: f32 = 0.80;
+const WAKE_FOAM_GAIN: f32 = 2.6;
+
+/// How far the wake's own height moves the body along the depth ramp. A trough is less water
+/// between the eye and the bed and a crest is more, and reading it that way is what puts a wake on
+/// screen when you are looking STEEPLY DOWN at it — the angle at which Fresnel is nothing, the sky
+/// mix and the reflection are gone, and the body colour is the only term left.
+const WAKE_BODY_DEPTH: f32 = 0.22;
+/// One octave of the wave slope, read off the tiling map on its **own rotated lattice**.
+///
+/// `rot` is `(cos, sin)` of the angle this layer's world plane is turned through before the lookup.
+/// Without it every layer reads the same 256-texel tile on the same axes, so their seams land on
+/// top of each other and the sum repeats on that one grid — a twelve-yard chequer that walks across
+/// open water and was the "the noise is repeating" report. Turned against each other by angles that
+/// share no common fraction of a turn, the layers' periods no longer line up and the sum has no
+/// visible period at all.
+///
+/// The gradient comes back out of the rotated frame at the end. Skipping that is the trap: the map
+/// holds a slope, and a slope sampled in a turned frame is a slope *in that frame*, so leaving it
+/// there would light every wave as though its crests ran at an angle to the wave itself.
+fn ripple_layer(
+    world_xz: vec2<f32>,
+    drift: vec2<f32>,
+    inv_wavelength: f32,
+    weight: f32,
+    t: f32,
+    rot: vec2<f32>,
+) -> vec2<f32> {
+    let r = mat2x2<f32>(rot.x, -rot.y, rot.y, rot.x);
+    let uv = (r * world_xz) * inv_wavelength + drift * t;
+    let g = (textureSample(ripples, ripples_samp, uv).rg * 2.0 - 1.0) * weight;
+    return transpose(r) * g;
+}
+
+/// The sky a surface facing `dir` reflects, off the dome's own zenith→horizon gradient.
+///
+/// **This is what makes a wave visible when the sun is not behind it.** Mixing the reflection
+/// toward one flat colour — which is what the scene fog was standing in for — cannot show a ripple:
+/// at the grazing angles you look at water from, a tilted facet and a flat one both have Fresnel
+/// near 1, so both come back the same colour and the whole surface reads as a sheet of glass except
+/// along the sun's own glitter path. Reflecting the view ray and reading the sky at the reflected
+/// ray's ELEVATION gives every facet a different colour instead: a wave's near face looks at the
+/// horizon and its far face at the zenith, and those two are as far apart as the sky is.
+///
+/// It is also what carries the distance. Out toward the horizon the fine ripples have mipped away
+/// by design (they would otherwise moiré) and only the long swell is left — and a long swell tilts
+/// the surface by very little, which is invisible under a flat sky mix and plainly visible under a
+/// gradient.
+///
+/// `sqrt` on the blend because the dome's own gradient is weighted toward its horizon stop, and a
+/// linear ramp put the horizon colour only in the last few degrees above it.
+fn sky_reflection(dir: vec3<f32>) -> vec3<f32> {
+    let t = sqrt(saturate(dir.y));
+    return mix(water_reflect.sky_horizon.rgb, water_reflect.sky_zenith.rgb, t);
+}
+
+/// Foam noise that does not repeat.
+///
+/// The ripple map is one 256-texel tile and the shader reads it in world yards, so a single tap of
+/// it at the bubbles' own scale repeats about every ten inches — close enough together to read as a
+/// printed pattern stamped along the shore rather than as foam, which is what the report meant by
+/// "the noise is repeating". Three things break it, and it takes all three:
+///
+/// * **Two taps at scales with no common multiple**, so neither one's period is the pair's.
+/// * **On lattices rotated against each other**, so their seams cross instead of stacking.
+/// * **Domain-warped** by a third, much coarser tap: the lookups are displaced by a field that
+///   itself varies over tens of yards, so what repeats is only the field being used to displace
+///   itself. This is the one that does most of the work — a warp of a third of a tile moves the
+///   repeat further than the eye can carry it.
+fn foam_noise(p: vec2<f32>, t: f32) -> f32 {
+    // cos/sin of ~33.9 degrees — a turn that is not a neat fraction of one.
+    let rot = vec2<f32>(0.8305, 0.5570);
+    let r = mat2x2<f32>(rot.x, -rot.y, rot.y, rot.x);
+    let warp = textureSample(ripples, ripples_samp, p * 0.031 + vec2<f32>(0.004, -0.003) * t).rg
+        * 2.0
+        - 1.0;
+    let a = textureSample(
+        ripples,
+        ripples_samp,
+        p * 0.83 + warp * 0.35 + vec2<f32>(0.010, 0.014) * t,
+    ).b;
+    let b = textureSample(
+        ripples,
+        ripples_samp,
+        (r * p) * 1.97 + warp * 0.20 + vec2<f32>(-0.021, 0.008) * t,
+    ).b;
+    return a * 0.55 + b * 0.45;
+}
+
+fn stylised_water(
+    world_pos: vec3<f32>,
+    frag_coord: vec2<f32>,
+    // Yards of water between this fragment and whatever opaque surface is behind it, or a negative
+    // number where the scene depth is unavailable (the reference lane, no prepass) — in which case
+    // every term below falls back to the authored depth byte, exactly as it did before.
+    thickness: f32,
+    depth: f32,
+    shore: f32,
+    shore_offset: vec2<f32>,
+    shallow: vec4<f32>,
+    deep: vec4<f32>,
+    lit: vec3<f32>,
+    room_fog: u32,
+) -> vec4<f32> {
+    let t = anim_time();
+    let xz = world_pos.xz;
+    // One tile every 12 yd at scale 1; the three layers run at 3.4x, 1x and 0.3x of it.
+    let inv_tile = 1.0 / 12.0;
+    // The fourth layer is the smallest and does the most: at ~1.4 yd it is the only one whose
+    // features are smaller than the sun's specular lobe, so it is what breaks the highlight into a
+    // glitter path instead of a single blown-out disc on a nearly flat plane. It carries the least
+    // weight of the four, and the mip chain retires it first with distance.
+    //
+    // Five octaves now, from ~110 yd down to ~1.4 yd, each on its own rotated lattice (see
+    // [`ripple_layer`]). The **long swell at the head is new**, and it is there for the distance:
+    // everything shorter than it either mips away toward the horizon or subtends too little of a
+    // pixel to be seen there, which is what left the far water looking like a painted plate. A
+    // 110-yard swell is still several pixels of tilt at the far clip, and it is the only layer that
+    // is, so it is the one carrying the far field — read through the sky gradient below, which is
+    // what turns half a degree of tilt into a visible colour.
+    //
+    // The drifts on the two longest layers are the other half of that: at the old rates the far
+    // water moved a third of a yard a second, which over a horizon-sized wave is no motion at all.
+    let slope =
+        ripple_layer(xz, vec2<f32>(0.012, 0.007), inv_tile / 9.2, 0.85, t, vec2<f32>(1.0, 0.0))
+        + ripple_layer(
+            xz,
+            vec2<f32>(0.016, 0.021),
+            inv_tile / 3.4,
+            1.00,
+            t,
+            vec2<f32>(0.8572, 0.5150),
+        )
+        // The two middle layers are what the broken highlight is MADE of: at twelve and at
+        // three-and-a-half yards their features are the size of the bright patches in the
+        // reference's sun column, so lifting them is what turns a smooth sheet into a mottle.
+        + ripple_layer(
+            xz,
+            vec2<f32>(-0.021, 0.010),
+            inv_tile,
+            1.00,
+            t,
+            vec2<f32>(0.4540, 0.8910),
+        )
+        + ripple_layer(
+            xz,
+            vec2<f32>(0.014, -0.026),
+            inv_tile / 0.30,
+            0.70,
+            t,
+            vec2<f32>(-0.2924, 0.9563),
+        )
+        // Dialled back from 0.30 with the specular: the finest layer is the crinkle, and a fine
+        // crinkle under a tight highlight is the texture of oil on water.
+        + ripple_layer(
+            xz,
+            vec2<f32>(0.041, 0.033),
+            inv_tile / 0.12,
+            0.20,
+            t,
+            vec2<f32>(-0.8572, 0.5150),
+        );
+    // ---- the live wave field ----------------------------------------------------------------
+    //
+    // Everything above is a texture of waves. This is water that has actually been pushed on: a
+    // height field integrated on the CPU under the 2-D wave equation, with every swimmer in range a
+    // moving source in it (`benilla_world::liquid::ripple_sim`). What arrives here is its slope,
+    // and it is simply added to the ambient ripple's — a wake is not a decal drawn over the water,
+    // it is the water being a different shape.
+    //
+    // Sampled UNCONDITIONALLY, with the window handled afterwards: a `textureSample` inside an `if`
+    // is non-uniform control flow, its implicit derivatives are undefined there, and WGSL rejects
+    // it. The sampler clamps, so a lookup from outside the window returns its rim, which the CPU's
+    // absorbing band has already brought to zero.
+    let sim_uv = (xz - water_reflect.sim.xy) * water_reflect.sim.z;
+    let sim_tex = textureSample(
+        wake_tex,
+        wake_samp,
+        clamp(sim_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+    );
+    let inside = select(
+        0.0,
+        1.0,
+        all(sim_uv > vec2<f32>(0.0)) && all(sim_uv < vec2<f32>(1.0)),
+    );
+    // Distance to the nearest edge of the window, in window fractions — the fade the far side of
+    // [`WAKE_EDGE_FADE`] describes.
+    let sim_edge = min(min(sim_uv.x, 1.0 - sim_uv.x), min(sim_uv.y, 1.0 - sim_uv.y));
+    // Clamped, because the lane doubles as the `$WOW_WAKE_SHOW` debug switch below.
+    let sim_w = min(water_reflect.sim.w, 1.0)
+        * inside
+        * smoothstep(0.0, WAKE_EDGE_FADE, sim_edge);
+    let wake_slope = (sim_tex.rg * 2.0 - 1.0) * sim_w;
+    // The wave's own height, signed — how much water the disturbance has put under this pixel.
+    let wake_height = (sim_tex.b * 2.0 - 1.0) * sim_w;
+    let wake_foam = saturate((length(wake_slope) - WAKE_FOAM_FLOOR) * WAKE_FOAM_GAIN);
+    // `$WOW_WAKE_SHOW` — the field, painted flat, with the window's own extent as the black border.
+    // Nothing to read into: either there are waves on the screen or the simulation is not arriving.
+    if (water_reflect.sim.w > 1.5) {
+        return vec4<f32>(sim_tex.rgb * inside, 1.0);
+    }
+
+    // The map holds slope, so the normal is rebuilt with Y up — no tangent frame, because a liquid
+    // surface is a flat axis-aligned plane that never rotates.
+    //
+    // **The strength is what breaks the light.** In the reference the sun's column on the water is
+    // not a wash, it is shattered — a mottle of bright patches and dark gaps several yards across,
+    // moving. That look comes from the surface having enough tilt to swing the reflected ray right
+    // off the highlight and back onto it again across a single wave, and at the sandbox's 0.75 it
+    // simply does not: every facet stays near enough to flat that the highlight slides over the
+    // whole surface as one smooth sheet.
+    //
+    // Note this is the opposite lever from the one that fixed "oily". A tighter specular lobe would
+    // also break the highlight up, into hard little chips — which is exactly the film-on-water read
+    // that complaint was about. Breaking it with the SURFACE instead keeps the lobe broad and the
+    // water rough, which is the same thing real water does.
+    let n = normalize(vec3<f32>(
+        slope.x * NORMAL_STRENGTH + wake_slope.x,
+        1.0,
+        slope.y * NORMAL_STRENGTH + wake_slope.y,
+    ));
+
+    // Body: the zone's own swatch, deepening with V. sqrt, not linear — absorption in real water is
+    // exponential, and the square root keeps the shallows a distinct band instead of a thin gradient.
+    // **How fast the water becomes water.** The depth coordinate runs 0 at the waterline to 1 at
+    // about five yards, and reading the body straight off it makes a stream a different substance
+    // from a pond: knee-deep water sits a fifth of the way along the ramp, so it keeps the swatch's
+    // shallow row — which in the shipped data is the muddy olive of a riverbed, not water — and its
+    // opacity stays near the shallow end, letting the bed through. The result is a wet path where
+    // there should be a stream.
+    //
+    // The exponents below pull both ramps forward so that anything more than ankle-deep reads as
+    // the same water a pond is made of, while the last hand's breadth still lightens into the
+    // shore. It is a look choice, not a depth model: the world's own numbers still decide, they are
+    // just read on a curve that treats shallow water as water.
+    //
+    // The ramp is also CAPPED short of the deep row — see [`BODY_DEPTH_MAX`], which is the "too
+    // dark, look at Booty Bay" report.
+    // The wake rides the depth ramp with the world's own bathymetry — see [`WAKE_BODY_DEPTH`].
+    // **How far along the swatch the body has travelled**, and there are two answers.
+    //
+    // Where the scene behind the water is known, the water column is a real distance in yards and
+    // the shallow row gives way to the deep one by Beer–Lambert extinction, PER CHANNEL: red is
+    // gone within a couple of yards, green carries further, blue furthest. That is the whole reason
+    // deep water is blue rather than "the deep colour", and it is a thing a single lerp of two
+    // swatch rows cannot express at any depth but the one it was tuned at — which is why the deep
+    // end had to be capped by hand to stop several zones going to tar.
+    //
+    // Where it is not known — the reference lane, which has no prepass, or the first frame after a
+    // style flip — this is the authored depth byte on a curve, exactly as before.
+    let wake_push = wake_height * WAKE_BODY_DEPTH;
+    var body_t = saturate(pow(depth, 0.35) + wake_push) * BODY_DEPTH_MAX;
+    var body_rgb = mix(shallow.rgb, deep.rgb, body_t);
+    if (thickness >= 0.0) {
+        let t = min(thickness, WATER_MAX_THICKNESS);
+        // [`BODY_DEPTH_MAX`] applies here too, and leaving it off was the other half of the slab.
+        // The cap is not a fudge around the authored byte's units — it is a statement about the
+        // 1.12 palettes themselves, several of whose deep rows are nearly black because they were
+        // authored for a surface with no reflection and no glitter on it. A physically-correct
+        // extinction curve run all the way to that row is still a run to tar.
+        let absorbed =
+            saturate(vec3<f32>(1.0) - exp(-WATER_EXTINCTION * t) + wake_push) * BODY_DEPTH_MAX;
+        body_rgb = mix(shallow.rgb, deep.rgb, absorbed);
+    }
+    // The sun's bearing, taken flat — see [`BODY_RIPPLE_SHADE`]. The epsilon is for the frame at
+    // startup before the lanes are written, and for the instant the sun crosses the zenith.
+    let sun_xz = normalize(water_reflect.sun.xz + vec2<f32>(1e-4, 1e-4));
+    let wave_tilt = dot(n.xz, sun_xz);
+    let body = body_rgb * lit * (1.0 + BODY_RIPPLE_SHADE * wave_tilt);
+
+    // Fresnel toward the horizon. Schlick's 5th power, floored at the 2 % water reflects head-on.
+    let to_view = normalize(view.world_position.xyz - world_pos);
+    let fresnel = pow(1.0 - saturate(dot(n, to_view)), 5.0);
+    // What the surface reflects when the mirrored pass has nothing for it: the sky, read at the
+    // reflected view ray's own elevation rather than as one flat colour — see [`sky_reflection`],
+    // which is the answer to "waves are only visible in the line of the sun".
+    let sky = sky_reflection(reflect(-to_view, n));
+    var rgb = mix(body, sky * lit, mix(0.02, 0.45, fresnel));
+
+    // ---- the planar reflection ----------------------------------------------------------------
+    //
+    // Replaces the sky mix above wherever the mirrored camera actually drew something. Three gates,
+    // and each is a case where the image is not this surface's reflection: strength 0 (the pass did
+    // not run), a surface further from the mirror plane than the tolerance (one capture is right
+    // for one plane, and a world of terraced pools has many), and an eye below the surface (the
+    // reflection is on the other side of it).
+    //
+    // `1 - u` is the mirrored camera's negated right vector undone — see `reflect`'s module doc; the
+    // normal's XZ displaces the sample, which is what makes it read as a reflection in water rather
+    // than in glass. Alpha is coverage, so where the mirrored view saw nothing the sky mix stands.
+    if (water_reflect.params.y > 0.0
+        && abs(world_pos.y - water_reflect.params.x) <= water_reflect.params.w
+        && view.world_position.y > world_pos.y) {
+        let uv = frag_coord_to_uv(frag_coord);
+        let ruv = clamp(
+            vec2<f32>(1.0 - uv.x, uv.y) + n.xz * water_reflect.params.z,
+            vec2<f32>(0.002),
+            vec2<f32>(0.998),
+        );
+        let mirrored = textureSample(reflection_tex, reflection_samp, ruv);
+        // Schlick again, on the same normal: water reflects almost nothing straight down and almost
+        // everything at a glancing angle, which is most of why a lake reads as a lake.
+        //
+        // The ceiling is a **look choice against the physics**, and named as one. Schlick's own top
+        // end is 1.0 — at a grazing angle real water is a mirror — and a mirror is what this drew:
+        // too clean, too complete, more polished glass than a lake with a breeze on it. Holding the
+        // top at [`REFLECT_MAX`] keeps a quarter of the water's own body in the picture at every
+        // angle, which is what stops it reading as perfect. It is a dimmer, not a distorter: the
+        // knob for a *broken* reflection rather than a fainter one is `REFLECT_DISTORT` on the CPU
+        // side.
+        let amount = mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * mirrored.a;
+        rgb = mix(rgb, mirrored.rgb, amount);
+    }
+
+    // The glitter path: the same Blinn highlight the reference computes, evaluated against the
+    // rippled normal per fragment. The fine ripple layer above breaks it into pieces; the exponent
+    // and the weight decide how hard and how bright those pieces are — which is to say, how ROUGH
+    // the water is. See [`SPEC_POWER`].
+    //
+    // **Against the VISIBLE sun, not the lighting one.** The engine carries two (see
+    // `lighting::daynight`): `light_sun` is pinned at compass 225 deg and never sets — it exists so
+    // MCSH shadows can be baked once — while the disc in the sky rides `celestial_sun_direction`
+    // at compass 45 deg and genuinely rises and sets. They measure 25-32 deg apart, so a highlight
+    // aimed by `light_sun` lands in a different part of the water than the sun it is supposed to be
+    // a reflection of, and it lands there at midnight too. `water_reflect.sun` is the one you can
+    // point at.
+    // Guarded: the lanes are zero for one frame at startup, before the sun pass has run, and
+    // `normalize` of a zero vector is a NaN that would survive the multiply by a zero reach.
+    let sun_len = length(water_reflect.sun.xyz);
+    let to_light = select(vec3<f32>(0.0, 1.0, 0.0), water_reflect.sun.xyz / sun_len, sun_len > 1e-4);
+    // ...and only as far as the sun actually reaches: below the horizon, behind a cloud, or behind
+    // the ridge you are standing under, there is no glitter to have. The scalar is slewed on the
+    // CPU, so this fades over about a second rather than switching.
+    let sun_reach = water_reflect.sun.w;
+    let half_v = normalize(to_light + to_view);
+    rgb += wow_light.light_spec.rgb
+        * pow(max(dot(n, half_v), 0.0), SPEC_POWER)
+        * (SPEC_WEIGHT * sun_reach);
+
+    // ...and the moon's, which is the same computation against the other body in the sky. Water
+    // does not care which one is up; it was only ever the sun here because the sun was the only
+    // direction this shader had been handed.
+    let moon_len = length(water_reflect.moon.xyz);
+    let to_moon = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        water_reflect.moon.xyz / moon_len,
+        moon_len > 1e-4,
+    );
+    let half_m = normalize(to_moon + to_view);
+    rgb += MOON_SPEC_COLOR
+        * pow(max(dot(n, half_m), 0.0), MOON_SPEC_POWER)
+        * (SPEC_WEIGHT * MOON_SPEC_WEIGHT * water_reflect.moon.w);
+
+    // The white line where the water meets the land, and the bubbles behind it.
+    //
+    // `to_shore` is the distance to the waterline in yards, traced on the CPU from where the water
+    // surface crosses the ground and carried per vertex (`benilla_world::liquid::surface`). The
+    // cells it runs through are subdivided so that distance is described finely enough to draw a
+    // band under a yard wide; at the bare 4.17 yd lattice the band appeared only where a corner
+    // happened to fall near the water's edge, which is what made it look like teeth.
+    // **The distance, measured here rather than interpolated.** `shore` is the same quantity carried
+    // per vertex, and it is what the band used to be drawn from — but distance to a curve creases
+    // along the curve, and a linear interpolation across that crease cuts its corner: the
+    // reconstructed band lands off by up to half a vertex spacing, so at half a yard between
+    // vertices and a fifth of a yard of band it visibly jogged, thinned and doubled as the camera
+    // moved. The offset has no crease, so it interpolates honestly and the length is exact.
+    //
+    // The interpolated scalar still wins beyond the near field, for two reasons: past a couple of
+    // yards nothing is drawn either way, and an offset is only meaningful where a nearest point
+    // exists — on the ridge halfway between two facing banks the nearest point flips sides, and
+    // interpolating across that flip would collapse the offset to nothing and draw a foam line down
+    // the middle of a channel. Inside the near field the two agree to within the mesh's own error;
+    // where they do not, the scalar is the conservative answer and is taken.
+    // `$WOW_WATER_DEPTH_SHOW` — the water column in yards, as greyscale (black 0, white 8).
+    //
+    // Kept, not scaffolding. Everything below now depends on a quantity that is invisible in the
+    // final image and wrong in ways that look like art problems: too little and the water is flat,
+    // too much and the shallows vanish. Being able to look at the number directly is what separated
+    // "the soft edge is too wide" from "the absorption is wrong" the first time they were confused
+    // for each other.
+    if (water_reflect.sky_zenith.w > 0.5) {
+        let t = max(thickness, 0.0) / 8.0;
+        return vec4<f32>(vec3<f32>(saturate(t)), 1.0);
+    }
+    let exact = length(shore_offset);
+    var to_shore = shore;
+    if (shore < SHORE_EXACT_REACH && abs(exact - shore) < SHORE_EXACT_TRUST) {
+        to_shore = exact;
+    }
+
+    // 1. The line. Its outer edge wavers only slightly, so it reads as an even edge rather than as
+    //    something ragged; the raggedness belongs to the bubbles. No time in this term — foam
+    //    gathers where the shore's shape makes it gather, and an edge that crawls reads as a bug.
+    let warp = textureSample(ripples, ripples_samp, xz * 0.05).b * 2.0 - 1.0;
+    // The swell: the band's outer edge advances up the shore and slides back down, out of step from
+    // bay to bay (see [`SHORE_RUNUP_YARDS`]). The phase comes from a very coarse read of the same
+    // map, so it drifts along a coastline instead of switching at some boundary.
+    let swell_phase = textureSample(ripples, ripples_samp, xz / SHORE_SWELL_SPREAD).b * TAU;
+    let swell = sin(t * (TAU / SHORE_SWELL_SECS) + swell_phase);
+    let edge = (FOAM_LINE_YARDS + SHORE_RUNUP_YARDS * swell) * (1.0 + FOAM_EDGE_WARP * warp);
+    // Anti-aliased against how much distance one pixel covers, bounded at both ends: below so a
+    // near-view edge stays an edge, above because past a fraction of the band's own width this
+    // stops being anti-aliasing and becomes a smear.
+    let aa = clamp(fwidth(to_shore), 0.015, 0.20);
+    let line = 1.0 - smoothstep(edge - aa, edge + aa, to_shore);
+
+    // 2. Behind it, bubbles: the same white, but broken into flecks that thin out with distance
+    //    until there is only water. `out` runs 0 at the line to 1 where they stop, and it is the
+    //    THRESHOLD the noise is cut at — so the coverage falls away on its own, and there is no
+    //    second hard edge anywhere out in the water to alias against.
+    let out = saturate((to_shore - edge) / FOAM_BUBBLE_YARDS);
+    // Fine on purpose: the band is barely a yard, so the flecks have to be a good deal smaller than
+    // that or only one spans it and the break-up never reads as bubbles at all — and non-repeating,
+    // which at that size the map is not on its own (see [`foam_noise`]).
+    let raw = foam_noise(xz, t);
+    // Spread before cutting. The map's height channel is a sum of Perlin octaves normalised on its
+    // single largest texel, so its values crowd hard around 0.5 and only the extremes ever approach
+    // 0 or 1 (`benilla_world::liquid::ripple`). Cut at a threshold sweeping the whole 0..1 it
+    // behaves as a step — everything passes, then nothing — which collapsed the bubbles into a
+    // narrow ring and made the line's outer edge read as hard. Widened about its middle, the field
+    // spans the range the threshold actually travels.
+    let bub = saturate((raw - 0.5) * 3.5 + 0.5);
+    // The cut is softened by the noise's own pixel footprint, so at distance the flecks resolve to
+    // their average instead of sparkling.
+    let bw = max(0.07, fwidth(bub) * 1.5);
+    // The taper must reach exactly zero where the band ends, not merely dim. `out` saturates at 1
+    // out in open water, and a threshold sitting at 1 still admits the top of the spread field —
+    // which put flecks across the whole surface the first time this was tried.
+    let bubbles = smoothstep(out - bw, out + bw, bub) * (1.0 - out);
+
+    // ...and the wake's own aeration alongside them. `max`, not a sum: these are three ways for the
+    // same surface to be white, and adding them blows out where a swimmer crosses a waterline —
+    // which is precisely where a player spends their time in the water.
+    let foam = max(
+        max(line * FOAM_LINE_LEVEL, bubbles * FOAM_BUBBLE_LEVEL),
+        wake_foam * WAKE_FOAM_LEVEL,
+    );
+    rgb = mix(rgb, FOAM_COLOR * lit, foam);
+
+    // Opacity is still the world's: the swatch ramp the reference uses, plus the foam, which is
+    // spray and hides what is under it.
+    // ...and the BODY thins to nothing where something passes through the surface: a sheet of water
+    // meeting a rock along a hard line is the giveaway that it is a sheet, while real water fades
+    // over the last hand's breadth because by then there is barely any water left to be opaque
+    // with. Needs to know what is behind the surface, so it is another thing the prepass buys.
+    //
+    // **The foam is taken after the fade, not before it.** Foam sits ON the surface — it is spray,
+    // not water column — so softening it against the very intersection it gathers at erases the
+    // shoreline exactly where the line belongs, which is what the first attempt did.
+    var soft = 1.0;
+    if (thickness >= 0.0) {
+        soft = saturate(thickness / SOFT_EDGE_YARDS);
+    }
+    let alpha = max(mix(shallow.w, deep.w, sqrt(depth)) * soft, foam);
+    return vec4<f32>(apply_fog(rgb, world_pos, room_fog), alpha);
+}
+
+// The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's own shader locations, plus
+// the shore offset at 10 under `LIQUID_SHORE_OFFSET` (`LiquidExt::specialize` sets the def and
+// appends the attribute to the buffer layout when the mesh carries it). Declared here rather than
+// imported for the one reason the model shader declares its own: a struct you did not write cannot
+// gain a field.
+struct LiquidVertex {
+    @builtin(instance_index) instance_index: u32,
+#ifdef VERTEX_POSITIONS
+    @location(0) position: vec3<f32>,
+#endif
+#ifdef VERTEX_NORMALS
+    @location(1) normal: vec3<f32>,
+#endif
+#ifdef VERTEX_UVS_A
+    @location(2) uv: vec2<f32>,
+#endif
+#ifdef VERTEX_UVS_B
+    @location(3) uv_b: vec2<f32>,
+#endif
+#ifdef VERTEX_COLORS
+    @location(5) color: vec4<f32>,
+#endif
+#ifdef LIQUID_SHORE_OFFSET
+    // Vertex → nearest point on the waterline, in mesh-local XZ yards.
+    @location(10) shore_offset: vec2<f32>,
+#endif
+}
+
 @vertex
-fn vertex(in: Vertex) -> LiquidVsOut {
+fn vertex(in: LiquidVertex) -> LiquidVsOut {
     var out: LiquidVsOut;
     let world_from_local = mesh_functions::get_world_from_local(in.instance_index);
     out.world_position =
@@ -279,6 +1006,24 @@ fn vertex(in: Vertex) -> LiquidVsOut {
 #endif
     // Per-vertex MCLQ depth (0..1) packed into UV1.x; drives the opacity ramp.
     out.depth = in.uv_b.x;
+    // UV1.y is the distance to the waterline in yards; drives the far field, and the shore foam on
+    // any mesh without the offset attribute below.
+    out.shore = in.uv_b.y;
+#ifdef LIQUID_SHORE_OFFSET
+    // A DIRECTION, so it takes the placement's rotation and scale but not its translation — which
+    // is what `mat3(world_from_local)` is. Interpolating the offset is equivalent to interpolating
+    // the nearest point and the position separately, because both are linear; the length is taken
+    // in the fragment stage, where the crease belongs.
+    let off_local = vec3<f32>(in.shore_offset.x, 0.0, in.shore_offset.y);
+    let off_world = mat3x3<f32>(
+        world_from_local[0].xyz,
+        world_from_local[1].xyz,
+        world_from_local[2].xyz,
+    ) * off_local;
+    out.shore_offset = off_world.xz;
+#else
+    out.shore_offset = vec2<f32>(in.uv_b.y, 0.0);
+#endif
     // The faithful per-vertex sun sheen — interpolated across the coarse mesh by the fragment stage.
     out.secondary_vtx = sun_sheen(out.world_normal, out.world_position.xyz);
     // `MeshTag` bit 30 — see `LiquidVsOut::room_fog`. ADT surfaces carry no tag (0 ⇒ scene fog,
@@ -348,7 +1093,17 @@ fn swatch_at(shallow: vec4<f32>, deep: vec4<f32>, v: f32, ocean: bool) -> vec4<f
 }
 
 @fragment
-fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
+fn fragment(
+    in: LiquidVsOut,
+#ifdef MULTISAMPLED
+    // `prepass_depth` reads a multisampled texture and needs to know which sample this is. The
+    // world camera runs at four, so this is the live path.
+    @builtin(sample_index) sample_index: u32,
+#endif
+) -> @location(0) vec4<f32> {
+#ifndef MULTISAMPLED
+    let sample_index = 0u;
+#endif
     // HARD FAR-CLIP WALL (same as terrain/models, see terrain.wgsl): discard water beyond the
     // projection far plane so lakes/rivers don't render past the wall. `fog_params.w` = farclip
     // (0 ⇒ disabled).
@@ -402,6 +1157,93 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         shallow = wow_light.water_ocean[0];
         deep = wow_light.water_ocean[1];
     }
+
+    // ---- The stylised look ------------------------------------------------------------------
+    //
+    // It replaces all three water arms at once, and it runs HERE — after the world's own swatch and
+    // depth are resolved, before any of the reference's three combines — because those two are the
+    // only world inputs it takes.
+    //
+    // Each arm keeps its own colour source and its own lighting, so what changes is the treatment
+    // and never the palette: the ADT ramp lerps the zone swatch by depth; a WMO exterior canal
+    // takes the deep river band flat, having no bathymetry to lerp over; and a WMO interior pool
+    // keeps its authored `MOMT.diffColor` body, unlit, because that arm has no normal to light with
+    // and its rooms are not lit by the scene's sun.
+    if (w.path.y > 0.5) {
+        // **The ocean's depth coordinate is a different ramp from the river's**, and this path has
+        // to reconcile them. Both come off the same per-vertex MCLQ depth byte (~8.5 byte/yd), but
+        // the reference divides the river's by 42 — saturating at ~5 yd — and the ocean's by 255,
+        // which `liquid.rs` records as a placeholder pending its own RE. The faithful path above
+        // takes each as it finds it, because each indexes its own swatch and that IS the reference's
+        // behaviour. The stylised look cannot: it reads this number as *how deep the water is*, and
+        // a sixth of a river's ramp read as a sixth of the way to deep water is what put a
+        // shoreline's worth of foam across the whole of Booty Bay and left the sea the colour of a
+        // shallow. Rescaled into the river's units here, and here only.
+        var style_depth = depth;
+        if (w.kind.y > 0.5) {
+            style_depth = min(depth * (255.0 / 42.0), 1.0);
+        }
+        var body_shallow = shallow;
+        var body_deep = deep;
+        var lit = vec3<f32>(1.0);
+        if (w.path.x > 1.5) {
+            body_shallow = vec4<f32>(in.vcolor.rgb, shallow.w);
+            body_deep = vec4<f32>(in.vcolor.rgb, deep.w);
+        } else {
+            if (w.path.x > 0.5) {
+                body_shallow = deep;
+            }
+            let n_lit = normalize(in.world_normal);
+            lit = clamp(
+                wow_light.light_ambient.rgb
+                    + wow_light.light_diffuse.rgb
+                        * max(dot(n_lit, -normalize(wow_light.light_sun.xyz)), 0.0),
+                vec3<f32>(0.0),
+                vec3<f32>(1.0),
+            );
+        }
+        // **How much water stands between this fragment and whatever is behind it**, in yards.
+        //
+        // The opaque scene's depth comes from the prepass, which exists only while this look is on
+        // (`benilla_world::liquid::depth`); both depths are converted out of reverse-Z into view
+        // space, where the difference is a distance rather than a ratio. Negative means "not
+        // known", and every consumer falls back to the authored depth byte.
+        var thickness = -1.0;
+#ifdef DEPTH_PREPASS
+        let scene_depth = prepass_depth(in.clip_position, sample_index);
+        // **A pixel with nothing in the prepass is UNKNOWN, not infinitely deep.** Reverse-Z clears
+        // to zero at the far plane, so that is what "nothing was drawn here" reads as — and taking
+        // it at face value makes the water column enormous, which drives the absorption below
+        // straight to the deep row and paints a flat slab.
+        //
+        // It happens over more of the world than it sounds. Terrain is in the prepass, but the
+        // static-gx pass draws on its own pipeline and is in none, and models opt out
+        // (`WowModelExt::enable_prepass`) — so every WMO floor under water is a hole, which is
+        // exactly what Booty Bay's harbour is. Falling back to the authored byte there gives the
+        // look this had before the prepass existed, which is the right answer for a pixel whose
+        // depth we genuinely do not know.
+        if (scene_depth > 0.0) {
+            let scene_z = depth_ndc_to_view_z(scene_depth);
+            let water_z = depth_ndc_to_view_z(in.clip_position.z);
+            // View Z runs negative into the screen, so the surface is the larger of the two and the
+            // column is their difference.
+            thickness = max(water_z - scene_z, 0.0);
+        }
+#endif
+        return stylised_water(
+            in.world_position.xyz,
+            in.clip_position.xy,
+            thickness,
+            style_depth,
+            in.shore,
+            in.shore_offset,
+            body_shallow,
+            body_deep,
+            lit,
+            in.room_fog,
+        );
+    }
+
     // ---- The two WMO water arms ------------------------------------------------------------
     //
     // Neither is the ADT combine below. `0x6b62e0`'s category 0 splits on the owning group's
