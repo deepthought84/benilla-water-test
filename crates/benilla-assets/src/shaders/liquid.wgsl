@@ -92,7 +92,10 @@
 #import bevy_pbr::{
     mesh_functions,
     forward_io::Vertex,
-    view_transformations::{position_world_to_clip, frag_coord_to_uv, depth_ndc_to_view_z},
+    view_transformations::{
+        position_world_to_clip, position_world_to_ndc, ndc_to_uv, frag_coord_to_uv,
+        depth_ndc_to_view_z,
+    },
     mesh_view_bindings::{view, globals},
 }
 #ifdef DEPTH_PREPASS
@@ -383,8 +386,99 @@ const SHORE_SWELL_SPREAD: f32 = 70.0;
 /// How bright the bubbles are against the solid line.
 const FOAM_BUBBLE_LEVEL: f32 = 0.30;
 
+/// Edge length of the generated ripple map, in texels — `benilla_world::liquid::ripple`'s `SIZE`.
+/// Needed here to turn its stored central-difference slope into a real `d/d(uv)`; see
+/// [`foam_noise`].
+const RIPPLE_TEXELS: f32 = 256.0;
+
+/// How far from the waterline the shore band is evaluated at all, in yards.
+///
+/// **The band was drawn on every water fragment in the world.** Out in open ocean, four hundred
+/// yards from any shore, `line` and `bubbles` both resolve to zero — and the surface still paid two
+/// texture taps for the edge, three more inside [`foam_noise`], and two `fwidth` chains to arrive
+/// at nothing. Five of the roughly thirteen taps a stylised water fragment makes, spent on the
+/// overwhelming majority of them for no pixel.
+///
+/// The reach is the band's own outer extent and is derived from the terms that set it rather than
+/// picked, so it cannot drift out of step with them: the line at its highest swell and widest warp,
+/// plus the bubble taper behind it, plus a quarter yard for the anti-aliasing that softens the far
+/// end. Past it `1 - out` is identically zero and so is the line's smoothstep.
+const FOAM_REACH: f32 = (FOAM_LINE_YARDS + SHORE_RUNUP_YARDS) * (1.0 + FOAM_EDGE_WARP)
+    + FOAM_BUBBLE_YARDS
+    + 0.25;
+
 /// The foam's own colour — spray, so near-white with the faintest cool cast.
 const FOAM_COLOR: vec3<f32> = vec3<f32>(0.88, 0.94, 0.96);
+
+/// How far past the trusted band the correction is allowed to keep working, as a multiple of it.
+///
+/// The reprojection does not stop being right at any particular distance — it degrades, because the
+/// lifted sample is placed at the water's own depth rather than at the depth of what is being
+/// reflected, and that approximation loosens as the lift grows. So the reflection is carried at
+/// full weight across the trusted band and then faded out over another band this much wider, which
+/// is long enough that no edge of it is visible as an edge.
+const PLANE_FADE: f32 = 2.5;
+
+/// The surface tilt, in radians, up to which the planar capture is trusted completely, and the
+/// tilt at which it is trusted not at all.
+///
+/// **A capture is rendered through a HORIZONTAL mirror.** Its plane error can be corrected — that
+/// is the reprojection — but its *orientation* cannot: a surface tilted by `t` reflects its rays
+/// `2t` away from where the capture looked, and no amount of moving the sample around an image
+/// recovers a direction the image never contained. Elwynn's stream falls about 3.04 yd across a
+/// single chunk, roughly 5.2 deg, so its reflected ray is out by better than ten.
+///
+/// So tilt is the second half of the trust: past a few degrees the planar image is a confidently
+/// wrong picture, and the sky mix it fades into is an honest one. The trusted band is generous
+/// enough that an ordinary river keeps its reflection, and the limit is where a chute or a
+/// cataract stops pretending.
+const SLOPE_TRUSTED: f32 = 0.10; // ~5.7 deg
+const SLOPE_LIMIT: f32 = 0.32; // ~18 deg
+
+/// How much the sample is *additionally* smeared as trust falls away.
+///
+/// The reference's own reflections are faint and broken up, and that is precisely why its
+/// single-plane errors never read as errors. A badly-fitted surface here does the same: it dims
+/// (the trust weight) and it blurs (this), so what survives is a suggestion of a reflection rather
+/// than a sharp claim about geometry the capture got wrong.
+const DISTORT_LIFT: f32 = 3.0;
+
+/// The **geometric** tilt of the water under this fragment, in radians.
+///
+/// Taken from screen-space derivatives of the world position rather than from the mesh, because
+/// the liquid mesh carries no slope at all — `surface.rs` writes `[0, 1, 0]` into every vertex
+/// normal, so `world_normal` is a constant and says nothing about the heightfield. The cross of
+/// the two derivatives is the true facet normal and costs nothing extra here.
+///
+/// Called in uniform control flow, before any branch: derivatives past a per-fragment `if` are
+/// undefined, which is the same rule the shore band is written around.
+fn surface_tilt(world_pos: vec3<f32>) -> f32 {
+    let g = cross(dpdx(world_pos), dpdy(world_pos));
+    let len = length(g);
+    if (len < 1e-12) {
+        return 0.0;
+    }
+    // Only the magnitude of the tilt matters, so the facet's winding is irrelevant.
+    return acos(clamp(abs(g.y / len), 0.0, 1.0));
+}
+
+/// How much of the planar reflection a surface `err` yards off the capture plane keeps.
+///
+/// **This replaced a hard cutoff, and the reason is the shot that broke it.** A capture serves one
+/// plane exactly and its neighbours approximately (see the reprojection in `stylised_water`), and
+/// the first cut simply refused any surface more than `trusted` yards away. But a frame regularly
+/// holds several water bodies at once — a roadside pool at 10.07 and the sea at 0.00 is a real
+/// Stranglethorn view — and under a threshold exactly one of them could reflect while the other
+/// went flat. Which one flipped as the camera moved, because the capture plane is chosen from what
+/// covers the screen.
+///
+/// A falloff serves them all instead: the body the capture was built for is exact, the others are
+/// approximate and a little weaker, and nothing pops when the choice changes hands.
+fn plane_trust(err: f32, trusted: f32, tilt: f32) -> f32 {
+    let by_height = 1.0 - smoothstep(trusted, trusted * (1.0 + PLANE_FADE), err);
+    let by_slope = 1.0 - smoothstep(SLOPE_TRUSTED, SLOPE_LIMIT, tilt);
+    return by_height * by_slope;
+}
 
 /// How reflective the water is allowed to get at a grazing angle. Below Schlick's 1.0 on purpose —
 /// see its use.
@@ -574,24 +668,69 @@ fn sky_reflection(dir: vec3<f32>) -> vec3<f32> {
 ///   itself varies over tens of yards, so what repeats is only the field being used to displace
 ///   itself. This is the one that does most of the work — a warp of a third of a tile moves the
 ///   repeat further than the eye can carry it.
-fn foam_noise(p: vec2<f32>, t: f32) -> f32 {
+///
+/// ## Explicit gradients, and why the value brings its own footprint back
+///
+/// The band this feeds is drawn only within [`FOAM_REACH`] of the waterline, which is per-fragment
+/// control flow — and there an implicit-LOD `textureSample` is undefined and naga rejects it, as
+/// does any derivative builtin. So the caller takes `d(world xz)/d(pixel)` in uniform flow and
+/// hands it down, and every tap here is a `textureSampleGrad`.
+///
+/// `fw` comes back for the same reason: the threshold that cuts these flecks softens itself by the
+/// noise's own screen footprint, and `fwidth` of the result is no longer available to measure it
+/// with. It does not have to be. **The map's R/G is the gradient of its B** — that is what it holds
+/// and what `ripple_layer` reads it as (`benilla_world::liquid::ripple`) — so the same fetches that
+/// give the value give its slope, and the footprint is that slope against the pixel's own step.
+/// The stored slope is a central difference over two texels of a [`RIPPLE_TEXELS`]-wide map, so
+/// `d(b)/d(uv)` is the decoded value times half the map's width.
+///
+/// The warp's contribution to the gradients is dropped: it varies over tens of yards, where the
+/// terms it displaces vary over fractions of one.
+struct FoamNoise {
+    /// The field, 0..1.
+    v: f32,
+    /// How much `v` moves across one pixel — `fwidth(v)`, computed rather than sampled.
+    fw: f32,
+}
+
+fn foam_noise(p: vec2<f32>, t: f32, ddx: vec2<f32>, ddy: vec2<f32>) -> FoamNoise {
     // cos/sin of ~33.9 degrees — a turn that is not a neat fraction of one.
     let rot = vec2<f32>(0.8305, 0.5570);
     let r = mat2x2<f32>(rot.x, -rot.y, rot.y, rot.x);
-    let warp = textureSample(ripples, ripples_samp, p * 0.031 + vec2<f32>(0.004, -0.003) * t).rg
-        * 2.0
-        - 1.0;
-    let a = textureSample(
+    let warp = textureSampleGrad(
+        ripples,
+        ripples_samp,
+        p * 0.031 + vec2<f32>(0.004, -0.003) * t,
+        ddx * 0.031,
+        ddy * 0.031,
+    ).rg * 2.0 - 1.0;
+    let a_dx = ddx * 0.83;
+    let a_dy = ddy * 0.83;
+    let a = textureSampleGrad(
         ripples,
         ripples_samp,
         p * 0.83 + warp * 0.35 + vec2<f32>(0.010, 0.014) * t,
-    ).b;
-    let b = textureSample(
+        a_dx,
+        a_dy,
+    );
+    let b_dx = (r * ddx) * 1.97;
+    let b_dy = (r * ddy) * 1.97;
+    let b = textureSampleGrad(
         ripples,
         ripples_samp,
         (r * p) * 1.97 + warp * 0.20 + vec2<f32>(-0.021, 0.008) * t,
-    ).b;
-    return a * 0.55 + b * 0.45;
+        b_dx,
+        b_dy,
+    );
+    // d(b)/d(uv), out of the same texels — see the header.
+    let ga = (a.rg * 2.0 - 1.0) * (RIPPLE_TEXELS * 0.5);
+    let gb = (b.rg * 2.0 - 1.0) * (RIPPLE_TEXELS * 0.5);
+    let fw_a = abs(dot(ga, a_dx)) + abs(dot(ga, a_dy));
+    let fw_b = abs(dot(gb, b_dx)) + abs(dot(gb, b_dy));
+    var out: FoamNoise;
+    out.v = a.b * 0.55 + b.b * 0.45;
+    out.fw = fw_a * 0.55 + fw_b * 0.45;
+    return out;
 }
 
 fn stylised_water(
@@ -611,6 +750,8 @@ fn stylised_water(
 ) -> vec4<f32> {
     let t = anim_time();
     let xz = world_pos.xz;
+    // In uniform control flow, before anything branches — see [`surface_tilt`].
+    let tilt = surface_tilt(world_pos);
     // One tile every 12 yd at scale 1; the three layers run at 3.4x, 1x and 0.3x of it.
     let inv_tile = 1.0 / 12.0;
     // The fourth layer is the smallest and does the most: at ~1.4 yd it is the only one whose
@@ -795,12 +936,47 @@ fn stylised_water(
     // `1 - u` is the mirrored camera's negated right vector undone — see `reflect`'s module doc; the
     // normal's XZ displaces the sample, which is what makes it read as a reflection in water rather
     // than in glass. Alpha is coverage, so where the mirrored view saw nothing the sky mix stands.
-    if (water_reflect.params.y > 0.0
-        && abs(world_pos.y - water_reflect.params.x) <= water_reflect.params.w
-        && view.world_position.y > world_pos.y) {
-        let uv = frag_coord_to_uv(frag_coord);
+    // **Every water body in the frame reflects, not just the one the capture was built for.**
+    // `params.w` is no longer a yes/no threshold on the plane error — it is the distance over which
+    // the correction below is trusted, and past it the surface fades back to its sky mix instead of
+    // switching off. See [`plane_trust`] for why a hard edge was the wrong shape: a pool and the
+    // ocean are routinely in one shot, they are ten yards apart, and whichever one lost the coin
+    // toss had no reflection at all.
+    let plane_error = abs(world_pos.y - water_reflect.params.x);
+    let trust = plane_trust(plane_error, water_reflect.params.w, tilt);
+    if (water_reflect.params.y > 0.0 && trust > 0.0 && view.world_position.y > world_pos.y) {
+        // ---- the plane-error reprojection ----
+        //
+        // **A capture is exact only for fragments lying ON the plane it was made for**, and almost
+        // no fragment does: a liquid grid is a heightfield, so an Elwynn stream slopes away from
+        // its own capture plane along its whole length, and the pond above it is a second plane
+        // entirely. Read at the fragment's own screen UV, the image those fragments get is mirrored
+        // about the wrong height — and because the error varies with the height, it *slides* along
+        // the surface as the water drops, which is what reads as a smeared or swimming reflection
+        // on a stream and as a plainly wrong one on a second body of water.
+        //
+        // The correction is exact and costs one projection. Let `p` be the capture plane and `h`
+        // this fragment's surface height. Mirroring a point about `h` and then back about `p`
+        // translates it by `2(p − h)` in Y — so the texel holding what this fragment should reflect
+        // is the one the capture drew for the world point `world_pos` lifted by that much, and its
+        // screen UV is where the MAIN camera projects the lifted point. At `h == p` the lift is zero
+        // and this reduces to `frag_coord_to_uv(frag_coord)` exactly, which is what it replaces.
+        //
+        // The one approximation: the lifted point is placed at the water's own depth rather than at
+        // the depth of whatever is being reflected. That makes the correction exact for reflections
+        // of things at the waterline — the bank, the trees on it, a hull alongside, which is what
+        // the eye judges a reflection by — and an overcorrection for distant mountains, where the
+        // true offset tends to zero and the residual is a fraction of a pixel through a wobble.
+        let lift = 2.0 * (water_reflect.params.x - world_pos.y);
+        let lifted = position_world_to_ndc(world_pos + vec3<f32>(0.0, lift, 0.0));
+        // Behind the eye (reverse-Z puts `w < 0` there, and the divide flips `z` negative with it)
+        // or thrown well off the side, the reprojection means nothing; the uncorrected UV is the
+        // image this drew before the correction existed and is the honest fallback.
+        let usable = lifted.z > 0.0 && all(abs(lifted.xy) < vec2<f32>(1.5));
+        let uv = select(frag_coord_to_uv(frag_coord), ndc_to_uv(lifted.xy), usable);
         let ruv = clamp(
-            vec2<f32>(1.0 - uv.x, uv.y) + n.xz * water_reflect.params.z,
+            vec2<f32>(1.0 - uv.x, uv.y)
+                + n.xz * water_reflect.params.z * (1.0 + DISTORT_LIFT * (1.0 - trust)),
             vec2<f32>(0.002),
             vec2<f32>(0.998),
         );
@@ -815,7 +991,8 @@ fn stylised_water(
         // angle, which is what stops it reading as perfect. It is a dimmer, not a distorter: the
         // knob for a *broken* reflection rather than a fainter one is `REFLECT_DISTORT` on the CPU
         // side.
-        let amount = mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * mirrored.a;
+        let amount =
+            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * mirrored.a * trust;
         rgb = mix(rgb, mirrored.rgb, amount);
     }
 
@@ -889,51 +1066,86 @@ fn stylised_water(
         let t = max(thickness, 0.0) / 8.0;
         return vec4<f32>(vec3<f32>(saturate(t)), 1.0);
     }
+    // `$WOW_WATER_TILT_SHOW` — the geometric tilt this fragment thinks it has, as greyscale, black
+    // flat and white at [`SLOPE_LIMIT`]. The trust term reads this number and nothing in the final
+    // image shows it directly, so a tilt that is wrong looks exactly like a reflection that is
+    // wrong — which is the confusion this exists to end.
+    if (water_reflect.sky_horizon.w > 0.5) {
+        return vec4<f32>(vec3<f32>(saturate(tilt / SLOPE_LIMIT)), 1.0);
+    }
     let exact = length(shore_offset);
     var to_shore = shore;
     if (shore < SHORE_EXACT_REACH && abs(exact - shore) < SHORE_EXACT_TRUST) {
         to_shore = exact;
     }
 
-    // 1. The line. Its outer edge wavers only slightly, so it reads as an even edge rather than as
-    //    something ragged; the raggedness belongs to the bubbles. No time in this term — foam
-    //    gathers where the shore's shape makes it gather, and an edge that crawls reads as a bug.
-    let warp = textureSample(ripples, ripples_samp, xz * 0.05).b * 2.0 - 1.0;
-    // The swell: the band's outer edge advances up the shore and slides back down, out of step from
-    // bay to bay (see [`SHORE_RUNUP_YARDS`]). The phase comes from a very coarse read of the same
-    // map, so it drifts along a coastline instead of switching at some boundary.
-    let swell_phase = textureSample(ripples, ripples_samp, xz / SHORE_SWELL_SPREAD).b * TAU;
-    let swell = sin(t * (TAU / SHORE_SWELL_SECS) + swell_phase);
-    let edge = (FOAM_LINE_YARDS + SHORE_RUNUP_YARDS * swell) * (1.0 + FOAM_EDGE_WARP * warp);
-    // Anti-aliased against how much distance one pixel covers, bounded at both ends: below so a
+    // The derivatives the band needs, taken HERE, where the flow is still uniform. Everything below
+    // sits behind [`FOAM_REACH`], and past that gate neither `fwidth` nor an implicit-LOD
+    // `textureSample` is defined — the same rule the wake field's unconditional tap is written
+    // around, answered the other way: hoist the derivative rather than the sample.
+    //
+    // Anti-aliasing against how much distance one pixel covers, bounded at both ends: below so a
     // near-view edge stays an edge, above because past a fraction of the band's own width this
     // stops being anti-aliasing and becomes a smear.
     let aa = clamp(fwidth(to_shore), 0.015, 0.20);
-    let line = 1.0 - smoothstep(edge - aa, edge + aa, to_shore);
+    // World yards per pixel, for the taps inside the gate.
+    let d_xz_dx = dpdx(xz);
+    let d_xz_dy = dpdy(xz);
 
-    // 2. Behind it, bubbles: the same white, but broken into flecks that thin out with distance
-    //    until there is only water. `out` runs 0 at the line to 1 where they stop, and it is the
-    //    THRESHOLD the noise is cut at — so the coverage falls away on its own, and there is no
-    //    second hard edge anywhere out in the water to alias against.
-    let out = saturate((to_shore - edge) / FOAM_BUBBLE_YARDS);
-    // Fine on purpose: the band is barely a yard, so the flecks have to be a good deal smaller than
-    // that or only one spans it and the break-up never reads as bubbles at all — and non-repeating,
-    // which at that size the map is not on its own (see [`foam_noise`]).
-    let raw = foam_noise(xz, t);
-    // Spread before cutting. The map's height channel is a sum of Perlin octaves normalised on its
-    // single largest texel, so its values crowd hard around 0.5 and only the extremes ever approach
-    // 0 or 1 (`benilla_world::liquid::ripple`). Cut at a threshold sweeping the whole 0..1 it
-    // behaves as a step — everything passes, then nothing — which collapsed the bubbles into a
-    // narrow ring and made the line's outer edge read as hard. Widened about its middle, the field
-    // spans the range the threshold actually travels.
-    let bub = saturate((raw - 0.5) * 3.5 + 0.5);
-    // The cut is softened by the noise's own pixel footprint, so at distance the flecks resolve to
-    // their average instead of sparkling.
-    let bw = max(0.07, fwidth(bub) * 1.5);
-    // The taper must reach exactly zero where the band ends, not merely dim. `out` saturates at 1
-    // out in open water, and a threshold sitting at 1 still admits the top of the spread field —
-    // which put flecks across the whole surface the first time this was tried.
-    let bubbles = smoothstep(out - bw, out + bw, bub) * (1.0 - out);
+    var line = 0.0;
+    var bubbles = 0.0;
+    if (to_shore < FOAM_REACH) {
+        // 1. The line. Its outer edge wavers only slightly, so it reads as an even edge rather than
+        //    as something ragged; the raggedness belongs to the bubbles. No time in this term —
+        //    foam gathers where the shore's shape makes it gather, and an edge that crawls reads as
+        //    a bug.
+        let warp = textureSampleGrad(
+            ripples,
+            ripples_samp,
+            xz * 0.05,
+            d_xz_dx * 0.05,
+            d_xz_dy * 0.05,
+        ).b * 2.0 - 1.0;
+        // The swell: the band's outer edge advances up the shore and slides back down, out of step
+        // from bay to bay (see [`SHORE_RUNUP_YARDS`]). The phase comes from a very coarse read of
+        // the same map, so it drifts along a coastline instead of switching at some boundary.
+        let swell_phase = textureSampleGrad(
+            ripples,
+            ripples_samp,
+            xz / SHORE_SWELL_SPREAD,
+            d_xz_dx / SHORE_SWELL_SPREAD,
+            d_xz_dy / SHORE_SWELL_SPREAD,
+        ).b * TAU;
+        let swell = sin(t * (TAU / SHORE_SWELL_SECS) + swell_phase);
+        let edge = (FOAM_LINE_YARDS + SHORE_RUNUP_YARDS * swell) * (1.0 + FOAM_EDGE_WARP * warp);
+        line = 1.0 - smoothstep(edge - aa, edge + aa, to_shore);
+
+        // 2. Behind it, bubbles: the same white, but broken into flecks that thin out with distance
+        //    until there is only water. `out` runs 0 at the line to 1 where they stop, and it is
+        //    the THRESHOLD the noise is cut at — so the coverage falls away on its own, and there
+        //    is no second hard edge anywhere out in the water to alias against.
+        let out = saturate((to_shore - edge) / FOAM_BUBBLE_YARDS);
+        // Fine on purpose: the band is barely a yard, so the flecks have to be a good deal smaller
+        // than that or only one spans it and the break-up never reads as bubbles at all — and
+        // non-repeating, which at that size the map is not on its own (see [`foam_noise`]).
+        let raw = foam_noise(xz, t, d_xz_dx, d_xz_dy);
+        // Spread before cutting. The map's height channel is a sum of Perlin octaves normalised on
+        // its single largest texel, so its values crowd hard around 0.5 and only the extremes ever
+        // approach 0 or 1 (`benilla_world::liquid::ripple`). Cut at a threshold sweeping the whole
+        // 0..1 it behaves as a step — everything passes, then nothing — which collapsed the bubbles
+        // into a narrow ring and made the line's outer edge read as hard. Widened about its middle,
+        // the field spans the range the threshold actually travels.
+        let bub = saturate((raw.v - 0.5) * 3.5 + 0.5);
+        // The cut is softened by the noise's own pixel footprint, so at distance the flecks resolve
+        // to their average instead of sparkling. The footprint is carried out of `foam_noise` on
+        // the same fetches that gave the value — `fwidth` is not available on this side of the gate
+        // — and the `* 3.5` is the spread above, which multiplies the derivative with the value.
+        let bw = max(0.07, raw.fw * 3.5 * 1.5);
+        // The taper must reach exactly zero where the band ends, not merely dim. `out` saturates at
+        // 1 out in open water, and a threshold sitting at 1 still admits the top of the spread
+        // field — which put flecks across the whole surface the first time this was tried.
+        bubbles = smoothstep(out - bw, out + bw, bub) * (1.0 - out);
+    }
 
     // ...and the wake's own aeration alongside them. `max`, not a sum: these are three ways for the
     // same surface to be white, and adding them blows out where a swimmer crosses a waterline —
