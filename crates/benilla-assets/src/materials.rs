@@ -243,7 +243,36 @@ impl MaterialExtension for WowModelExt {
     /// and only the soft edge around a body in the water is absent.
     ///
     /// The real fix is a prepass vertex shader of our own ([`MaterialExtension::prepass_vertex_shader`]
-    /// exists precisely for this) that skins the same way the main pass does. Until it lands, this.
+    /// exists precisely for this). **It is a larger job than that sentence suggests, and the cost is
+    /// worth writing down before someone starts it** — the liquid prepass was disabled for months
+    /// behind a diagnosis that turned out to be wrong (`liquid::depth`), so a guess recorded here
+    /// costs real time later.
+    ///
+    /// A twin has to reproduce this lane's position **bit for bit**, because the main pass tests
+    /// `GreaterEqual` against what the prepass wrote and a position one ULP short is a dropped
+    /// fragment. That means all of:
+    ///
+    /// * the camera-relative `p_cam` route, which exists precisely because the absolute one loses
+    ///   ~1 mm of precision at a ~9 k-yard origin (decision 0974) — a twin that reconstructs the
+    ///   position "equivalently" rather than identically reintroduces exactly that error;
+    /// * the WMO batch-order nudge, `position.z *= 1.0 + m.sun_scale.y * 1.1920929e-7`, which needs
+    ///   the MATERIAL bind group in the prepass;
+    /// * the `WOW_SKY_DEPTH` pin and the `WOW_MERGED_FADE` clip collapse, both of which move the
+    ///   depth deliberately;
+    /// * skinning through `wow_skin_model`, which needs the shared palette and `rig_origin`.
+    ///
+    /// And a vertex twin alone is not enough: the clutter lane is `AlphaMode::Mask`, so it carries
+    /// `MeshPipelineKey::MAY_DISCARD` and Bevy WILL attach a prepass fragment for it — which must
+    /// run the same alpha test, or the prepass writes depth through cut-out foliage.
+    ///
+    /// The shape that avoids the obvious trap — two copies of precision-critical arithmetic drifting
+    /// apart — is to give `wow_model.wgsl` a `#define_import_path` and export the position function,
+    /// then have the twin import it. No shader in this crate does that yet, so it is a new
+    /// convention rather than a local change.
+    ///
+    /// What staying out costs is one thing only: a body standing in water has no soft edge where it
+    /// meets the surface. Depth and colour are unaffected, because the column is measured past the
+    /// character to the terrain behind. Until the above lands, this.
     fn enable_prepass() -> bool {
         false
     }
