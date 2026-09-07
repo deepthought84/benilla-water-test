@@ -440,8 +440,19 @@ const PLANE_FADE: f32 = 2.5;
 /// wrong picture, and the sky mix it fades into is an honest one. The trusted band is generous
 /// enough that an ordinary river keeps its reflection, and the limit is where a chute or a
 /// cataract stops pretending.
-const SLOPE_TRUSTED: f32 = 0.10; // ~5.7 deg
-const SLOPE_LIMIT: f32 = 0.32; // ~18 deg
+/// **Tightened once the march landed**, and the reason is the march. These were 0.10 and 0.32,
+/// chosen when the capture was the only tier there was: fading a sloped surface out then did not
+/// hand it to something better, it simply took its reflection away, so the band had to be generous
+/// enough to let an ordinary river keep one. Elwynn's stream is 5.22 deg (3.044 yd of relief across
+/// one 33.33 yd chunk, measured), which the old band trusted **completely** — at a 10.4 deg ray
+/// error.
+///
+/// Screen-space reflection is exact at any orientation and, measured with `$WOW_SSR_SHOW`, is
+/// confident over nearly all of that same stream. So the capture no longer has to cover for it, and
+/// can be honest about where a horizontal mirror stops describing the surface: 5.22 deg now keeps
+/// about 0.71 of it and the rest comes from the tiers that are right.
+const SLOPE_TRUSTED: f32 = 0.03; // ~1.7 deg
+const SLOPE_LIMIT: f32 = 0.20; // ~11.5 deg
 
 /// How much the sample is *additionally* smeared as trust falls away.
 ///
@@ -656,6 +667,12 @@ const SSR_GROWTH: f32 = 1.22;
 /// The march finds the interval; this finds the point. Five halvings take the last step's error
 /// down by 32x, which is what turns a stair-stepped reflection edge into a clean one.
 const SSR_REFINE: i32 = 5;
+
+// **A finer march was tried and buys nothing.** 40 steps growing 1.12x from 0.25 yd — roughly twice
+// the near-field resolution — moved the hit rate over the Elwynn reach from 80.2 to 80.0, i.e. not
+// at all. The red speckle inside that stream's confidence is therefore NOT undersampling; it is
+// the thickness rejection and the genuine gaps between its rocks, and more steps only cost more.
+// Anyone reaching for these numbers to clean that speckle should look at [`SSR_THICKNESS`] instead.
 
 /// How far behind a surface a crossing may be and still count as a hit, in yards.
 ///
