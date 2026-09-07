@@ -439,6 +439,24 @@ fn reflect_debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_DEBUG").is_some())
 }
 
+/// `$WOW_REFLECT_SURFACES=1` — one line per water surface per frame: its height, footprint, depth
+/// and the share of the frame it was scored at.
+///
+/// Separate from `$WOW_REFLECT_TRACE` because it is a different order of noise — a coastal view
+/// carries seventy surfaces, so this is thousands of lines a second and is meant to be captured
+/// once and read, not watched.
+///
+/// It earns its place by being the only view of *why* a plane won. Twice now the frame-level trace
+/// showed a plane changing with nothing in the world changing, and both times the answer was in
+/// these numbers and nowhere else: first a single point crossing the frame edge (fixed by
+/// [`edge_fade`]), then one chunk's `area / depth²` running away as it neared the eye (fixed by
+/// [`Frame::screen_share`]). A plane is chosen from a sum over surfaces, and a sum is not
+/// debuggable from its total.
+fn trace_surfaces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_SURFACES").is_some())
+}
+
 /// `$WOW_REFLECT_TRACE=1` — one line a frame: the plane, whether the pass ran, and the target's
 /// size. It exists because everything this module decides is invisible in the frame it decides it
 /// (a reflection that is not drawn looks exactly like water that is not reflective), and because
@@ -573,6 +591,7 @@ fn plane_near(
     let [x, y, _] = bevy_to_wow(eye);
     let frame = Frame::new(forward, up, fov_y, aspect);
     let mut seen = Prominence::default();
+    let trace_on = trace_surfaces();
     let mut nearest: Option<(f32, f32)> = None; // (distance² to a wet sample, plane)
     for chunk in chunks {
         // The cheap reject first, on the footprint alone: everything below samples the grid.
@@ -598,15 +617,22 @@ fn plane_near(
         if eye.y <= z {
             continue;
         }
-        let Some((depth, on_screen)) = frame.depth_if_visible(eye, wow_to_bevy([at[0], at[1], z]))
-        else {
+        let sample = wow_to_bevy([at[0], at[1], z]);
+        let Some((depth, on_screen)) = frame.depth_if_visible(eye, sample) else {
             continue;
         };
         if depth > reach {
             continue;
         }
         let area = (max_x - min_x) * (max_y - min_y);
-        seen.add(z, on_screen * area / (depth * depth));
+        let share = frame.screen_share(eye, sample, depth, area) * on_screen;
+        if trace_on {
+            info!(
+                "  surf z {z:.2} area {area:.0} depth {depth:.1} on_screen {on_screen:.3} \
+                 share {share:.3}"
+            );
+        }
+        seen.add(z, share);
     }
     if std::env::var_os("WOW_REFLECT_TRACE").is_some() {
         info!(
@@ -646,9 +672,14 @@ fn plane_near(
 /// distance from 100 to 700 yd, with the ocean right there at 0.00.
 ///
 /// What actually decides which plane a capture should serve is **which water the player is mostly
-/// looking at**, and that is a question about screen area. A surface's projected area falls as
-/// `area / depth²`, so one chunk of pool close by and a hundred chunks of ocean far away can be
-/// compared on the same scale — and the ocean, being made of many chunks, accumulates.
+/// looking at**, and that is a question about screen area. [`Frame::screen_share`] gives each chunk
+/// its fraction of the window, so one chunk of pool close by and a hundred chunks of ocean far away
+/// can be compared on the same scale — and the ocean, being made of many chunks, accumulates.
+///
+/// The accumulated number is therefore **a share of the frame**: around 1.0 for a body filling the
+/// window, a few hundredths for one at the edge of notice. That scale is what lets
+/// [`HANDOVER_MARGIN`] be written as an absolute, which is the half of the switching fix that a
+/// ratio could not express.
 ///
 /// Heights are bucketed because a water body is many surfaces at one height: the ocean is hundreds
 /// of ADT chunks all at 0.0, and they have to add up rather than compete. [`BUCKET_YARDS`] is well
@@ -656,7 +687,7 @@ fn plane_near(
 /// together anyway.
 #[derive(Default)]
 struct Prominence {
-    /// `(height, accumulated area/depth²)`, in no order.
+    /// `(height, accumulated share of the frame)`, in no order.
     slots: [(f32, f32); PROMINENCE_SLOTS],
     used: usize,
 }
@@ -672,8 +703,28 @@ const BUCKET_YARDS: f32 = 0.5;
 /// expensive to look at however well-judged it is; two bodies scoring within a few percent of each
 /// other would otherwise trade the capture back and forth every time the camera breathed. A
 /// challenger that is genuinely what the player is looking at clears this easily — at the Savage
-/// Coast the pool outscored the ocean seven-fold — while a near-tie leaves the picture alone.
+/// Coast a pool under the camera covers the frame against an ocean at a quarter of it — while a
+/// near-tie leaves the picture alone. It is necessary and not sufficient: see [`HANDOVER_MARGIN`].
 const HYSTERESIS: f32 = 1.5;
+
+/// How much more of the frame a challenger must cover, in absolute share, before it may take the
+/// capture — on top of clearing [`HYSTERESIS`].
+///
+/// **A ratio alone cannot tell a real lead from noise, because a ratio has no scale.** Two bodies
+/// covering 8% and 16% of the frame are 2.1x apart and the difference is nothing anyone is looking
+/// at; two covering 40% and 84% are the same 2.1x and the second one plainly IS the view. Only the
+/// first of those should be refused, and no ratio can separate them.
+///
+/// This is now askable because [`Frame::screen_share`] returns a real fraction of the window. The
+/// old score was `area / depth²` — unbounded, and in no unit an absolute threshold could be written
+/// in — so a ratio was the only test available, and a pool receding to 8% of the frame took the
+/// capture off an ocean at 16% purely on the ratio. Measured on the reported flight up the Savage
+/// Coast, that alone accounts for a plane that went pool → ocean → pool → ocean over 100 yards of
+/// straight line.
+///
+/// A tenth of the window is the smallest lead worth a handover's cost: below it the switch is more
+/// visible than whatever it corrects.
+const HANDOVER_MARGIN: f32 = 0.10;
 
 /// How many distinct water heights can be ranked at once.
 ///
@@ -726,7 +777,9 @@ impl Prominence {
             .iter()
             .map(|(_, s)| *s)
             .fold(0.0_f32, f32::max);
-        if top > held_score * HYSTERESIS {
+        // Both bars, and for different reasons: the ratio refuses a near-tie at any size, the
+        // margin refuses a large ratio between two bodies that are both slivers of the frame.
+        if top > held_score * HYSTERESIS && top - held_score > HANDOVER_MARGIN {
             Some(challenger)
         } else {
             Some(held_z)
@@ -813,6 +866,46 @@ impl Frame {
             tan_v,
             tan_h: tan_v * aspect.max(0.1),
         }
+    }
+
+    /// What fraction of the frame a horizontal patch of `area` at height `z` covers, seen from
+    /// `eye` — never more than the whole frame.
+    ///
+    /// **`area / depth²` was the old answer and it is wrong twice**, which is why the capture plane
+    /// went on switching after the frame edge was made to fade. Both errors inflate the same term
+    /// and neither cancels the other.
+    ///
+    /// *It has no cosine.* `area / depth²` is the solid angle of a patch turned to FACE the camera.
+    /// Water is horizontal, so a body seen from a low eye is nearly edge-on and covers a small band
+    /// of screen however wide it is: the ocean's chunks at 300 yd, viewed from 11 yd up, subtend
+    /// about a fortieth of what the old term claimed. Left uncorrected it lets a body accumulate
+    /// far more than a screenful — the Savage Coast ocean summed to 2.3 *frames* — so the sum stops
+    /// meaning anything a second body can be compared against.
+    ///
+    /// *It is unbounded.* As a chunk approaches the eye its term grows without limit, while what it
+    /// can actually cover stops at the window. One pool chunk crossing from 33 yd to 13 yd
+    /// multiplied its score sixfold — enough to take the lead from an ocean that had not moved, and
+    /// then hand it back twenty yards later. That is the flip the recording shows: measured on this
+    /// flight the plane went pool → ocean → pool → ocean over 100 yards of straight line.
+    ///
+    /// So: project the patch properly (`cos` between the surface normal and the line of sight, which
+    /// for level water is the depression angle `dy / r`), divide by the world area the frustum spans
+    /// at that depth rather than by depth alone, and clamp at one frame. A chunk under the camera
+    /// now saturates instead of exploding, and chunks add up to something bounded by the screen they
+    /// are competing for.
+    fn screen_share(&self, eye: Vec3, point: Vec3, depth: f32, area: f32) -> f32 {
+        let r = eye.distance(point);
+        if !r.is_finite() || r <= f32::EPSILON {
+            return 1.0; // standing in it
+        }
+        // Level water's normal is up, so the foreshortening is the sine of the depression angle.
+        let cos_tilt = ((eye.y - point.y) / r).clamp(0.0, 1.0);
+        // The world area the frame spans at this depth: a `2·d·tan` by `2·d·tan` rectangle.
+        let frame_area = 4.0 * depth * depth * self.tan_h * self.tan_v;
+        if frame_area <= f32::EPSILON {
+            return 1.0;
+        }
+        (area * cos_tilt / frame_area).clamp(0.0, 1.0)
     }
 
     /// How far in front of the eye `point` is, or `None` when it is behind the camera or outside
@@ -1232,15 +1325,15 @@ mod tests {
         );
     }
 
-    /// **The switch, as arithmetic.** The measured Savage Coast numbers: the pool outscores the
-    /// ocean seven-fold while it is in frame, so it wins outright — and when the camera turns and
-    /// its score decays, the incumbent holds until the ocean is clearly better, instead of the two
-    /// trading the capture the instant they cross.
+    /// **The switch, as arithmetic**, in shares of the frame — see [`Frame::screen_share`]. The
+    /// pool under the camera fills the window against an ocean at a quarter of it, so it wins
+    /// outright; when the camera turns and its share decays, the incumbent holds until the ocean is
+    /// clearly better, instead of the two trading the capture the instant they cross.
     #[test]
     fn the_incumbent_holds_until_a_challenger_is_clearly_better() {
         let mut seen = Prominence::default();
-        seen.add(10.069875, 23.4); // the pool, in frame
-        seen.add(0.0, 3.9); // the ocean behind it
+        seen.add(10.069875, 1.00); // the pool, filling the frame
+        seen.add(0.0, 0.27); // the ocean behind it
         assert_eq!(
             seen.best_sticky(None),
             Some(10.069875),
@@ -1255,8 +1348,8 @@ mod tests {
         // The camera turns: the pool fades toward the frame edge and the ocean gains. A near-tie
         // must NOT flip — that is the twitch.
         let mut turning = Prominence::default();
-        turning.add(10.069875, 4.2);
-        turning.add(0.0, 4.8);
+        turning.add(10.069875, 0.63);
+        turning.add(0.0, 0.72);
         assert_eq!(
             turning.best_sticky(Some(10.069875)),
             Some(10.069875),
@@ -1265,12 +1358,50 @@ mod tests {
 
         // Further round, the ocean is unambiguously the subject and the handover happens.
         let mut past = Prominence::default();
-        past.add(10.069875, 2.0);
-        past.add(0.0, 9.0);
+        past.add(10.069875, 0.16);
+        past.add(0.0, 0.74);
         assert_eq!(
             past.best_sticky(Some(10.069875)),
             Some(0.0),
-            "4.5x clears the bar"
+            "4.6x and three-fifths of the window clears both bars"
+        );
+    }
+
+    /// **The reported flight, as arithmetic.** These are the measured shares from the Savage Coast
+    /// recording, flying north with the stream on one side and the ocean opening on the other. The
+    /// pool recedes to a twelfth of the frame and comes back; on the ratio alone the ocean took the
+    /// capture at `y = -100` and gave it back at `y = -80`, which is the switching that was
+    /// reported. The margin refuses both, and the one handover that should happen — the pool
+    /// leaving the frame for good — still happens.
+    #[test]
+    fn a_body_briefly_receding_does_not_take_the_capture() {
+        let flight = [
+            // (pool share, ocean share) at y = -140, -120, -100, -80, -60
+            (2.07_f32, 0.06_f32),
+            (0.53, 0.09),
+            (0.08, 0.16), // the ocean leads 2.1x here — on ratio alone, a handover
+            (1.01, 0.27),
+            (0.63, 0.64),
+        ];
+        let mut held = Some(10.069875_f32);
+        for (pool, ocean) in flight {
+            let mut seen = Prominence::default();
+            seen.add(10.069875, pool);
+            seen.add(0.0, ocean);
+            held = seen.best_sticky(held);
+            assert_eq!(
+                held,
+                Some(10.069875),
+                "the pool never covers a tenth of the frame less than the ocean: {pool} vs {ocean}"
+            );
+        }
+        // Past the mouth the stream is gone from the frame and the ocean is the whole subject.
+        let mut open = Prominence::default();
+        open.add(0.0, 0.74);
+        assert_eq!(
+            open.best_sticky(held),
+            Some(0.0),
+            "an incumbent that left the frame gives way"
         );
     }
 
@@ -1279,7 +1410,7 @@ mod tests {
     #[test]
     fn an_incumbent_that_left_the_frame_gives_way_at_once() {
         let mut seen = Prominence::default();
-        seen.add(0.0, 2.1); // only the ocean is left in frame
+        seen.add(0.0, 0.74); // only the ocean is left in frame
         assert_eq!(seen.best_sticky(Some(10.069875)), Some(0.0));
     }
 
