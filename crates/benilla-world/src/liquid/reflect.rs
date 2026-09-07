@@ -842,7 +842,14 @@ fn drive_reflection(
     let to_sun = light.celestial_dir.normalize_or_zero();
     data.0[4..8].copy_from_slice(&[to_sun.x, to_sun.y, to_sun.z, sun_visible.0]);
     let to_moon = light.moon_dir_white.normalize_or_zero();
-    data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_visible.0]);
+    // `$WOW_SCENE_SHOW` rides the moon lane's spare headroom, the way `$WOW_WAKE_SHOW` rides the
+    // sim's: the visibility term is a 0..1 fraction, so anything past 1.5 is unambiguous.
+    let moon_w = if std::env::var_os("WOW_SCENE_SHOW").is_some() {
+        2.0
+    } else {
+        moon_visible.0
+    };
+    data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_w]);
     let (zenith, horizon) = (light.sky[0], light.sky[4]);
     // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
     let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());

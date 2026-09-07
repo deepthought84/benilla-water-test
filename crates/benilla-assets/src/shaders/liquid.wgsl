@@ -113,6 +113,11 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var ripples_samp: sampler;
 // The stylised look's PLANAR REFLECTION: the world as a camera mirrored through the water plane
 // saw it (`benilla_world::liquid::reflect`), with **alpha as coverage**.
+// The opaque scene, snapshotted before anything transparent drew — what a screen-space reflection
+// reads once its ray has found a hit (`benilla_world::liquid::scene_color`).
+@group(#{MATERIAL_BIND_GROUP}) @binding(111) var scene_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(112) var scene_samp: sampler;
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var reflection_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var reflection_samp: sampler;
 
@@ -1065,6 +1070,15 @@ fn stylised_water(
     if (water_reflect.sky_zenith.w > 0.5) {
         let t = max(thickness, 0.0) / 8.0;
         return vec4<f32>(vec3<f32>(saturate(t)), 1.0);
+    }
+    // `$WOW_SCENE_SHOW` — paint the scene snapshot straight onto the water at this fragment's own
+    // screen position. If the copy is landing, the water becomes a window showing the world behind
+    // the camera's own view of it, seamlessly continuous with the frame around it; if the node
+    // never ran, it is black. Nothing downstream can distinguish those two, which is why this
+    // exists before the march that will depend on it.
+    if (water_reflect.moon.w > 1.5) {
+        let suv = frag_coord_to_uv(frag_coord);
+        return vec4<f32>(textureSample(scene_tex, scene_samp, suv).rgb, 1.0);
     }
     // `$WOW_WATER_TILT_SHOW` — the geometric tilt this fragment thinks it has, as greyscale, black
     // flat and white at [`SLOPE_LIMIT`]. The trust term reads this number and nothing in the final

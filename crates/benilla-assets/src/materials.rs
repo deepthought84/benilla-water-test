@@ -595,6 +595,17 @@ pub struct LiquidExt {
     #[texture(108, visibility(fragment))]
     #[sampler(109, visibility(fragment))]
     pub wake: Handle<Image>,
+
+    /// The opaque scene, snapshotted after the world has drawn and before anything transparent has
+    /// (`benilla_world::liquid::scene_color`) — what a screen-space reflection reads once its ray
+    /// has found a hit in the prepass depth.
+    ///
+    /// Bound unconditionally, like the mirror beside it and for the same reason: a binding that
+    /// only exists under `waterStyle` would make the toggle a pipeline rebuild instead of a uniform
+    /// write.
+    #[texture(111, visibility(fragment))]
+    #[sampler(112, visibility(fragment))]
+    pub scene_color: Handle<Image>,
     /// The reflection's per-frame parameters — plane height, strength, distortion — in one 16-byte
     /// buffer written once a frame in the render world (`benilla_world::liquid::reflect`). A
     /// *buffer* rather than a uniform on this material for the reason the light buffer beside it is

@@ -101,6 +101,7 @@ mod query;
 #[cfg(test)]
 mod real_data;
 mod reflect;
+mod scene_color;
 mod depth;
 mod ripple;
 mod ripple_sim;
@@ -307,6 +308,7 @@ impl Plugin for LiquidPlugin {
         ripple_sim::register(app);
         // ...and the scene depth it reads to know what is behind it, on the same terms: a second
         // geometry pass, attached only while the stylised look is selected.
+        scene_color::register(app);
         depth::register(app);
     }
 }

@@ -992,6 +992,7 @@ pub(super) fn setup_liquid(
     style: Res<WaterStyle>,
     reflect: Res<super::reflect::WaterReflect>,
     reflect_buf: Res<super::reflect::WaterReflectBuffer>,
+    scene_color: Res<super::scene_color::WaterSceneColor>,
     sim: Res<super::ripple_sim::RippleSim>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
@@ -1084,6 +1085,7 @@ pub(super) fn setup_liquid(
                     frames: frames.clone(),
                     ripples: ripples.clone(),
                     reflection: reflect.image.clone(),
+                    scene_color: scene_color.image.clone(),
                     wake: wake.clone(),
                     reflect_buf: reflect_buf.0.clone(),
                     // x = fullbright (magma/slime: the animated texture is the opaque body, skipping
