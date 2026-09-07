@@ -149,6 +149,9 @@ struct WaterReflect {
     // through. Water reflects moonlight as readily as sunlight and the first pass had it reflecting
     // none.
     moon: vec4<f32>,
+    /// `x` = the screen-space march is switched off (`$WOW_NO_SSR`); `y` = paint its confidence
+    /// instead of the water (`$WOW_SSR_SHOW`); `zw` spare.
+    flags: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<storage, read> water_reflect: WaterReflect;
 
@@ -638,6 +641,46 @@ fn ripple_layer(
     return transpose(r) * g;
 }
 
+/// How many steps the screen-space march takes before giving up, and how the step grows.
+///
+/// Geometric, not uniform: what a reflection needs resolved finely is the first few yards off the
+/// surface — the bank, the trunk base, the hull at the waterline — while the far end of the ray is
+/// a tree canopy that one long step lands on just as well. A uniform march fine enough for the near
+/// field would need hundreds of steps to reach the far one.
+const SSR_STEPS: i32 = 28;
+const SSR_FIRST_STEP: f32 = 0.35;
+const SSR_GROWTH: f32 = 1.22;
+
+/// How many times the crossing is bisected once the march has stepped past a surface.
+///
+/// The march finds the interval; this finds the point. Five halvings take the last step's error
+/// down by 32x, which is what turns a stair-stepped reflection edge into a clean one.
+const SSR_REFINE: i32 = 5;
+
+/// How far behind a surface a crossing may be and still count as a hit, in yards.
+///
+/// A depth buffer records a front face and says nothing about what is behind it, so a ray that
+/// passes *well* behind a thin object has not hit it — it has gone past it, through space the
+/// buffer cannot describe. Accepting those is what paints a tree's silhouette onto water the tree
+/// does not overhang. Six yards is generous enough for real geometry and mean enough to reject a
+/// ray that has left the visible world.
+const SSR_THICKNESS: f32 = 6.0;
+
+/// How far from the edge of the frame the march's confidence starts falling, in UV.
+///
+/// **The one artefact every screen-space reflection has**, and the only honest handling of it: the
+/// ray can only find what the camera drew, so a reflection whose source is off-screen has to stop
+/// existing — and it must stop *gradually*, or the boundary is a hard line across the water that
+/// moves whenever the camera does. Where this fades out, the planar capture and the sky mix
+/// underneath it are still there to take over.
+const SSR_EDGE_FADE: f32 = 0.14;
+
+/// A screen-space reflection hit: what was there, and how much to believe it.
+struct SsrHit {
+    rgb: vec3<f32>,
+    conf: f32,
+}
+
 /// The sky a surface facing `dir` reflects, off the dome's own zenith→horizon gradient.
 ///
 /// **This is what makes a wave visible when the sun is not behind it.** Mixing the reflection
@@ -738,9 +781,93 @@ fn foam_noise(p: vec2<f32>, t: f32, ddx: vec2<f32>, ddy: vec2<f32>) -> FoamNoise
     return out;
 }
 
+#ifdef DEPTH_PREPASS
+/// The scene depth under a world point, and the point's own depth, both in view space.
+///
+/// View Z runs negative into the screen, so "the ray is behind the surface" reads as `ray < scene`.
+/// A pixel the prepass never wrote clears to reverse-Z zero, which is the far plane — returned as
+/// a sentinel rather than taken at face value, exactly as the thickness lane does with it.
+fn ssr_probe(p: vec3<f32>, sample_index: u32) -> vec3<f32> {
+    let ndc = position_world_to_ndc(p);
+    if (ndc.z <= 0.0 || any(abs(ndc.xy) > vec2<f32>(1.0))) {
+        return vec3<f32>(0.0, 0.0, -1.0); // off screen or behind the eye
+    }
+    let uv = ndc_to_uv(ndc.xy);
+    let px = uv * view.viewport.zw + view.viewport.xy;
+    let d = prepass_depth(vec4<f32>(px, 0.0, 0.0), sample_index);
+    if (d <= 0.0) {
+        return vec3<f32>(0.0, 0.0, -1.0); // nothing was drawn here — unknown, not infinitely far
+    }
+    // x = the scene's view z, y = the ray's, z = the smaller UV distance to the frame's edge.
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    return vec3<f32>(depth_ndc_to_view_z(d), depth_ndc_to_view_z(ndc.z), edge);
+}
+
+/// March the reflected ray through the prepass depth and read the scene snapshot where it lands.
+///
+/// **This is the half of the water's reflection that a plane cannot do.** The direction traced is
+/// `reflect(-V, N)` on the fragment's OWN normal — ripple, wave sim and macro surface slope already
+/// summed — so a sloped stream and a rippled lake are the same code path, and neither needs a
+/// mirror to be built for it. What it cannot do is see off the screen, which is why it returns a
+/// confidence rather than just a colour: where the ray leaves the frame the planar capture and the
+/// sky mix behind it take over.
+///
+/// The water itself is not in the prepass (Bevy excludes alpha-blended materials, and
+/// `liquid::depth`'s doc keeps it that way deliberately), so there is no self-intersection to bias
+/// against — the first step off the surface is already reading opaque geometry only.
+fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, sample_index: u32) -> SsrHit {
+    var out: SsrHit;
+    out.rgb = vec3<f32>(0.0);
+    out.conf = 0.0;
+
+    var step = SSR_FIRST_STEP;
+    var t = SSR_FIRST_STEP;
+    var prev_t = 0.0;
+    for (var i = 0; i < SSR_STEPS; i = i + 1) {
+        let probe = ssr_probe(origin + dir * t, sample_index);
+        if (probe.z < 0.0) {
+            return out; // ran off the frame or into a pixel with no depth: no hit, no confidence
+        }
+        // Crossed behind the surface, and not so far behind that the ray has left the world the
+        // depth buffer can describe — see [`SSR_THICKNESS`].
+        if (probe.y < probe.x && probe.x - probe.y < SSR_THICKNESS) {
+            // Bisect the interval the march just stepped over.
+            var lo = prev_t;
+            var hi = t;
+            for (var r = 0; r < SSR_REFINE; r = r + 1) {
+                let mid = 0.5 * (lo + hi);
+                let m = ssr_probe(origin + dir * mid, sample_index);
+                if (m.z < 0.0) {
+                    break;
+                }
+                if (m.y < m.x) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let hit = origin + dir * hi;
+            let ndc = position_world_to_ndc(hit);
+            let uv = ndc_to_uv(ndc.xy);
+            out.rgb = textureSampleLevel(scene_tex, scene_samp, uv, 0.0).rgb;
+            let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+            out.conf = smoothstep(0.0, SSR_EDGE_FADE, edge);
+            return out;
+        }
+        prev_t = t;
+        step = step * SSR_GROWTH;
+        t = t + step;
+    }
+    return out;
+}
+#endif
+
 fn stylised_water(
     world_pos: vec3<f32>,
     frag_coord: vec2<f32>,
+    /// Which MSAA sample this fragment is — the prepass depth is multisampled and the march has to
+    /// read the same one the thickness lane does.
+    sample_index: u32,
     // Yards of water between this fragment and whatever opaque surface is behind it, or a negative
     // number where the scene depth is unavailable (the reference lane, no prepass) — in which case
     // every term below falls back to the authored depth byte, exactly as it did before.
@@ -947,6 +1074,35 @@ fn stylised_water(
     // switching off. See [`plane_trust`] for why a hard edge was the wrong shape: a pool and the
     // ocean are routinely in one shot, they are ten yards apart, and whichever one lost the coin
     // toss had no reflection at all.
+    // ---- screen-space reflection, over the planar capture, over the sky ------------------------
+    //
+    // The layering is the whole design, and each tier covers the one below's blind spot. SSR is
+    // right for any surface orientation because it traces the fragment's real normal, and blind to
+    // everything off the screen. The planar capture sees off-screen and behind the camera, and is
+    // right for one plane at one orientation. The sky is always available and always plausible.
+    //
+    // They fail in complementary places, which is why this is a hybrid rather than a compromise:
+    // open water is flat (where the plane is exact) and grazing (where the march runs off the
+    // frame), while a stream is sloped (where the plane is wrong by twice its tilt) and enclosed by
+    // banks a few yards away (where the march has plenty to hit).
+    var ssr: SsrHit;
+    ssr.rgb = vec3<f32>(0.0);
+    ssr.conf = 0.0;
+#ifdef DEPTH_PREPASS
+    if (water_reflect.params.y > 0.0
+        && water_reflect.flags.x < 0.5
+        && view.world_position.y > world_pos.y) {
+        ssr = ssr_trace(world_pos, reflect(-to_view, n), sample_index);
+    }
+#endif
+
+    // `$WOW_SSR_SHOW` — green where the march found a hit and how much it is believed, red where
+    // it found nothing. A reflection that is merely faint and one that was never traced look
+    // identical in the final image, which is the confusion this ends.
+    if (water_reflect.flags.y > 0.5) {
+        return vec4<f32>(1.0 - ssr.conf, ssr.conf, 0.0, 1.0);
+    }
+
     let plane_error = abs(world_pos.y - water_reflect.params.x);
     let trust = plane_trust(plane_error, water_reflect.params.w, tilt);
     if (water_reflect.params.y > 0.0 && trust > 0.0 && view.world_position.y > world_pos.y) {
@@ -996,9 +1152,25 @@ fn stylised_water(
         // angle, which is what stops it reading as perfect. It is a dimmer, not a distorter: the
         // knob for a *broken* reflection rather than a fainter one is `REFLECT_DISTORT` on the CPU
         // side.
-        let amount =
-            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * mirrored.a * trust;
+        // `1 - ssr.conf`: where the march found the answer itself, the capture stands down rather
+        // than averaging with it. Two reflections of one surface blended together is a double
+        // image, not a better one.
+        let amount = mix(0.02, REFLECT_MAX, fresnel)
+            * water_reflect.params.y
+            * mirrored.a
+            * trust
+            * (1.0 - ssr.conf);
         rgb = mix(rgb, mirrored.rgb, amount);
+    }
+
+    // …and the march's own contribution, on the same Fresnel weight the tiers below it use, so the
+    // water does not change how reflective it is depending on which tier answered.
+    if (ssr.conf > 0.0) {
+        rgb = mix(
+            rgb,
+            ssr.rgb,
+            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * ssr.conf,
+        );
     }
 
     // The glitter path: the same Blinn highlight the reference computes, evaluated against the
@@ -1459,6 +1631,7 @@ fn fragment(
         return stylised_water(
             in.world_position.xyz,
             in.clip_position.xy,
+            sample_index,
             thickness,
             style_depth,
             in.shore,

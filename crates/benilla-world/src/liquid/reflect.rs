@@ -267,7 +267,7 @@ pub(crate) struct WaterReflect {
 /// per-frame scalar. They are written unconditionally — the water's glitter needs them on exactly
 /// the frames the reflection is off.
 #[derive(Resource, Clone, Copy, Default, ExtractResource)]
-pub(crate) struct WaterReflectData(pub(crate) [f32; 24]);
+pub(crate) struct WaterReflectData(pub(crate) [f32; 28]);
 
 /// The buffer every liquid material binds (`#[storage(107, …)]`), written once a frame in the render
 /// world — the same shape as the shared light buffer, and for the same reason: a per-frame material
@@ -399,7 +399,7 @@ fn setup_reflection(
     commands.insert_resource(WaterReflectBuffer(device.create_buffer(
         &BufferDescriptor {
             label: Some("water_reflect_params"),
-            size: 96,
+            size: 112,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         },
@@ -415,6 +415,15 @@ fn setup_reflection(
 fn no_reflect() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("WOW_NO_REFLECT").is_some())
+}
+
+/// `$WOW_NO_SSR=1` — the screen-space march's kill switch, in the mould of `$WOW_NO_REFLECT`.
+///
+/// The march and the mirror answer the same question by different means, so the only way to grade
+/// either is to turn the other off. Read once, like every lever here.
+fn no_ssr() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("WOW_NO_SSR").is_some())
 }
 
 /// `$WOW_REFLECT_DEBUG=1` — draw the mirrored camera's image **to the window** instead of into the
@@ -850,6 +859,11 @@ fn drive_reflection(
         moon_visible.0
     };
     data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_w]);
+    // The flag row. `x` = the screen-space march's kill switch (`$WOW_NO_SSR`), which is the A/B
+    // this tier is priced and graded with — the same shape `$WOW_NO_REFLECT` gives the mirror.
+    // `y` = `$WOW_SSR_SHOW`, which paints the march's confidence instead of the water.
+    let ssr_show = f32::from(std::env::var_os("WOW_SSR_SHOW").is_some());
+    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, 0.0, 0.0]);
     let (zenith, horizon) = (light.sky[0], light.sky[4]);
     // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
     let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());
