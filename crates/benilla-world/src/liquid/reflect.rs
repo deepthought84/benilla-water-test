@@ -439,8 +439,31 @@ fn reflect_debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_DEBUG").is_some())
 }
 
+/// `$WOW_REFLECT_PLANE=<height>` — serve this capture plane instead of the one
+/// [`plane_near`] elected, in raw WoW `z`.
+///
+/// The instrument for the only question that matters about a handover: **not how often the plane
+/// changes, but what changes when it does.** Everything else here measures the choice — this
+/// measures the cost, by capturing one viewpoint twice with the two planes it is choosing between
+/// and diffing them. A handover the trust falloff and the screen-space tier fully cover is one the
+/// player cannot see, and that is the bar; counting handovers only ever showed how often the bar
+/// was being tested.
+///
+/// It defeats the election entirely, so it is a measuring tool and not a setting — a pinned plane
+/// is wrong for every body that is not at that height.
+fn pinned_plane() -> Option<f32> {
+    static PIN: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *PIN.get_or_init(|| {
+        std::env::var("WOW_REFLECT_PLANE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// `$WOW_REFLECT_SURFACES=1` — one line per water surface per frame: its height, footprint, depth
-/// and the share of the frame it was scored at.
+/// and the share of the frame it covers, plus a `DROP` line naming why a surface was not scored at
+/// all. The drops are the half worth reading: a body can only lose the capture to arithmetic, and a
+/// surface that never reaches the sum is invisible in the total it is missing from.
 ///
 /// Separate from `$WOW_REFLECT_TRACE` because it is a different order of noise — a coastal view
 /// carries seventy surfaces, so this is thousands of lines a second and is meant to be captured
@@ -449,9 +472,11 @@ fn reflect_debug() -> bool {
 /// It earns its place by being the only view of *why* a plane won. Twice now the frame-level trace
 /// showed a plane changing with nothing in the world changing, and both times the answer was in
 /// these numbers and nowhere else: first a single point crossing the frame edge (fixed by
-/// [`edge_fade`]), then one chunk's `area / depth²` running away as it neared the eye (fixed by
-/// [`Frame::screen_share`]). A plane is chosen from a sum over surfaces, and a sum is not
-/// debuggable from its total.
+/// a fade), then one chunk's `area / depth²` running away as it neared the eye, and then the whole
+/// body underfoot being dropped as off-screen because the point chosen to stand for it was the one
+/// nearest the eye. All three are gone now that [`Frame::footprint_share`] measures the footprint
+/// instead of sampling it. A plane is chosen from a sum over surfaces, and a sum is not debuggable
+/// from its total.
 fn trace_surfaces() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_SURFACES").is_some())
@@ -520,17 +545,12 @@ fn reflection_image(size: UVec2) -> Image {
 /// lattice is for. It runs only when the cheap point missed, and only for the surfaces near enough
 /// to be the fallback plane (`lattice`); see [`look_reach`] for why the walk now visits
 /// many more surfaces than it can afford to probe.
-fn wet_height_near(
-    chunk: &WaterChunkInfo,
-    x: f32,
-    y: f32,
-    lattice: bool,
-) -> Option<(f32, f32, [f32; 2])> {
+fn wet_height_near(chunk: &WaterChunkInfo, x: f32, y: f32, lattice: bool) -> Option<(f32, f32)> {
     let [[min_x, min_y], [max_x, max_y]] = chunk.xy_bounds()?;
     let (cx, cy) = (x.clamp(min_x, max_x), y.clamp(min_y, max_y));
     let d2 = |px: f32, py: f32| (px - x) * (px - x) + (py - y) * (py - y);
     if let Some(z) = chunk.surface_z_at(cx, cy) {
-        return Some((z, d2(cx, cy), [cx, cy]));
+        return Some((z, d2(cx, cy)));
     }
     // Only for the surfaces near enough to be the fallback plane. The lattice is 25 grid probes and
     // the walk now reaches out to [`look_reach`], which is several times the surfaces —
@@ -541,7 +561,7 @@ fn wet_height_near(
         return None;
     }
     const N: i32 = 4;
-    let mut best: Option<(f32, f32, [f32; 2])> = None;
+    let mut best: Option<(f32, f32)> = None;
     for i in 0..=N {
         for j in 0..=N {
             let px = min_x + (max_x - min_x) * i as f32 / N as f32;
@@ -550,12 +570,12 @@ fn wet_height_near(
                 continue;
             };
             let d = d2(px, py);
-            if best.is_none_or(|(bd, _, _)| d < bd) {
-                best = Some((d, z, [px, py]));
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, z));
             }
         }
     }
-    best.map(|(d, z, at)| (z, d, at))
+    best.map(|(d, z)| (z, d))
 }
 
 /// The water plane to mirror through: **the surface the camera is looking at**, out to
@@ -605,7 +625,7 @@ fn plane_near(
         }
         // Near enough to be the *fallback* plane, which is a shorter reach than the look test's.
         let near = foot_d2 <= REFLECT_RADIUS * REFLECT_RADIUS;
-        let Some((z, d2, at)) = wet_height_near(chunk, x, y, near) else {
+        let Some((z, d2)) = wet_height_near(chunk, x, y, near) else {
             continue; // a footprint with no wet cell in reach
         };
         if near && nearest.is_none_or(|(bd2, _)| d2 < bd2) {
@@ -615,22 +635,35 @@ fn plane_near(
         // centre ray on it" (which the sea fails from up the beach) and not "is it the nearest one
         // in frame" (which hands a roadside pool the capture while the sea fills the window).
         if eye.y <= z {
+            if trace_on {
+                info!("  DROP z {z:.2} eye {:.2} below surface", eye.y);
+            }
             continue;
         }
-        let sample = wow_to_bevy([at[0], at[1], z]);
-        let Some((depth, on_screen)) = frame.depth_if_visible(eye, sample) else {
+        // The footprint, measured rather than sampled — see [`Frame::footprint_share`]. `at` is
+        // still the right sample for the surface's HEIGHT; it was never the right one for how much
+        // of the screen the surface covers.
+        let corners = [
+            wow_to_bevy([min_x, min_y, z]),
+            wow_to_bevy([max_x, min_y, z]),
+            wow_to_bevy([max_x, max_y, z]),
+            wow_to_bevy([min_x, max_y, z]),
+        ];
+        let Some((depth, share)) = frame.footprint_share(eye, corners) else {
+            if trace_on {
+                info!("  DROP z {z:.2} footprint off screen");
+            }
             continue;
         };
         if depth > reach {
+            if trace_on {
+                info!("  DROP z {z:.2} depth {depth:.0} past reach");
+            }
             continue;
         }
-        let area = (max_x - min_x) * (max_y - min_y);
-        let share = frame.screen_share(eye, sample, depth, area) * on_screen;
         if trace_on {
-            info!(
-                "  surf z {z:.2} area {area:.0} depth {depth:.1} on_screen {on_screen:.3} \
-                 share {share:.3}"
-            );
+            let area = (max_x - min_x) * (max_y - min_y);
+            info!("  surf z {z:.2} area {area:.0} depth {depth:.1} share {share:.4}");
         }
         seen.add(z, share);
     }
@@ -672,8 +705,8 @@ fn plane_near(
 /// distance from 100 to 700 yd, with the ocean right there at 0.00.
 ///
 /// What actually decides which plane a capture should serve is **which water the player is mostly
-/// looking at**, and that is a question about screen area. [`Frame::screen_share`] gives each chunk
-/// its fraction of the window, so one chunk of pool close by and a hundred chunks of ocean far away
+/// looking at**, and that is a question about screen area. [`Frame::footprint_share`] gives each
+/// chunk its measured fraction of the window, so one chunk of pool close by and a hundred chunks of ocean far away
 /// can be compared on the same scale — and the ocean, being made of many chunks, accumulates.
 ///
 /// The accumulated number is therefore **a share of the frame**: around 1.0 for a body filling the
@@ -715,15 +748,15 @@ const HYSTERESIS: f32 = 1.5;
 /// at; two covering 40% and 84% are the same 2.1x and the second one plainly IS the view. Only the
 /// first of those should be refused, and no ratio can separate them.
 ///
-/// This is now askable because [`Frame::screen_share`] returns a real fraction of the window. The
-/// old score was `area / depth²` — unbounded, and in no unit an absolute threshold could be written
-/// in — so a ratio was the only test available, and a pool receding to 8% of the frame took the
-/// capture off an ocean at 16% purely on the ratio. Measured on the reported flight up the Savage
-/// Coast, that alone accounts for a plane that went pool → ocean → pool → ocean over 100 yards of
-/// straight line.
+/// This is askable at all only because [`Frame::footprint_share`] returns a real fraction of the
+/// window. The score before it was `area / depth²` — unbounded, and in no unit an absolute
+/// threshold could be written in — so a ratio was the only test available.
 ///
-/// A tenth of the window is the smallest lead worth a handover's cost: below it the switch is more
-/// visible than whatever it corrects.
+/// **It is a guard, not the fix.** The reported flight up the Savage Coast is held by the
+/// measurement now: with footprints the stream's share is a smooth 0.6 the whole way in and the
+/// rule hands the capture over once, at the mouth, with or without this margin. What this still
+/// buys is the case the measurement cannot settle — two bodies both reduced to slivers, where a
+/// large ratio between two small numbers is noise and a handover costs more than it corrects.
 const HANDOVER_MARGIN: f32 = 0.10;
 
 /// How many distinct water heights can be ranked at once.
@@ -829,29 +862,68 @@ struct Frame {
     tan_h: f32,
 }
 
-/// How far past the frustum's true edge a surface still counts as "looked at".
-///
-/// Generous on purpose. The test stands on ONE point of a surface that is usually far wider than
-/// the screen, so a sea whose nearest wet cell sits just off the left edge is still the thing being
-/// looked at; being strict about the edge would reintroduce the popping this exists to remove, just
-/// at a different boundary.
-const FRAME_SLOP: f32 = 1.35;
+/// The nearest depth a footprint vertex may keep, in yards. Anything closer is trimmed away by
+/// [`clip_near`] so the perspective divide stays finite.
+const MIN_DEPTH: f32 = 0.05;
 
-/// How a surface's contribution falls off as it leaves the frame — 1 well inside, 0 well outside.
-///
-/// **A step function here is what made the capture plane switch**, and it is worth being precise
-/// about why, because the symptom looked like a reflection bug rather than a scoring one. Each
-/// surface is tested at ONE point, so an in-or-out test makes its whole score appear and vanish the
-/// instant that point crosses the edge: measured at the Savage Coast, a 10 deg turn took a pool
-/// from 37.7 to absent, the winner flipped to the ocean, and every fragment in the frame changed
-/// its plane error, its trust, its reprojection and the mirror's clip in one frame. The water had
-/// not moved; the arithmetic had.
-///
-/// Fading the contribution across the frame edge instead makes the score continuous, so a
-/// crossover between two bodies is a slow trade rather than a jump.
-fn edge_fade(offset: f32, half_extent: f32) -> f32 {
-    let outer = half_extent * FRAME_SLOP;
-    1.0 - ((offset - half_extent) / (outer - half_extent)).clamp(0.0, 1.0)
+/// The most vertices a clipped footprint can have: a quad, plus one per clipping plane.
+const POLY_MAX: usize = 12;
+
+/// A polygon under construction — a fixed buffer, because this runs per surface per frame and a
+/// heap allocation there buys nothing.
+struct Poly<const N: usize> {
+    v: [[f32; 3]; POLY_MAX],
+    n: usize,
+}
+
+impl<const N: usize> Poly<N> {
+    fn new() -> Self {
+        Self {
+            v: [[0.0; 3]; POLY_MAX],
+            n: 0,
+        }
+    }
+
+    fn push(&mut self, p: [f32; 3]) {
+        if self.n < POLY_MAX {
+            self.v[self.n] = p;
+            self.n += 1;
+        }
+    }
+
+    /// Sutherland–Hodgman against one half-space `keep(v) >= 0`, interpolating the crossings.
+    ///
+    /// Convex in, convex out, which is why one pass per plane is enough and why the area below can
+    /// be a plain shoelace.
+    fn clip(&self, keep: impl Fn(&[f32; 3]) -> f32) -> Self {
+        let mut out = Self::new();
+        for i in 0..self.n {
+            let (a, b) = (self.v[i], self.v[(i + 1) % self.n]);
+            let (fa, fb) = (keep(&a), keep(&b));
+            if fa >= 0.0 {
+                out.push(a);
+            }
+            if (fa >= 0.0) != (fb >= 0.0) {
+                let t = fa / (fa - fb);
+                out.push([
+                    a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t,
+                ]);
+            }
+        }
+        out
+    }
+
+    /// Twice the signed area in the `[1]`/`[2]` components — the shoelace sum.
+    fn double_area(&self) -> f32 {
+        let mut acc = 0.0;
+        for i in 0..self.n {
+            let (a, b) = (self.v[i], self.v[(i + 1) % self.n]);
+            acc += a[1] * b[2] - b[1] * a[2];
+        }
+        acc
+    }
 }
 
 impl Frame {
@@ -868,59 +940,72 @@ impl Frame {
         }
     }
 
-    /// What fraction of the frame a horizontal patch of `area` at height `z` covers, seen from
-    /// `eye` — never more than the whole frame.
+    /// What fraction of the window a surface's footprint covers, and the nearest depth of the part
+    /// that is actually on screen — or `None` when none of it is.
     ///
-    /// **`area / depth²` was the old answer and it is wrong twice**, which is why the capture plane
-    /// went on switching after the frame edge was made to fade. Both errors inflate the same term
-    /// and neither cancels the other.
+    /// **This replaces scoring a surface at a single representative point, which has now produced
+    /// the same bug three times.** A point is cheap and it is not the shape: a footprint is a
+    /// 33-yard chunk and the frame is a window, so any one point of it answers for a place the body
+    /// mostly is not. Each time the fix was to make the point behave better and each time the
+    /// failure came back somewhere else — the point crossing the frame edge made the whole score
+    /// vanish (patched with a fade), the point's `area / depth²` ran away as it neared the eye
+    /// (patched with a proper share), and then the point chosen was the footprint's *nearest* one,
+    /// which for the water you are standing over is directly underfoot and below the bottom of the
+    /// screen. Measured on the reported flight: seventeen chunks of the stream dropped as "not
+    /// visible" including a full 1111 yd² chunk three yards in front of the camera, the body
+    /// filling the frame scored 0.043, and the ocean took the capture.
     ///
-    /// *It has no cosine.* `area / depth²` is the solid angle of a patch turned to FACE the camera.
-    /// Water is horizontal, so a body seen from a low eye is nearly edge-on and covers a small band
-    /// of screen however wide it is: the ocean's chunks at 300 yd, viewed from 11 yd up, subtend
-    /// about a fortieth of what the old term claimed. Left uncorrected it lets a body accumulate
-    /// far more than a screenful — the Savage Coast ocean summed to 2.3 *frames* — so the sum stops
-    /// meaning anything a second body can be compared against.
+    /// So the footprint is measured instead of sampled. Its four corners go to view space, the part
+    /// behind the eye is trimmed rather than dropped, the rest is projected and clipped to the
+    /// window, and the area of what survives is the answer.
     ///
-    /// *It is unbounded.* As a chunk approaches the eye its term grows without limit, while what it
-    /// can actually cover stops at the window. One pool chunk crossing from 33 yd to 13 yd
-    /// multiplied its score sixfold — enough to take the lead from an ocean that had not moved, and
-    /// then hand it back twenty yards later. That is the flip the recording shows: measured on this
-    /// flight the plane went pool → ocean → pool → ocean over 100 yards of straight line.
+    /// Three properties come out of that for free, each of which was a patch before. It is
+    /// **bounded** — clipped to the window, a surface cannot claim more than the screen, so the
+    /// sum over the chunks of one body means something. It is **foreshortened** — a horizontal
+    /// sheet seen from a low eye projects to a thin band without a cosine term written anywhere.
+    /// And it is **continuous** — a body leaving the frame loses area smoothly, so no fade is
+    /// needed to stop the score stepping.
     ///
-    /// So: project the patch properly (`cos` between the surface normal and the line of sight, which
-    /// for level water is the depression angle `dy / r`), divide by the world area the frustum spans
-    /// at that depth rather than by depth alone, and clamp at one frame. A chunk under the camera
-    /// now saturates instead of exploding, and chunks add up to something bounded by the screen they
-    /// are competing for.
-    fn screen_share(&self, eye: Vec3, point: Vec3, depth: f32, area: f32) -> f32 {
-        let r = eye.distance(point);
-        if !r.is_finite() || r <= f32::EPSILON {
-            return 1.0; // standing in it
+    /// The footprint is the surface's full rectangle, wet cells or not; an L-shaped canal bend is
+    /// therefore over-credited by the dry part of its box. That was true of the `area` term this
+    /// replaces and it is the right trade — the alternative is walking the wet grid per surface per
+    /// frame to score a body that is already known to be in view.
+    fn footprint_share(&self, eye: Vec3, corners: [Vec3; 4]) -> Option<(f32, f32)> {
+        // View space, as (depth along forward, right, up) — the basis the clip and the projection
+        // both want.
+        let mut poly = Poly::<POLY_MAX>::new();
+        for c in corners {
+            let v = c - eye;
+            poly.push([v.dot(self.forward), v.dot(self.right), v.dot(self.up)]);
         }
-        // Level water's normal is up, so the foreshortening is the sine of the depression angle.
-        let cos_tilt = ((eye.y - point.y) / r).clamp(0.0, 1.0);
-        // The world area the frame spans at this depth: a `2·d·tan` by `2·d·tan` rectangle.
-        let frame_area = 4.0 * depth * depth * self.tan_h * self.tan_v;
-        if frame_area <= f32::EPSILON {
-            return 1.0;
-        }
-        (area * cos_tilt / frame_area).clamp(0.0, 1.0)
-    }
-
-    /// How far in front of the eye `point` is, or `None` when it is behind the camera or outside
-    /// the frame. The depth is along `forward`, not the straight-line distance: it is the ordering
-    /// the phrase "the nearest water on screen" actually wants, and it is what a projection uses.
-    fn depth_if_visible(&self, eye: Vec3, point: Vec3) -> Option<(f32, f32)> {
-        let v = point - eye;
-        let depth = v.dot(self.forward);
-        if depth <= 0.0 {
+        // Behind the eye is trimmed, not dropped: the chunk underfoot reaches back past the camera
+        // and it is the part in FRONT that fills the screen.
+        let near = poly.clip(|p| p[0] - MIN_DEPTH);
+        if near.n < 3 {
             return None;
         }
-        let vertical = (v.dot(self.up) / depth).abs();
-        let horizontal = (v.dot(self.right) / depth).abs();
-        let weight = edge_fade(vertical, self.tan_v) * edge_fade(horizontal, self.tan_h);
-        (weight > 0.0).then_some((depth, weight))
+        let depth = near.v[..near.n]
+            .iter()
+            .map(|p| p[0])
+            .fold(f32::MAX, f32::min);
+        // Project: the window is [-1, 1] in both axes.
+        let mut screen = Poly::<POLY_MAX>::new();
+        for i in 0..near.n {
+            let [d, r, u] = near.v[i];
+            screen.push([d, r / (d * self.tan_h), u / (d * self.tan_v)]);
+        }
+        // Straight lines stay straight under projection, so clipping the window in 2D is exact.
+        let clipped = screen
+            .clip(|p| p[1] + 1.0)
+            .clip(|p| 1.0 - p[1])
+            .clip(|p| p[2] + 1.0)
+            .clip(|p| 1.0 - p[2]);
+        if clipped.n < 3 {
+            return None;
+        }
+        // The window itself is 2 by 2, so its area is 4 and the shoelace gives twice the polygon's.
+        let share = (clipped.double_area().abs() / 8.0).clamp(0.0, 1.0);
+        (share > 0.0).then_some((depth, share))
     }
 }
 
@@ -1003,6 +1088,8 @@ fn drive_reflection(
         off(&mut mirror_cam, &mut data);
         return;
     };
+    // Pinned, for measuring what a handover costs — see [`pinned_plane`].
+    let plane = pinned_plane().unwrap_or(plane);
     // Under the surface there is nothing to reflect: the sky is on the other side of it, and the
     // mirrored camera would be above the water looking down at the bed.
     if eye_pos.y <= plane {
@@ -1167,14 +1254,14 @@ mod tests {
         // The dry corner of the same footprint: the point test says nothing is here …
         assert!(chunk.surface_z_at(1.0, 1.0).is_none());
         // … and the surface's own answer is still its water, with the distance to it.
-        let (z, d2, _) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the wet cell is found");
+        let (z, d2) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the wet cell is found");
         assert!(
             (z - 42.0).abs() < 1e-3,
             "the pool's height, not a guess: {z}"
         );
         assert!(d2 > 0.0, "the sample is somewhere else on the surface");
         // A point over the wet cell answers directly, at no distance.
-        let (z, d2, _) = wet_height_near(&chunk, 15.0, 15.0, false).expect("wet under the point");
+        let (z, d2) = wet_height_near(&chunk, 15.0, 15.0, false).expect("wet under the point");
         assert!((z - 42.0).abs() < 1e-3);
         assert!(d2 < 1e-6, "the near point itself was wet: {d2}");
         // Note this surface never needs the lattice: `xy_bounds` is the bounding box of the WET
@@ -1214,13 +1301,25 @@ mod tests {
             chunk.surface_z_at(1.0, 1.0).is_none(),
             "the fixture's corner is dry"
         );
-        let (z, d2, _) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the lattice finds the L");
+        let (z, d2) = wet_height_near(&chunk, 1.0, 1.0, true).expect("the lattice finds the L");
         assert!((z - 7.0).abs() < 1e-3, "the L's height: {z}");
         assert!(d2 > 0.0, "the water is somewhere else on the surface");
         assert!(
             wet_height_near(&chunk, 1.0, 1.0, false).is_none(),
             "without the lattice a dry corner is simply not a candidate"
         );
+    }
+
+    /// A square footprint of `side` yards centred on WoW `(x, y)` at height `z`, as the four Bevy
+    /// corners [`Frame::footprint_share`] takes.
+    fn patch(x: f32, y: f32, z: f32, side: f32) -> [Vec3; 4] {
+        let h = side * 0.5;
+        [
+            wow_to_bevy([x - h, y - h, z]),
+            wow_to_bevy([x + h, y - h, z]),
+            wow_to_bevy([x + h, y + h, z]),
+            wow_to_bevy([x - h, y + h, z]),
+        ]
     }
 
     /// **The ocean regression, as arithmetic.** A camera 12 yd above sea level, 400 yd up the
@@ -1237,19 +1336,15 @@ mod tests {
         let frame = Frame::new(forward, Vec3::Y, 0.8, 16.0 / 9.0);
         let eye = Vec3::new(0.0, 12.0, 0.0);
 
-        // The sea, 400 yd ahead at sea level: 1.7 deg below the horizon, well inside a 23 deg
-        // half-frame, so it is on screen and the test must say so.
-        let sea = Vec3::new(-400.0, 0.0, 0.0);
-        let (depth, weight) = frame
-            .depth_if_visible(eye, sea)
+        // The sea, a 200 yd stretch centred 400 yd ahead at sea level: 1.7 deg below the horizon,
+        // well inside a 23 deg half-frame, so it is on screen and the test must say so.
+        let (depth, share) = frame
+            .footprint_share(eye, patch(0.0, 400.0, 0.0, 200.0))
             .expect("the sea is in the upper half of the frame");
+        assert!(share > 0.0, "it covers some of the window: {share}");
         assert!(
-            weight > 0.9,
-            "well inside the frame, so barely faded: {weight}"
-        );
-        assert!(
-            (depth - 400.0).abs() < 5.0,
-            "depth should be the distance ahead: {depth}"
+            depth > 250.0 && depth < 400.0,
+            "the near edge of the stretch: {depth}"
         );
 
         // The centre ray, for contrast: it crosses sea level at 12/tan(3 deg) ≈ 229 yd — dry sand,
@@ -1259,6 +1354,80 @@ mod tests {
             centre_hit < 300.0,
             "the centre ray lands on the beach, not the sea: {centre_hit}"
         );
+    }
+
+    /// **The water you are standing over is the water most likely to be missed.** Scoring a surface
+    /// at the point of its footprint nearest the eye put that point directly underfoot — off the
+    /// bottom of the screen — so the chunk filling the frame was dropped as "not visible" and the
+    /// plane went to whatever was on the horizon. Measuring the footprint trims the part behind the
+    /// camera and keeps the part in front, which is the part being looked at.
+    #[test]
+    fn a_surface_the_camera_stands_over_still_fills_the_frame() {
+        // Level-ish, looking along WoW +x (Bevy −Z), eye four yards up.
+        let frame = Frame::new(Vec3::new(0.0, -0.2, -1.0).normalize(), Vec3::Y, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 4.0, 0.0);
+        // A 33 yd chunk centred on the camera: it reaches 16 yd behind and 16 yd ahead.
+        let (_, share) = frame
+            .footprint_share(eye, patch(0.0, 0.0, 0.0, 33.0))
+            .expect("the half in front of the camera is on screen");
+        assert!(
+            share > 0.2,
+            "the water underfoot covers a real part of the window: {share}"
+        );
+    }
+
+    /// A surface cannot claim more window than there is, however close it comes — the property that
+    /// made the old `area / depth²` term run away as a chunk neared the eye.
+    #[test]
+    fn a_footprint_never_claims_more_than_the_whole_window() {
+        // Straight down, so `up` must be something other than +Y or the basis is degenerate.
+        let frame = Frame::new(Vec3::new(0.0, -1.0, 0.0), Vec3::NEG_Z, 0.8, 16.0 / 9.0);
+        let eye = Vec3::new(0.0, 2.0, 0.0); // water two yards below
+        for side in [50.0, 500.0, 5000.0] {
+            let (_, share) = frame
+                .footprint_share(eye, patch(0.0, 0.0, 0.0, side))
+                .expect("directly below the camera");
+            assert!(
+                share <= 1.0 + f32::EPSILON,
+                "a {side} yd sheet still covers one window at most: {share}"
+            );
+            assert!(share > 0.99, "and it does cover it: {share}");
+        }
+    }
+
+    /// A body leaving the frame loses its share smoothly. This is what a hysteresis rule needs in
+    /// order to have anything to hold, and it is now a property of the measurement rather than a
+    /// fade bolted onto a point test.
+    #[test]
+    fn a_surface_leaves_the_frame_continuously() {
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        let mut prev = None;
+        let mut biggest_step = 0.0_f32;
+        let mut partials = 0;
+        // Swing the camera away from a patch off to one side and watch its share decay.
+        for step in 0..40 {
+            let yaw = step as f32 * 0.05;
+            let forward = Vec3::new(-yaw.cos(), -0.1, yaw.sin()).normalize();
+            let frame = Frame::new(forward, Vec3::Y, 0.8, 16.0 / 9.0);
+            let share = frame
+                .footprint_share(eye, patch(0.0, 60.0, 0.0, 40.0))
+                .map_or(0.0, |(_, s)| s);
+            if let Some(p) = prev {
+                biggest_step = biggest_step.max((share - p as f32).abs());
+            }
+            if share > 0.0 {
+                partials += 1;
+            }
+            prev = Some(share);
+        }
+        // The property that matters is that no single step drops the whole contribution — that is
+        // what a step function does, and what made the plane change hands in one frame.
+        assert!(
+            biggest_step < 0.02,
+            "the share moves smoothly, never all at once: {biggest_step}"
+        );
+        assert!(partials > 3, "it was in frame for a while first: {partials}");
+        assert_eq!(prev, Some(0.0), "and it is gone by the end");
     }
 
     /// **The Savage Coast ranking, with the measured geometry.** A single pool at the roadside
@@ -1325,7 +1494,7 @@ mod tests {
         );
     }
 
-    /// **The switch, as arithmetic**, in shares of the frame — see [`Frame::screen_share`]. The
+    /// **The switch, as arithmetic**, in shares of the frame — see [`Frame::footprint_share`]. The
     /// pool under the camera fills the window against an ocean at a quarter of it, so it wins
     /// outright; when the camera turns and its share decays, the incumbent holds until the ocean is
     /// clearly better, instead of the two trading the capture the instant they cross.
@@ -1367,42 +1536,64 @@ mod tests {
         );
     }
 
-    /// **The reported flight, as arithmetic.** These are the measured shares from the Savage Coast
-    /// recording, flying north with the stream on one side and the ocean opening on the other. The
-    /// pool recedes to a twelfth of the frame and comes back; on the ratio alone the ocean took the
-    /// capture at `y = -100` and gave it back at `y = -80`, which is the switching that was
-    /// reported. The margin refuses both, and the one handover that should happen — the pool
-    /// leaving the frame for good — still happens.
+    /// **The reported flight, as arithmetic.** The measured shares from the Savage Coast recording,
+    /// flying north with the stream alongside and the ocean opening ahead — one capture every ten
+    /// yards, scored by [`Frame::footprint_share`].
+    ///
+    /// What the numbers show is a body that is simply *there* the whole way in: the stream holds
+    /// about six tenths of the frame from -140 to -60, because that is how much of the window it
+    /// fills. The scorer these replaced reported the same stretch as 2.32, 0.16, 0.53, 2.03, 0.075,
+    /// 1.01, 0.043 — the same water, sampled at one point that kept falling off the bottom of the
+    /// screen — and the capture changed hands three times chasing it.
+    ///
+    /// So the assertion is the whole flight: one handover, at the end, when the stream really has
+    /// gone.
     #[test]
-    fn a_body_briefly_receding_does_not_take_the_capture() {
+    fn the_capture_changes_hands_once_on_the_reported_flight() {
+        // (y, stream share, ocean share)
         let flight = [
-            // (pool share, ocean share) at y = -140, -120, -100, -80, -60
-            (2.07_f32, 0.06_f32),
-            (0.53, 0.09),
-            (0.08, 0.16), // the ocean leads 2.1x here — on ratio alone, a handover
-            (1.01, 0.27),
-            (0.63, 0.64),
+            (-160, 0.170_f32, 0.030_f32),
+            (-150, 0.508, 0.034),
+            (-140, 0.586, 0.051),
+            (-130, 0.603, 0.060),
+            (-120, 0.602, 0.072),
+            (-110, 0.596, 0.089),
+            (-100, 0.588, 0.117),
+            (-90, 0.574, 0.148),
+            (-80, 0.545, 0.192),
+            (-70, 0.527, 0.257),
+            (-60, 0.519, 0.369),
+            (-50, 0.425, 0.553),
+            (-40, 0.167, 0.575),
+            (-30, 0.0, 0.583), // the stream is out of frame
+            (-20, 0.0, 0.583),
         ];
-        let mut held = Some(10.069875_f32);
-        for (pool, ocean) in flight {
+        let stream = 10.069875_f32;
+        let mut held = Some(stream);
+        let mut handovers = Vec::new();
+        for (y, pool, ocean) in flight {
             let mut seen = Prominence::default();
-            seen.add(10.069875, pool);
+            if pool > 0.0 {
+                seen.add(stream, pool);
+            }
             seen.add(0.0, ocean);
-            held = seen.best_sticky(held);
-            assert_eq!(
-                held,
-                Some(10.069875),
-                "the pool never covers a tenth of the frame less than the ocean: {pool} vs {ocean}"
-            );
+            let next = seen.best_sticky(held);
+            if next != held {
+                handovers.push(y);
+            }
+            held = next;
         }
-        // Past the mouth the stream is gone from the frame and the ocean is the whole subject.
-        let mut open = Prominence::default();
-        open.add(0.0, 0.74);
         assert_eq!(
-            open.best_sticky(held),
-            Some(0.0),
-            "an incumbent that left the frame gives way"
+            handovers.len(),
+            1,
+            "one handover on the whole flight, not three: {handovers:?}"
         );
+        assert!(
+            handovers[0] >= -50,
+            "and it happens at the mouth, once the stream has thinned: y={}",
+            handovers[0]
+        );
+        assert_eq!(held, Some(0.0), "the ocean ends up with the capture");
     }
 
     /// A plane that has left the frame entirely cannot defend itself — otherwise turning your back
@@ -1414,71 +1605,48 @@ mod tests {
         assert_eq!(seen.best_sticky(Some(10.069875)), Some(0.0));
     }
 
-    /// The contribution fades across the frame edge rather than switching off, which is what makes
-    /// the score continuous enough for hysteresis to have anything to hold.
-    #[test]
-    fn a_surface_fades_out_of_frame_instead_of_vanishing() {
-        let half = 0.4_f32;
-        assert_eq!(edge_fade(0.0, half), 1.0, "dead centre");
-        assert_eq!(
-            edge_fade(half, half),
-            1.0,
-            "the frustum edge itself is still full"
-        );
-        let mid = edge_fade(half * 1.17, half);
-        assert!(
-            mid > 0.2 && mid < 0.8,
-            "partway into the slop it is partial: {mid}"
-        );
-        assert_eq!(
-            edge_fade(half * FRAME_SLOP, half),
-            0.0,
-            "the far side of the slop"
-        );
-        assert_eq!(edge_fade(half * 5.0, half), 0.0, "and it stays there");
-    }
-
     /// The frame has sides, and things behind the camera are not in it.
     #[test]
     fn the_frame_rejects_what_is_behind_it_and_off_its_edges() {
         let frame = Frame::new(Vec3::new(0.0, 0.0, -1.0), Vec3::Y, 0.8, 16.0 / 9.0);
-        let eye = Vec3::ZERO;
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        // Bevy −Z is WoW +x, so "dead ahead" is WoW +x and "behind" is WoW −x.
         assert!(
-            frame
-                .depth_if_visible(eye, Vec3::new(0.0, 0.0, 100.0))
-                .is_none(),
+            frame.footprint_share(eye, patch(-100.0, 0.0, 0.0, 20.0)).is_none(),
             "a pool behind the camera is not what the player is looking at"
         );
         assert!(
-            frame
-                .depth_if_visible(eye, Vec3::new(0.0, 0.0, -100.0))
-                .is_some(),
+            frame.footprint_share(eye, patch(100.0, 0.0, 0.0, 20.0)).is_some(),
             "dead ahead is in frame"
         );
-        // Straight up, and far off to the side, are both out.
-        assert!(frame
-            .depth_if_visible(eye, Vec3::new(0.0, 100.0, -1.0))
-            .is_none());
-        assert!(frame
-            .depth_if_visible(eye, Vec3::new(500.0, 0.0, -1.0))
-            .is_none());
+        assert!(
+            frame.footprint_share(eye, patch(1.0, 500.0, 0.0, 20.0)).is_none(),
+            "far off to the side is out"
+        );
     }
 
-    /// The edge slop is real but bounded — a surface a little outside the frustum still counts
-    /// (see [`FRAME_SLOP`]), one far outside does not.
+    /// A surface half outside the window contributes half, not all of it and not nothing. The old
+    /// point test had to approximate this with a fade across an invented slop band; clipping the
+    /// footprint gives it exactly.
     #[test]
-    fn the_frame_is_forgiving_at_its_edge_but_not_boundless() {
+    fn a_footprint_straddling_the_edge_counts_only_what_is_inside() {
         let frame = Frame::new(Vec3::new(0.0, 0.0, -1.0), Vec3::Y, 0.8, 16.0 / 9.0);
-        let eye = Vec3::ZERO;
-        let tan_v = (0.8_f32 * 0.5).tan();
-        let at = |up: f32| Vec3::new(0.0, up * 100.0, -100.0);
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        // Two identical patches 100 yd ahead: one centred, one pushed sideways so about half of it
+        // is outside the window.
+        let (_, centred) = frame
+            .footprint_share(eye, patch(100.0, 0.0, 0.0, 60.0))
+            .expect("centred");
+        let half_out = frame
+            .footprint_share(eye, patch(100.0, 60.0, 0.0, 60.0))
+            .map_or(0.0, |(_, s)| s);
         assert!(
-            frame.depth_if_visible(eye, at(tan_v * 1.2)).is_some(),
-            "just past the edge still reads as looked-at"
+            half_out < centred,
+            "the part outside the window does not count: {half_out} vs {centred}"
         );
         assert!(
-            frame.depth_if_visible(eye, at(tan_v * 2.0)).is_none(),
-            "well past it does not"
+            half_out > 0.0,
+            "but the part inside it still does: {half_out}"
         );
     }
 
