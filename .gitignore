@@ -23,3 +23,10 @@ trace-*.json
 TODO
 ideas.md
 water-style-shots
+
+# The client's own local state, written beside the executable at runtime: CVars, macros, chat and
+# window layout, saved variables, and the per-character camera and addon settings. One machine's
+# play session, not the project's.
+/benilla-config/
+# The run log.
+/benilla.log
