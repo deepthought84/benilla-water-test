@@ -35,27 +35,43 @@
 //! place rather than at the camera's spawn because the CVar moves at runtime and there are three
 //! spawn sites for the world camera, none of which should have to know this.
 //!
-//! ## It is OFF, and the reason is not the water
+//! ## It was off, and the reason was the HORIZON
 //!
-//! **A global depth prepass is not usable in this engine as it stands, and the way it fails is
-//! quiet.** With it armed, terrain vanishes wherever a river or lake runs over it and the sky shows
-//! through the hole — reproducible in Elwynn from a single vista, and provably the prepass: with
-//! the stylised look on and the prepass alone disabled, the ground is whole again.
+//! For a long time this was behind `$WOW_WATER_DEPTH` and disabled, because arming it punched holes
+//! in the world: terrain vanished wherever a river or lake ran over it and the sky showed through.
+//! It is on now, and the diagnosis that kept it off was wrong, which is worth recording because it
+//! sent two plausible fixes into the bin before the real one.
 //!
-//! It is the same root as the loud failure the model materials give. Bevy renders the prepass with
-//! its own vertex path, and any material whose real vertex stage differs from it writes a different
-//! depth there than it computes in the main pass; the main pass compares `GreaterEqual` against
-//! that, and where the prepass came out nearer, the fragment is simply dropped. The model materials
-//! at least fail validation outright and abort, which is how they were caught. Terrain returns a
-//! wrong picture instead, and a wrong picture that only appears over water is one that survives an
-//! empty-coastline vista, several live sessions and a commit — which is exactly what it did.
+//! The suspicion was depth *disagreement* — Bevy renders the prepass with its own vertex path, so a
+//! material whose real vertex stage differs from it could write a depth there that its main pass
+//! then fails `GreaterEqual` against, dropping the fragment. That reads well and it is not what was
+//! happening. Both remedies it implies were built and measured: a `prepass_fragment_shader` twin
+//! carrying terrain's far-clip discard, and a `prepass_vertex_shader` twin computing terrain's
+//! position under `@invariant`. Each changed the frame by **MAE 0.000**. The first was never even
+//! called — Bevy only attaches a prepass fragment when `MeshPipelineKey::MAY_DISCARD` is set, which
+//! comes from `AlphaMode::Mask`, and terrain is opaque.
 //!
-//! So this is behind `$WOW_WATER_DEPTH` and off. Everything downstream of it falls back to the
-//! authored depth byte (`thickness < 0.0` in `liquid.wgsl`), which is the look the water had before
-//! any of this. Turning it on for real means giving each custom vertex path a prepass twin —
-//! terrain's included, not just the models' — via `MaterialExtension::prepass_vertex_shader`, and
-//! then proving on screen that a prepass-armed frame is pixel-identical to an unarmed one wherever
-//! no water is involved.
+//! The cause was the **WDL horizon**, and it was a *discard* mismatch rather than a vertex one.
+//! `wdl.wgsl`'s fragment cuts everything NEARER than `farclip − 33`, so the coarse hull only draws
+//! past the wall and the fine terrain owns the near field. Bevy's stock prepass has no such cut, so
+//! an armed prepass wrote the whole hull's depth — including the near part that never draws. The
+//! coarse surface lies above the fine one wherever the ground is flat, which is exactly the river
+//! valleys and lake beds, so the detailed terrain there failed the depth test against a horizon
+//! that was not drawn either, and nothing was left but sky. The hole followed the water because the
+//! water is where the flat ground is.
+//!
+//! The fix is `WdlExt::enable_prepass() -> false`: the same "a missing answer beats a wrong one"
+//! trade the model lane already takes, and it costs the water nothing, because the coarse hull only
+//! exists beyond the far-clip wall where there is no water to measure. `terrain.wgsl`'s position
+//! carries `@invariant` beside it — it measured as free and it is the standard guard for a material
+//! that draws in both passes, not a fix for anything observed here.
+//!
+//! Pinned by capture: a frame with no liquid in it is **pixel-identical** armed and unarmed
+//! (MAE 0.000), which is the bar this section used to set for turning the gate off. `water-noon`
+//! moves MAE 1.786 over 29 % of its pixels, and that is the feature — absorption and the soft edge
+//! reading a true column instead of the authored byte.
+//!
+//! `$WOW_WATER_DEPTH=0` still forces it off, for bisecting a frame against the byte-only look.
 //!
 //! ## What is in it, and what is not
 //!
@@ -73,6 +89,11 @@
 //! is absent. A prepass vertex shader of our own is the fix, and it is a job in the model renderer.
 //! The same is true of the static-gx pass, which draws on its own pipeline and is in no prepass at
 //! all.
+//!
+//! **The WDL horizon is not, deliberately** — see `WdlExt::enable_prepass` and the section above.
+//! Its fragment discards the near field and Bevy's prepass cannot reproduce that, so it wrote depth
+//! for a hull it never drew. Nothing is lost: the coarse horizon lives beyond the far-clip wall,
+//! and there is no water out there to measure a column through.
 
 use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::prelude::*;
@@ -80,10 +101,13 @@ use bevy::prelude::*;
 use super::WaterStyle;
 use crate::view::WorldCamera;
 
-/// `$WOW_WATER_DEPTH=1` — arm the prepass. **Off by default, and it must stay that way until the
-/// custom vertex paths have prepass twins** — see the module doc.
+/// Is the prepass armed? **On**, with `$WOW_WATER_DEPTH=0` as the way back to the authored-byte
+/// look — see the module doc for the horizon bug that kept it off, and for what it costs.
+///
+/// Anything other than `0` reads as on, so the `=1` that every recipe in this repo carries keeps
+/// working.
 fn depth_enabled() -> bool {
-    std::env::var_os("WOW_WATER_DEPTH").is_some()
+    std::env::var("WOW_WATER_DEPTH").as_deref() != Ok("0")
 }
 
 /// Attach the depth prepass while the stylised look is on, and take it away again when it is not.
@@ -113,4 +137,33 @@ pub(super) fn register(app: &mut App) {
     // Every frame, but it is a query over one camera and a comparison — the work is the insert,
     // which happens on a style flip and on the first frame a camera exists.
     app.add_systems(Update, maintain_depth_prepass);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate's polarity, which has now flipped once. It reads **on** unarmed — the prepass is
+    /// the shipped behaviour — and only the explicit `0` turns it off; anything else, including the
+    /// `=1` every recipe in this repo and its decisions carry, leaves it on.
+    #[test]
+    fn the_prepass_is_on_unless_it_is_explicitly_switched_off() {
+        let restore = std::env::var("WOW_WATER_DEPTH").ok();
+        // SAFETY: single-threaded test, and the variable is restored before it returns.
+        unsafe {
+            std::env::remove_var("WOW_WATER_DEPTH");
+            assert!(depth_enabled(), "the default is armed");
+            std::env::set_var("WOW_WATER_DEPTH", "1");
+            assert!(depth_enabled(), "the historical =1 still means on");
+            std::env::set_var("WOW_WATER_DEPTH", "0");
+            assert!(
+                !depth_enabled(),
+                "and 0 is the way back to the authored byte"
+            );
+            match restore {
+                Some(v) => std::env::set_var("WOW_WATER_DEPTH", v),
+                None => std::env::remove_var("WOW_WATER_DEPTH"),
+            }
+        }
+    }
 }

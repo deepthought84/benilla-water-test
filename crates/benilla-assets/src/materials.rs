@@ -497,6 +497,23 @@ pub struct WdlExt {
 }
 
 impl MaterialExtension for WdlExt {
+    /// **Out of the depth prepass**, for the reason the model lane is out of it: a pass that cannot
+    /// reproduce this material's discards writes depth for fragments the main pass throws away.
+    ///
+    /// The WDL hull is the coarse horizon, and its fragment stage cuts everything NEARER than
+    /// `farclip − 33` so the fine terrain owns the near field. Bevy's stock prepass has no such cut,
+    /// so an armed prepass wrote the whole hull's depth — including the near part that never draws.
+    /// The coarse surface sits above the fine one wherever the ground is flat, which is exactly the
+    /// river valleys and lake beds, so the detailed terrain there failed `GreaterEqual` against a
+    /// horizon that was not drawn either, and the sky came through the hole. That is the
+    /// "terrain vanishes wherever a river or lake runs over it" this whole prepass has been off for.
+    ///
+    /// Opting out costs the water nothing: it measures its column against the real terrain, and the
+    /// coarse hull only exists past the far-clip wall where there is no water to measure.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wdl.wgsl".into()
     }
