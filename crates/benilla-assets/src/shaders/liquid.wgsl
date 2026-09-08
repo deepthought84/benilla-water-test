@@ -150,7 +150,8 @@ struct WaterReflect {
     // none.
     moon: vec4<f32>,
     /// `x` = the screen-space march is switched off (`$WOW_NO_SSR`); `y` = paint its confidence
-    /// instead of the water (`$WOW_SSR_SHOW`); `zw` spare.
+    /// instead of the water (`$WOW_SSR_SHOW`); `z` = the march's OWN strength — 1 on the stylised
+    /// lane unless `x`, and pointedly independent of `params.y`, which is the mirror's; `w` spare.
     flags: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<storage, read> water_reflect: WaterReflect;
@@ -1106,9 +1107,7 @@ fn stylised_water(
     ssr.rgb = vec3<f32>(0.0);
     ssr.conf = 0.0;
 #ifdef DEPTH_PREPASS
-    if (water_reflect.params.y > 0.0
-        && water_reflect.flags.x < 0.5
-        && view.world_position.y > world_pos.y) {
+    if (water_reflect.flags.z > 0.0 && view.world_position.y > world_pos.y) {
         ssr = ssr_trace(world_pos, reflect(-to_view, n), sample_index);
     }
 #endif
@@ -1186,7 +1185,7 @@ fn stylised_water(
         rgb = mix(
             rgb,
             ssr.rgb,
-            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.params.y * ssr.conf,
+            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.flags.z * ssr.conf,
         );
     }
 

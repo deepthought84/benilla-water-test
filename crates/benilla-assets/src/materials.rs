@@ -226,56 +226,52 @@ pub struct WowModelExt {
 }
 
 impl MaterialExtension for WowModelExt {
-    /// **Out of the depth prepass, for now.**
+    /// **Out of the depth prepass — attempted, and reverted with the measurement that says why.**
     ///
-    /// [`Self::specialize`] rebuilds the vertex buffer layout around attributes Bevy does not know
-    /// — the rig's joints, the merged fader's sphere, the merged slot — and Bevy applies a
-    /// material's `specialize` to the PREPASS pipeline as well as the main one (its own source says
-    /// so, and calls it risky). Handed to Bevy's prepass vertex shader, that layout names locations
-    /// it never declared and `create_render_pipeline` fails validation outright: the client aborts
-    /// the moment a skinned model is in view.
+    /// The blocker is real and unchanged: [`Self::specialize`] rebuilds the vertex buffer layout
+    /// around attributes Bevy does not know, and Bevy applies a material's `specialize` to the
+    /// PREPASS pipeline as well as the main one, so Bevy's own prepass vertex shader is handed a
+    /// layout naming locations it never declared and pipeline creation fails validation.
     ///
-    /// Simply not rebuilding the layout for the prepass would be worse than useless — the prepass
-    /// would then draw every skinned character in BIND POSE and write that shape into the depth
-    /// buffer the stylised water reads, which is a wrong answer rather than a missing one. Opting
-    /// out gives a missing one, and missing is recoverable: the water measures its column to the
-    /// terrain behind a character instead of to the character, so its depth and colour stay right
-    /// and only the soft edge around a body in the water is absent.
+    /// A full twin was built to get past that and it WORKED as a pipeline — a `wow_model_prepass.wgsl`
+    /// declaring the rebuilt layout's locations, `specialize` rebuilding that layout for the prepass
+    /// unconditionally (Bevy's own prepass layout puts UV_0 at location 1, which disagrees with this
+    /// lane), a cutout fragment so depth is not written through foliage, and the sky pin and fader
+    /// collapse reproduced. It compiled, it drew, and models rendered intact, which means the
+    /// positions did agree.
     ///
-    /// The real fix is a prepass vertex shader of our own ([`MaterialExtension::prepass_vertex_shader`]
-    /// exists precisely for this). **It is a larger job than that sentence suggests, and the cost is
-    /// worth writing down before someone starts it** — the liquid prepass was disabled for months
-    /// behind a diagnosis that turned out to be wrong (`liquid::depth`), so a guess recorded here
-    /// costs real time later.
+    /// **It was reverted for two findings, and the second is the one that matters.**
     ///
-    /// A twin has to reproduce this lane's position **bit for bit**, because the main pass tests
-    /// `GreaterEqual` against what the prepass wrote and a position one ULP short is a dropped
-    /// fragment. That means all of:
+    /// First, it bought nothing measurable. SSR coverage at the Savage Coast was BYTE-IDENTICAL with
+    /// the twin on and off, because the geometry a lake reflects — trees and buildings — is not on
+    /// this lane at all: `static_gx` took the static world out of bevy_pbr entirely at 1429, and it
+    /// now has a depth prepass of its own, which is what actually let the march see a tree. What
+    /// this lane would add is the entity path: creatures, players, faders.
     ///
-    /// * the camera-relative `p_cam` route, which exists precisely because the absolute one loses
-    ///   ~1 mm of precision at a ~9 k-yard origin (decision 0974) — a twin that reconstructs the
-    ///   position "equivalently" rather than identically reintroduces exactly that error;
-    /// * the WMO batch-order nudge, `position.z *= 1.0 + m.sun_scale.y * 1.1920929e-7`, which needs
-    ///   the MATERIAL bind group in the prepass;
-    /// * the `WOW_SKY_DEPTH` pin and the `WOW_MERGED_FADE` clip collapse, both of which move the
-    ///   depth deliberately;
-    /// * skinning through `wow_skin_model`, which needs the shared palette and `rig_origin`.
+    /// Second, the refactor it needed broke the model lane outright. To keep one copy of the
+    /// precision-critical position arithmetic, `WowLight`, `ModelParams`, the owned-palette skinning
+    /// and the camera-relative clip route were moved into a shared `wow_model_pos.wgsl` that both
+    /// stages imported. That composed and ran with NO shader or validation error, and rendered the
+    /// world's terrain, water and static content correctly — while every model on this lane went
+    /// black. The character-create screen is the sharpest reproduction (`WOW_CAPTURE=glue-charcreate`:
+    /// centre luminance 117 before, 18 after). The cause was never isolated below "importing the
+    /// bindings through naga_oil changes something the composed module does not complain about";
+    /// the discriminating experiment not yet run is a shared module holding ONLY the two position
+    /// functions, which need `view` and no bindings of their own.
     ///
-    /// And a vertex twin alone is not enough: the clutter lane is `AlphaMode::Mask`, so it carries
-    /// `MeshPipelineKey::MAY_DISCARD` and Bevy WILL attach a prepass fragment for it — which must
-    /// run the same alpha test, or the prepass writes depth through cut-out foliage.
+    /// So the order for anyone picking this up: prove the shared-module import in isolation on a
+    /// scene with a character in it, THEN build the twin on top of it. `glue-charcreate` is the
+    /// cheap regression test and neither golden water scenario nor felwood catches this — none of
+    /// them contains a model on this lane.
     ///
-    /// The shape that avoids the obvious trap — two copies of precision-critical arithmetic drifting
-    /// apart — is to give `wow_model.wgsl` a `#define_import_path` and export the position function,
-    /// then have the twin import it. No shader in this crate does that yet, so it is a new
-    /// convention rather than a local change.
-    ///
-    /// What staying out costs is one thing only: a body standing in water has no soft edge where it
-    /// meets the surface. Depth and colour are unaffected, because the column is measured past the
-    /// character to the terrain behind. Until the above lands, this.
+    /// What staying out costs is now only the entity path's contribution: a body standing in water
+    /// has no soft edge, and a creature or player is not in the depth the march traces. Depth and
+    /// colour are unaffected, because the water's column is measured past the character to the
+    /// terrain behind.
     fn enable_prepass() -> bool {
         false
     }
+
 
     /// Custom vertex stage (decision 0278): bevy's mesh vertex verbatim plus the GOURAUD point-light
     /// term — the dynamic light sum evaluates per VERTEX like the reference FFP and interpolates,

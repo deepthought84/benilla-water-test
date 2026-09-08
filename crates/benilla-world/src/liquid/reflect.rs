@@ -1041,7 +1041,18 @@ fn drive_reflection(
     // this tier is priced and graded with — the same shape `$WOW_NO_REFLECT` gives the mirror.
     // `y` = `$WOW_SSR_SHOW`, which paints the march's confidence instead of the water.
     let ssr_show = f32::from(std::env::var_os("WOW_SSR_SHOW").is_some());
-    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, 0.0, 0.0]);
+    // `z` = **the march's own strength, deliberately not the mirror's.** It used to have none: the
+    // march was gated on, and scaled by, `params.y`, which is the MIRROR's strength — so every path
+    // that stood the mirror down (no water within [`REFLECT_RADIUS`], the eye under the surface, no
+    // plane elected, `$WOW_NO_REFLECT`) took the screen-space tier with it. A tier that only runs
+    // when the tier it is meant to cover for is already running cannot be the general answer, and
+    // the composition below has it taking precedence, which made the coupling a plain contradiction.
+    //
+    // What it legitimately depends on is the look and its own kill switch, and that is all. The
+    // shader adds the two conditions that are genuinely per-fragment — a depth prepass to march
+    // against, and an eye above the surface.
+    let ssr_on = f32::from(*style == WaterStyle::Stylised && !no_ssr());
+    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, ssr_on, 0.0]);
     let (zenith, horizon) = (light.sky[0], light.sky[4]);
     // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
     let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());
