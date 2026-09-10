@@ -1,9 +1,0 @@
-# benilla local config (decision 0954) — CVar values that moved off their defaults.
-# Managed by the client; hand edits are read on next launch and preserved on save.
-[cvars]
-MasterSoundEffects = "0"
-farclip = "717"
-gxVSync = "0"
-gxWindow = "1"
-realmName = "VMaNGOS"
-waterStyle = "1"

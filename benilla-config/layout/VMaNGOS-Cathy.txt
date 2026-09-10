@@ -1,4 +1,0 @@
-# benilla window layout — every frame the player has moved or resized (the client's userPlaced
-# bit). A relative of the reference's layout-cache.txt: same scope, same Frame:/W:/H: keys, but
-# anchors instead of its X:/Y: pair, because a benilla drag moves a frame's anchors rather than
-# collapsing it to a screen position. `-` as a Point: target means the screen root.
