@@ -1052,7 +1052,17 @@ fn drive_reflection(
     // shader adds the two conditions that are genuinely per-fragment — a depth prepass to march
     // against, and an eye above the surface.
     let ssr_on = f32::from(*style == WaterStyle::Stylised && !no_ssr());
-    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, ssr_on, 0.0]);
+    // `w` = `$WOW_REFLECT_LAYER=1`, which restores the composite the tiers used to have, where each
+    // of them mixed OVER a water that had already had its full Fresnel share of sky mixed in. That
+    // layering is what made a river read as unreflective: the sky mix and the tier mix carry the
+    // same Fresnel weight `s`, so a tier at full coverage only ever displaced `s` of the sky and
+    // left `s(1 - s)` of it standing — bright sky painted across a reflection of a dark valley,
+    // holding the tier to about half the contrast it should have had. It costs nothing at a coast,
+    // where the tier is *looking at* the sky and the two agree; it is most of the reflection on a
+    // river in a gorge, where they do not. Kept as a knob because it is the image every capture
+    // before this was graded against.
+    let layer = f32::from(std::env::var("WOW_REFLECT_LAYER").as_deref() == Ok("1"));
+    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, ssr_on, layer]);
     let (zenith, horizon) = (light.sky[0], light.sky[4]);
     // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
     let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());

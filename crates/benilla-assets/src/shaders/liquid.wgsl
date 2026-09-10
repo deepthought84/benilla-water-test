@@ -151,7 +151,8 @@ struct WaterReflect {
     moon: vec4<f32>,
     /// `x` = the screen-space march is switched off (`$WOW_NO_SSR`); `y` = paint its confidence
     /// instead of the water (`$WOW_SSR_SHOW`); `z` = the march's OWN strength — 1 on the stylised
-    /// lane unless `x`, and pointedly independent of `params.y`, which is the mirror's; `w` spare.
+    /// lane unless `x`, and pointedly independent of `params.y`, which is the mirror's; `w` =
+    /// composite the tiers the old layered way (`$WOW_REFLECT_LAYER`).
     flags: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<storage, read> water_reflect: WaterReflect;
@@ -1073,7 +1074,24 @@ fn stylised_water(
     // reflected view ray's own elevation rather than as one flat colour — see [`sky_reflection`],
     // which is the answer to "waves are only visible in the line of the sun".
     let sky = sky_reflection(reflect(-to_view, n));
-    var rgb = mix(body, sky * lit, mix(0.02, 0.45, fresnel));
+    let sky_lit = sky * lit;
+    // **A surface has one reflection, and Fresnel is how big its share of the fragment is.** This
+    // is that share, and the tiers below spend it: the sky, the capture and the march are three
+    // answers to *what* is reflected, never three separate reflections to be layered one over the
+    // other.
+    //
+    // They used to be layered, and it cost the tiers about half their contrast. `rgb` took its full
+    // `s` of sky here; a tier then mixed itself in at its own `s`, which displaces only `s` of the
+    // sky and leaves `s(1 - s)` standing — so a reflection of a dark gorge arrived with a wash of
+    // bright sky still painted over it, the body was robbed to pay for it, and a river read as flat
+    // while a coast, where the tier is looking at the sky anyway, read as correct.
+    // `$WOW_REFLECT_LAYER=1` puts the old composite back.
+    let fres = mix(0.02, 0.45, fresnel);
+    // What is reflected. The sky is the FLOOR, not a layer: it is the answer for a direction no
+    // tier has a better one for, and each tier below replaces it over the coverage it actually has.
+    var refl = sky_lit;
+    let layered = water_reflect.flags.w > 0.5;
+    var rgb = mix(body, sky_lit, fres);
 
     // ---- the planar reflection ----------------------------------------------------------------
     //
@@ -1171,22 +1189,36 @@ fn stylised_water(
         // `1 - ssr.conf`: where the march found the answer itself, the capture stands down rather
         // than averaging with it. Two reflections of one surface blended together is a double
         // image, not a better one.
-        let amount = mix(0.02, REFLECT_MAX, fresnel)
-            * water_reflect.params.y
-            * mirrored.a
-            * trust
-            * (1.0 - ssr.conf);
-        rgb = mix(rgb, mirrored.rgb, amount);
+        // No `1 - ssr.conf` on the new path: the march has the last word below, over one mix, and
+        // that mix already leaves this tier `1 - conf`. Applying it in both places counted it twice.
+        let w_planar = saturate(water_reflect.params.y * mirrored.a * trust);
+        refl = mix(refl, mirrored.rgb, w_planar);
+        if (layered) {
+            let amount = mix(0.02, REFLECT_MAX, fresnel)
+                * water_reflect.params.y
+                * mirrored.a
+                * trust
+                * (1.0 - ssr.conf);
+            rgb = mix(rgb, mirrored.rgb, amount);
+        }
     }
 
     // …and the march's own contribution, on the same Fresnel weight the tiers below it use, so the
     // water does not change how reflective it is depending on which tier answered.
     if (ssr.conf > 0.0) {
-        rgb = mix(
-            rgb,
-            ssr.rgb,
-            mix(0.02, REFLECT_MAX, fresnel) * water_reflect.flags.z * ssr.conf,
-        );
+        refl = mix(refl, ssr.rgb, saturate(water_reflect.flags.z * ssr.conf));
+        if (layered) {
+            rgb = mix(
+                rgb,
+                ssr.rgb,
+                mix(0.02, REFLECT_MAX, fresnel) * water_reflect.flags.z * ssr.conf,
+            );
+        }
+    }
+    // The one mix. With both tiers off this is exactly the sky mix `rgb` already holds, which is
+    // what keeps a world with no reflection pass byte-identical.
+    if (!layered) {
+        rgb = mix(body, refl, fres);
     }
 
     // The glitter path: the same Blinn highlight the reference computes, evaluated against the
