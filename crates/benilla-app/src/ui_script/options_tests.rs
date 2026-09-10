@@ -2257,10 +2257,11 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             continue;
         }
         // The deliberate exceptions (1639 Render Scale, 1650 Display Mode, 1847 Enable Sound in
-        // Background). None has a 1.12 counterpart whose `OPTION_TOOLTIP_*` could be resolved —
-        // Render Scale has no era row at all, Display Mode's era row was a CHECKBOX whose string
-        // says "Check to…", and 1.12 has no background-sound setting at all (it mutes on its
-        // window-activation event and offers no way out) — and each is a row a player needs a
+        // Background, and Water Style with the stylised look). None has a 1.12 counterpart whose
+        // `OPTION_TOOLTIP_*` could be resolved — Render Scale has no era row at all, Display Mode's
+        // era row was a CHECKBOX whose string says "Check to…", 1.12 has no background-sound
+        // setting at all (it mutes on its window-activation event and offers no way out), and the
+        // reference has exactly one water and no dial for it — and each is a row a player needs a
         // description for. Each carries one under a `BENILLA_` prefix so the reference's
         // namespace stays the reference's, which is exactly what this guard is here to protect.
         // Everything the guard was built to catch — an invented or typo'd `OPTION_TOOLTIP_` key
@@ -2273,6 +2274,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "BENILLA_TOOLTIP_BACKGROUND_SOUND",
                 "AudioRowBackgroundSound",
             ),
+            ("BENILLA_TOOLTIP_WATER_STYLE", "GraphicsRowWaterStyle"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2322,7 +2324,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // key OPTION_TOOLTIP_SHOW_TUTORIALS is 1.12's own.
     // The 30th and 31st CVar rows are the two text filters (2077): Profanity Filter on the
     // Interface page and Disable Spam Filter on the Chat page, both keys 1.12's own.
-    assert_eq!(checked, 62, "every tipped row carries a live key");
+    // The 63rd is Water Style, benilla's own Graphics row for the stylised look — a dropdown with
+    // no 1.12 counterpart, so its description is a `BENILLA_` string like Render Scale's.
+    assert_eq!(checked, 63, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2427,14 +2431,15 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // (the lock 1136, Always Show
     // ActionBars 1500), the Chat page's 1 (Remove Chat Hover Delay, 1589) and 6 API rows (Show
     // Cloak / Show Helm, 1472; the four multibar switches, 1500).
-    // …plus the Graphics page's Render Scale (1639) and Display Mode (1650) and the Audio page's
-    // Enable Sound in Background (1847), the three rows whose descriptions are benilla's own
-    // rather than 1.12 GlobalStrings — see the guard above.
+    // …plus the Graphics page's Render Scale (1639), Display Mode (1650) and Water Style, and the
+    // Audio page's Enable Sound in Background (1847), the four rows whose descriptions are
+    // benilla's own rather than 1.12 GlobalStrings — see the guard above.
     // …and Block Trades (1764), the Controls page's 28th CVar row, and Enable Error Speech
     // (1815), the Audio page's fourth checkbox and 1.12's own.
     // …and Show Tutorials (2077), the Interface page's seventh API row.
     // …and the two text-filter rows (2077).
-    assert_eq!(raised, 62, "every row but Auto Loot raises a description");
+    // …and Water Style, the Graphics page's fourth benilla-owned description.
+    assert_eq!(raised, 63, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a
