@@ -219,6 +219,64 @@ fn vertex(v: GxVertex) -> GxVsOut {
     return out;
 }
 
+// **The depth-prepass half of this lane** — the same two discards as `fragment` above, and
+// nothing else.
+//
+// The static world (never-fade doodads and WMO geometry — the trees and buildings) leaves
+// bevy_pbr entirely and draws from retained buffers in this pass, so it was in no depth prepass
+// at all. That made it invisible to everything reading the opaque scene's depth: the stylised
+// water's column, its soft edge, and — the reason this exists — its screen-space reflection
+// march, which could not reflect a single tree because no tree was in the depth it traces.
+//
+// **Both discards are load-bearing and neither is optional.** A prepass that wrote depth where
+// the main pass discards is not a smaller version of this lane, it is a wrong one, and this
+// project has already paid for that lesson once: `wdl.wgsl` cuts everything nearer than the
+// far-clip wall, Bevy's stock prepass did not, and the coarse horizon's depth punched holes
+// through every river valley in the world (`liquid::depth`). The farclip wall here is the same
+// shape of cut, and the cutout is what keeps leaf cards and grass blades from writing depth as
+// if they were solid.
+//
+// No colour target — only `DepthPrepass` is ever attached on this camera — so this returns
+// nothing and exists purely for its `discard`s.
+@fragment
+fn fragment_prepass(in: GxVsOut) {
+    // The hard farclip wall, verbatim from `fragment`.
+    let eye_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
+    if (wow_light.fog_params.w > 0.0 && eye_z > wow_light.fog_params.w) {
+        discard;
+    }
+#ifdef GX_CUTOUT
+    // The cutout needs the texel's alpha and only its alpha, so this is the sample above with
+    // the colour work left out — the same layer, the same sampler choice, the same bias.
+    if ((in.word & WORD_TEXTURED) != 0u) {
+        let layer = i32(recs[in.word & 0xffffu].x);
+        let wrap_x = (in.word & WORD_WRAP_X) != 0u;
+        let wrap_y = (in.word & WORD_WRAP_Y) != 0u;
+        let dims = vec2<f32>(textureDimensions(tex_array).xy);
+        let inset = 0.5 / dims;
+        var uv_mixed = in.uv;
+        if (!wrap_x) {
+            uv_mixed.x = clamp(uv_mixed.x, inset.x, 1.0 - inset.x);
+        }
+        if (!wrap_y) {
+            uv_mixed.y = clamp(uv_mixed.y, inset.y, 1.0 - inset.y);
+        }
+        let a_repeat = textureSampleBias(tex_array, samp_repeat, in.uv, layer, view.mip_bias).a;
+        let a_clamp = textureSampleBias(tex_array, samp_clamp, in.uv, layer, view.mip_bias).a;
+        let a_mixed = textureSampleBias(tex_array, samp_repeat, uv_mixed, layer, view.mip_bias).a;
+        var a = a_repeat;
+        if (!wrap_x && !wrap_y) {
+            a = a_clamp;
+        } else if (!(wrap_x && wrap_y)) {
+            a = a_mixed;
+        }
+        if (a < VANILLA_ALPHA_KEY) {
+            discard;
+        }
+    }
+#endif
+}
+
 @fragment
 fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // The hard farclip wall — per-pixel planar eye-Z, same plane as the entity path.

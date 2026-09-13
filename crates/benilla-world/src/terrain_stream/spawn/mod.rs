@@ -512,6 +512,18 @@ pub(super) fn spawn_loaded_placements(
                     // Spawned a group at a time so each surface can take that group's cull key: a
                     // pool belongs to the room it sits in, and a culled room's lava must go with it
                     // (decision 0689 — the same defect as the props, on the same building).
+                    // One lattice for the WHOLE placement, built before the loop and handed to
+                    // every group's surface. Each group's own grid ends in a ring of dry cells, so
+                    // a group that traced its own boundary called the join with the next group a
+                    // shoreline — which is how Stormwind's canal came to have a foam line drawn
+                    // straight across the middle of it at every segment join (see
+                    // [`benilla_world::liquid::WetLattice`]). The surfaces still spawn one group
+                    // at a time, because a pool belongs to the room it sits in and takes that
+                    // room's cull key; only the question "where does the water end" is the
+                    // building's rather than the room's.
+                    let model_liquids: Vec<&_> = m.group_liquids.iter().flatten().collect();
+                    let water_lattice =
+                        crate::liquid::WetLattice::build(model_liquids.iter().copied());
                     for (gi, lq) in m.group_liquids.iter().enumerate() {
                         let Some(lq) = lq else { continue };
                         let first = ents.len();
@@ -538,6 +550,7 @@ pub(super) fn spawn_loaded_placements(
                             ),
                             // The root's MOMT diffColor table — an interior pool's body colour.
                             &m.material_diff_color,
+                            water_lattice.as_ref(),
                             &mut ents,
                         );
                         // Another building's canal is exterior scene like its walls (`0x6856c0`,

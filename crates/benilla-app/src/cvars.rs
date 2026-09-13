@@ -60,6 +60,7 @@ use crate::world_backdrop::{RenderScale, RENDER_SCALE_RANGE};
 use benilla_ui::script::UiScript;
 use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
 use benilla_world::clutter::ClutterConfig;
+use benilla_world::liquid::WaterStyle;
 use benilla_world::view::{MsaaSetting, ViewDistance, FARCLIP_RANGE, MSAA_RANGE};
 
 /// One host-backed CVar: its registered name, benilla's shipped default, and — the column that
@@ -1114,6 +1115,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2008: benilla's own — 1.12 has no player-side perf log; its nearest thing is the \
          Ctrl+R framerate label, a number with no file behind it",
     ),
+    // The water rendering style — `"0"` is the reference's water (the 1.12 client's own combine,
+    // swatch, opacity and frame flip), `"1"` is benilla's own stylised alternative
+    // (`liquid.wgsl`'s `stylised_water`). The knob is [`benilla_world::liquid::WaterStyle`], and
+    // the write reaches the surfaces as one uniform lane — no rebuild, no reload, so the dropdown
+    // is not deferred.
+    same("waterStyle", "0"),
     same(crate::char_select::CVAR_LAST_CHARACTER, "0"),
 ];
 
@@ -1289,6 +1296,7 @@ pub(crate) struct KnobParams<'w> {
     combat_ranges: ResMut<'w, crate::ui_chat::combat::CombatLogRanges>,
     damage_text: ResMut<'w, crate::combat_text::DamageTextGates>,
     log_periodic: ResMut<'w, crate::ui_chat::combat::LogPeriodicSpells>,
+    water_style: ResMut<'w, WaterStyle>,
 }
 
 impl KnobParams<'_> {
@@ -1334,6 +1342,7 @@ impl KnobParams<'_> {
             combat_ranges: &mut self.combat_ranges,
             damage_text: &mut self.damage_text,
             log_periodic: &mut self.log_periodic,
+            water_style: &mut self.water_style,
         }
     }
 }
@@ -1379,6 +1388,7 @@ struct Knobs<'a> {
     combat_ranges: &'a mut crate::ui_chat::combat::CombatLogRanges,
     damage_text: &'a mut crate::combat_text::DamageTextGates,
     log_periodic: &'a mut crate::ui_chat::combat::LogPeriodicSpells,
+    water_style: &'a mut WaterStyle,
 }
 
 /// **The string-valued rows**, matched ahead of the numeric parse every other row goes through —
@@ -1658,6 +1668,7 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
                 *benilla_assets::ANISO_RANGE.end(),
             )
         }
+        "waterstyle" => *knobs.water_style = WaterStyle::from_cvar(v),
         _ => return false,
     }
     true
@@ -1758,6 +1769,12 @@ fn load_config(mut persist: ResMut<CvarPersist>, mut params: KnobParams) {
     // that pinned 4× into the file would come back at 4× the next time the client opened.
     if std::env::var_os("WOW_RENDER_SCALE").is_some() {
         persist.session_owned.insert("renderscale".into());
+    }
+    // `$WOW_WATER_STYLE` picks the water look for the run, and it is the lever every capture and
+    // A/B of the liquid path uses — so it is session-only for the same reason `$WOW_RENDER_SCALE`
+    // is: a look dialled in for one measurement must not come back the next time the client opens.
+    if std::env::var_os("WOW_WATER_STYLE").is_some() {
+        persist.session_owned.insert("waterstyle".into());
     }
     // `$WOW_HOST` is the realmlist for the session (1667) — every probe, smoke run and harness leg
     // sets it, and a value pinned into the file would silently repoint the player's client at
@@ -1908,6 +1925,7 @@ fn sync_cvars(
             combat_ranges,
             damage_text,
             log_periodic,
+            water_style,
         } = &params;
         // The config file's values go in FIRST (decision 1291): registration — ours below, or an
         // addon's `RegisterCVar` later — starts a key at its saved value. This is what carries a
@@ -1965,7 +1983,7 @@ fn sync_cvars(
             hardware_cursor: true,
         });
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 87] = [
+        let session: [(&str, String); 88] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -2096,6 +2114,7 @@ fn sync_cvars(
             ("trilinear", flag(tex_filter.trilinear)),
             ("anisotropic", tex_filter.aniso.to_string()),
             ("fpsJournal", flag(fps_journal.0)),
+            ("waterStyle", water_style.cvar().to_string()),
             // The other string-valued row (1667): what the next logon attempt will actually dial,
             // including a `$WOW_HOST` the player never typed.
             (
@@ -2624,6 +2643,11 @@ mod tests {
         // goldens is denominated in a 1:1 backdrop, so a registered value other than 1 would
         // silently re-render every one of them through a resample.
         assert_eq!(d["renderScale"], 1.0);
+        // waterStyle: "0" is the reference (WaterStyle::Reference), matching from_cvar(0.0).
+        assert_eq!(
+            WaterStyle::from_cvar(d["waterStyle"]),
+            WaterStyle::Reference,
+        );
     }
 
     #[test]
@@ -2684,6 +2708,7 @@ mod tests {
         let mut text_filter = crate::text_filter::TextFilterSwitches::default();
         let mut game_tip = crate::game_tip::GameTipSetting::default();
         let mut camera_opts = crate::player::camera_dynamics::CameraOptions::default();
+        let mut water_style = WaterStyle::default();
         let mut knobs = Knobs {
             camera_opts: &mut camera_opts,
             sound: &mut sound,
@@ -2718,6 +2743,7 @@ mod tests {
             combat_ranges: &mut combat_ranges,
             damage_text: &mut damage_text,
             log_periodic: &mut log_periodic,
+            water_style: &mut water_style,
         };
         assert!(apply_to_knobs("MusicVolume", "0.7", &mut knobs));
         assert_eq!(knobs.sound.music, 0.7);
@@ -3009,6 +3035,11 @@ mod tests {
         assert_eq!(knobs.minimap.inside, MINIMAP_ZOOM_LEVELS - 1);
         assert!(apply_to_knobs("minimapZoom", "-2", &mut knobs));
         assert_eq!(knobs.minimap.outdoor, 0);
+        // waterStyle: "0" is Reference, anything else is Stylised (from_cvar).
+        assert!(apply_to_knobs("waterStyle", "1", &mut knobs));
+        assert_eq!(*knobs.water_style, WaterStyle::Stylised);
+        assert!(apply_to_knobs("waterstyle", "0", &mut knobs));
+        assert_eq!(*knobs.water_style, WaterStyle::Reference);
         // A bad value is consumed (known key) and the resource keeps its truth.
         assert!(apply_to_knobs("uiScale", "banana", &mut knobs));
         assert_eq!(knobs.scale.0, 0.9);
@@ -3150,6 +3181,7 @@ mod tests {
             .init_resource::<crate::perf::FpsJournalSetting>()
             .init_resource::<crate::text_filter::TextFilterSwitches>()
             .init_resource::<crate::game_tip::GameTipSetting>()
+            .init_resource::<WaterStyle>()
             .add_plugins(CvarPlugin);
         app.insert_non_send_resource(UiScript::new().unwrap());
         app

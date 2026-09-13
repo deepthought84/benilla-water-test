@@ -28,7 +28,7 @@ use bevy::prelude::*;
 use crate::clouds::{occ1_moon, occ1_sun, CloudCoverage};
 use crate::dev_state::DebugState;
 use crate::lighting::WowLighting;
-use crate::terrain_stream::TerrainStreamer;
+use crate::terrain_stream::{terrain_height_under, TerrainStreamer};
 use crate::view::WorldCamera;
 use crate::wdl::WdlStreamer;
 use crate::wmo_portal::CameraInteriorClaim;
@@ -100,6 +100,20 @@ fn view_lerp(cam_forward: Vec3, to_body: Vec3) -> f32 {
 fn horizon_gate(to_body: Vec3) -> f32 {
     let t = (to_body.y / 0.035).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// The sun/moon lens-flare **submersion fade** (`0x6cf501`/`0x6cf504`): above water the glare is
+/// unaffected; wading in it dims linearly to zero over 10 yards, then stays off. From the client's
+/// `0x6cf501` arithmetic (`(g+0x30) <= 10 ? 10 - (g+0x30) : 0` over `0..=255` → `[0,1]`),
+/// byte-verified and measured against video (decision 1754): the **exact identity at depth 0** has
+/// been defended in two rounds, for the reason `glare_fade_tests::the_glare_fades_linearly` states.
+///
+/// Applies to the **sun and moon glares alike** (`0x6d48cf` / `0x6d48ea`; slot 4 of both glare
+/// vtables is `0x6cf800`, and they differ only at slot 3) and to **neither disc** — the discs have
+/// no submerged path at all, so suppressing them outright with the skipped sky pass is right. Both
+/// confirmed by census rather than assumed.
+fn submersion_glare_fade(depth: f32) -> f32 {
+    1.0 - (depth * 0.1).clamp(0.0, 1.0)
 }
 
 /// One step of the reference's `[glare+0x30]` **asymmetric linear slew** toward `target`
@@ -258,8 +272,8 @@ pub(super) struct FlareGate<'w, 's> {
     /// The submerged-eye depth — the glare's own submersion fade (decision 1829). The glare is
     /// NOT part of the sky pass the client skips underwater: it draws in its own top-level pass
     /// (`0x6cf490` ← `0x6d48c0` ← `0x483740`, unconditional), while the sky is `0x6d4940` *inside*
-    /// `0x681070`, which is what `0x6812a4` skips. Both facts are true at once, which is why the
-    /// fade is live code and not a ramp on a pass that never runs.
+    /// the `0x6cf260` gate — so the correct fade is something you apply, not a draw you skip. Both
+    /// flare paths (`0x6cf501`/`0x6cf504`) multiply the same fade in, at the target accumulator.
     submerged: Res<'w, crate::liquid::SubmergedEye>,
     /// The live cloud coverage field — the occ1 sample source (one field serves the glare and
     /// the visible layer, like the reference).
@@ -272,26 +286,6 @@ pub(super) struct FlareGate<'w, 's> {
     mask: Local<'s, u16>,
     cursor: Local<'s, u32>,
     primed: Local<'s, bool>,
-}
-
-/// The glare's **submersion fade** — `1 − clamp(depth × 0.1, 0, 1)`, a 10-yard linear ramp on the
-/// glare alpha (wow-re `submerged-consumer-census.md`; decision 1829). `depth` is
-/// `liquidSurfaceHeight − probeZ` in world-Z yards, positive when submerged, so a dry camera reads
-/// `0` and the fade is the exact identity.
-///
-/// **This was a published negative until this round.** Two wow-re notes recorded the glare as
-/// having no submersion term; the read is one indirection out (`0x6cf4fe call [edx+0x10]` → the
-/// glare vtable's slot 4 → `0x6cf800`), which a direct-call census cannot see. It is worth
-/// implementing rather than filing as trivia: the glare is additive, so a black underwater
-/// celestial band would make it invisible anyway — and **288 of 374 `Light.dbc` rows (77%) carry a
-/// non-zero one**, so on most of the map there is a glare down there to fade.
-///
-/// Applies to the **sun and moon glares alike** (`0x6d48cf` / `0x6d48ea`; slot 4 of both glare
-/// vtables is `0x6cf800`, and they differ only at slot 3) and to **neither disc** — the discs have
-/// no submerged path at all, so suppressing them outright with the skipped sky pass is right. Both
-/// confirmed by census rather than assumed.
-fn submersion_glare_fade(depth: f32) -> f32 {
-    1.0 - (depth * 0.1).clamp(0.0, 1.0)
 }
 
 /// The weather **celestial-alpha seed** (Addendum #6): under active weather the recompute writes
@@ -307,22 +301,7 @@ impl FlareGate<'_, '_> {
     /// The slewed `[0, 1]` flare envelope along `dir` from the camera: slew target = `dn` (the
     /// body's dnCurve sample) × the horizon smoothstep × `occ1` (the body's cloud occlusion) ×
     /// the visible fraction of the body's quad (`half` = its angular half-size; the interior
-    /// claim zeroes it) and the **submersion fade** ([`submersion_glare_fade`]), all approached at
-    /// `rise`/[`FLARE_FALL`] per second.
-    ///
-    /// The fade is INSIDE the slew — one of the factors composed into the target, not a multiply on
-    /// the drawn alpha. `[glare+0x34]` is the per-frame target accumulator (reset to 1.0 at
-    /// `0x6cf499`); `0x6cf501`/`0x6cf504` multiply the fade into it, and the limiter first reads it
-    /// 158 bytes later at `0x6cf59b`, writing the envelope `[glare+0x30]` at `0x6cf5ea`. So
-    /// surfacing ramps the glare back in over the rise time rather than snapping.
-    ///
-    /// We shipped it the other way first, on the reasoning that a rate limiter should smooth
-    /// *visibility* and depth is not visibility. That reasoning was fine and the fact was against
-    /// it — wow-re's summary said the fade goes "into the glare alpha", which is the drawn byte
-    /// `[glare+0x1b]` and is not where it goes. Asked, and corrected at the bytes.
-    ///
-    /// It falls out that a deep camera (`fade == 0`) drives `base` to zero, which skips the terrain
-    /// ray march entirely — the reference's own `0x6cf58c` shortcut, for free.
+    /// claim zeroes it), approached at `rise`/[`FLARE_FALL`] per second.
     fn envelope(
         &mut self,
         cam_pos: Vec3,
@@ -331,21 +310,20 @@ impl FlareGate<'_, '_> {
         occ1: f32,
         half: f32,
         rise: f32,
+        // Does a roof over the CAMERA kill this? For the lens flares, yes — a flare is an artefact
+        // of the lens, and there is no lens flare from a sun the eye cannot see. For light landing
+        // on a surface somewhere else in the world, no: see [`super::SunVisibility`].
+        roofed_by_camera: bool,
     ) -> f32 {
         let base = dn * horizon_gate(dir) * occ1 * submersion_glare_fade(self.submerged.depth);
-        let target = if base > 0.0 && self.camera_interior.0.is_none() {
+        let indoors = roofed_by_camera && self.camera_interior.0.is_some();
+        let target = if base > 0.0 && !indoors {
             // Resident detailed terrain first; the coarse WDL surface everywhere else (it
             // covers the whole map, so it also plugs the ADT-ring-to-farclip gap).
             let (streamer, adt_tiles, wdl) = (&self.streamer, &self.adt_tiles, &self.wdl);
-            let tile = std::cell::RefCell::new(None);
             let oracle = |p| {
-                crate::terrain_stream::terrain_height_under_cached(
-                    streamer,
-                    adt_tiles,
-                    p,
-                    &mut tile.borrow_mut(),
-                )
-                .or_else(|| wdl.as_ref().and_then(|w| w.height_under(p)))
+                terrain_height_under(streamer, adt_tiles, p)
+                    .or_else(|| wdl.as_ref().and_then(|w| w.height_under(p)))
             };
             // The round-robin drip (decision 1436): an unprimed mask marches every cell once,
             // a primed one re-prices FLARE_RAYS_PER_FRAME — the slew smooths the ≤8-frame
@@ -367,6 +345,71 @@ impl FlareGate<'_, '_> {
         *self.env = flare_slew(*self.env, target, rise, FLARE_FALL, self.time.delta_secs());
         *self.env
     }
+}
+
+/// Publish [`super::SunVisibility`] — the sun the world is lit by, as opposed to the sun the lens
+/// makes a flare of.
+///
+/// Its own system with its own [`FlareGate`], rather than a line in [`follow_sun`], for two reasons.
+/// The gate keeps one slewed envelope and one occlusion mask in `Local`s, so a second caller needs a
+/// second instance or the two fight over the same scalar. And the answer is genuinely different:
+/// this one passes `roofed_by_camera = false`.
+///
+/// **That flag is the whole point.** The flare's envelope goes to zero the moment the camera is
+/// claimed by a WMO interior, which is right for a flare and wrong for everything else — Stormwind's
+/// canals are open to the sky, the city is one enormous WMO, and standing beside the water there
+/// claims the camera. Reusing the flare's number put the sun's glitter out on every canal in the
+/// game while the sun sat plainly overhead. What lights a surface is whether anything stands between
+/// that surface and the sun, not whether the eye happens to be under a roof.
+pub(super) fn publish_sun_visibility(
+    light: Res<WowLighting>,
+    mut gate: FlareGate,
+    mut vis: ResMut<super::SunVisibility>,
+    cam: Query<&GlobalTransform, With<WorldCamera>>,
+) {
+    let Some(cam_gt) = cam.iter().next() else {
+        return;
+    };
+    let to_light = light.celestial_dir.normalize_or_zero();
+    if to_light == Vec3::ZERO {
+        return;
+    }
+    let occ1 = occ1_sun(gate.clouds.coverage(to_light * GLARE_DIST));
+    let half = (0.5 * SUN_SIZE * light.sun_disc_scale).atan();
+    let env = gate.envelope(
+        cam_gt.translation(),
+        to_light,
+        light.sun_flare_dn,
+        occ1,
+        half,
+        SUN_FLARE_RISE,
+        false,
+    );
+    vis.set_if_neq(super::SunVisibility(env));
+}
+
+/// Publish [`super::MoonVisibility`] — the moon is up, and cloud is not over it.
+///
+/// Its own system rather than a line inside [`follow_moons`], because that one's [`FlareGate`]
+/// holds a single slewed envelope in a `Local` and calling it twice would have the halo and the
+/// water fighting over the same scalar.
+pub(super) fn publish_moon_visibility(
+    time: Res<Time>,
+    light: Res<WowLighting>,
+    clouds: Res<CloudCoverage>,
+    mut vis: ResMut<super::MoonVisibility>,
+    mut env: Local<f32>,
+) {
+    let to_moon = light.moon_dir_white.normalize_or_zero();
+    let target = if to_moon == Vec3::ZERO {
+        0.0
+    } else {
+        horizon_gate(to_moon) * occ1_sun(clouds.coverage(to_moon * GLARE_DIST))
+    };
+    // The sun's own slew rates: this is the same kind of quantity, and a body's light arriving or
+    // leaving should take the same time whichever body it is.
+    *env = flare_slew(*env, target, SUN_FLARE_RISE, FLARE_FALL, time.delta_secs());
+    vis.set_if_neq(super::MoonVisibility(*env));
 }
 
 /// Pin the sun's disc + glare to the **visible celestial sun** direction, camera-facing, and rewrite
@@ -422,6 +465,7 @@ pub(super) fn follow_sun(
         occ1,
         sun_half,
         SUN_FLARE_RISE,
+        true,
     );
     for (mut tf, mut gt, sprite, mat) in &mut sprites {
         tf.rotation = rot;
@@ -535,6 +579,7 @@ pub(super) fn follow_moons(
             occ1,
             moon_half,
             MOON_FLARE_RISE,
+            true,
         )
     };
     for (mut tf, mut gt, moon, mat) in &mut sprites {
@@ -693,30 +738,6 @@ pub(super) fn follow_stars(
 }
 
 #[cfg(test)]
-mod glare_fade_tests {
-    use super::submersion_glare_fade;
-
-    /// The 10-yard linear ramp, and — the half that matters most — the exact identity when dry.
-    /// A dry camera reads `depth = 0`, so this multiplies every glare in the game by 1.0; if that
-    /// were ever not exact, the feature would be a global dimmer rather than an underwater one.
-    #[test]
-    fn the_glare_fades_linearly_over_ten_yards() {
-        assert_eq!(submersion_glare_fade(0.0), 1.0, "dry is the exact identity");
-        assert_eq!(submersion_glare_fade(5.0), 0.5);
-        assert_eq!(submersion_glare_fade(10.0), 0.0);
-        assert_eq!(submersion_glare_fade(200.0), 0.0, "clamped, never negative");
-        // Linear in between, and monotone all the way down.
-        let mut prev = 1.0;
-        for i in 1..=10 {
-            let f = submersion_glare_fade(i as f32);
-            assert!(f <= prev && f >= 0.0);
-            assert!((f - (1.0 - i as f32 * 0.1)).abs() < 1e-6);
-            prev = f;
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::dev_state::DebugState;
@@ -739,8 +760,6 @@ mod tests {
         app.init_resource::<CameraInteriorClaim>();
         app.init_resource::<CloudCoverage>();
         app.init_resource::<DebugState>();
-        // Dry (depth 0) — this fixture is about the glare tracking the camera within one frame,
-        // and the submersion fade is the exact identity there, so it cannot perturb the assertion.
         app.init_resource::<crate::liquid::SubmergedEye>();
         app.insert_resource(WowLighting {
             moon_dir_white: dir,

@@ -227,6 +227,53 @@ pub struct WowModelExt {
 }
 
 impl MaterialExtension for WowModelExt {
+    /// **Out of the depth prepass — attempted, and reverted with the measurement that says why.**
+    ///
+    /// The blocker is real and unchanged: [`Self::specialize`] rebuilds the vertex buffer layout
+    /// around attributes Bevy does not know, and Bevy applies a material's `specialize` to the
+    /// PREPASS pipeline as well as the main one, so Bevy's own prepass vertex shader is handed a
+    /// layout naming locations it never declared and pipeline creation fails validation.
+    ///
+    /// A full twin was built to get past that and it WORKED as a pipeline — a `wow_model_prepass.wgsl`
+    /// declaring the rebuilt layout's locations, `specialize` rebuilding that layout for the prepass
+    /// unconditionally (Bevy's own prepass layout puts UV_0 at location 1, which disagrees with this
+    /// lane), a cutout fragment so depth is not written through foliage, and the sky pin and fader
+    /// collapse reproduced. It compiled, it drew, and models rendered intact, which means the
+    /// positions did agree.
+    ///
+    /// **It was reverted for two findings, and the second is the one that matters.**
+    ///
+    /// First, it bought nothing measurable. SSR coverage at the Savage Coast was BYTE-IDENTICAL with
+    /// the twin on and off, because the geometry a lake reflects — trees and buildings — is not on
+    /// this lane at all: `static_gx` took the static world out of bevy_pbr entirely at 1429, and it
+    /// now has a depth prepass of its own, which is what actually let the march see a tree. What
+    /// this lane would add is the entity path: creatures, players, faders.
+    ///
+    /// Second, the refactor it needed broke the model lane outright. To keep one copy of the
+    /// precision-critical position arithmetic, `WowLight`, `ModelParams`, the owned-palette skinning
+    /// and the camera-relative clip route were moved into a shared `wow_model_pos.wgsl` that both
+    /// stages imported. That composed and ran with NO shader or validation error, and rendered the
+    /// world's terrain, water and static content correctly — while every model on this lane went
+    /// black. The character-create screen is the sharpest reproduction (`WOW_CAPTURE=glue-charcreate`:
+    /// centre luminance 117 before, 18 after). The cause was never isolated below "importing the
+    /// bindings through naga_oil changes something the composed module does not complain about";
+    /// the discriminating experiment not yet run is a shared module holding ONLY the two position
+    /// functions, which need `view` and no bindings of their own.
+    ///
+    /// So the order for anyone picking this up: prove the shared-module import in isolation on a
+    /// scene with a character in it, THEN build the twin on top of it. `glue-charcreate` is the
+    /// cheap regression test and neither golden water scenario nor felwood catches this — none of
+    /// them contains a model on this lane.
+    ///
+    /// What staying out costs is now only the entity path's contribution: a body standing in water
+    /// has no soft edge, and a creature or player is not in the depth the march traces. Depth and
+    /// colour are unaffected, because the water's column is measured past the character to the
+    /// terrain behind.
+    fn enable_prepass() -> bool {
+        false
+    }
+
+
     /// Custom vertex stage (decision 0278): bevy's mesh vertex verbatim plus the GOURAUD point-light
     /// term — the dynamic light sum evaluates per VERTEX like the reference FFP and interpolates,
     /// which is what spreads a fixture's floor pool and keeps the forge hood dim.
@@ -353,13 +400,9 @@ impl MaterialExtension for WowModelExt {
         // The nudge now lives in `wow_model.wgsl`'s vertex stage, an exact relative scale of clip z
         // driven by `sun_scale.y` (uniform DATA, no pipeline axis) — same one-ULP-per-index
         // semantics, byte-verified intent unchanged (wow-5875-re wmo-batch-blend-depth-state.md).
-        if key.bind_group_data.fade && !key.bind_group_data.sky_depth {
+        if key.bind_group_data.fade {
             // The distance-fade blend twin needs depth-write ON so near geometry occludes far within the
-            // same fading model — force it regardless of the per-flag rule above. EXCEPT on the
-            // WMO-skybox lane: its twin exists for the 4-second crossfade, where every fragment
-            // forces the one far depth — there is no within-model occlusion to preserve, and the
-            // sky's own law is depth-write off, always (the fragment leaves the z-buffer at its
-            // clear value so the world and the forced-far glare quads order by depth alone).
+            // same fading model — force it regardless of the per-flag rule above.
             if let Some(ds) = descriptor.depth_stencil.as_mut() {
                 ds.depth_write_enabled = true;
             }
@@ -494,6 +537,23 @@ pub struct WdlExt {
 }
 
 impl MaterialExtension for WdlExt {
+    /// **Out of the depth prepass**, for the reason the model lane is out of it: a pass that cannot
+    /// reproduce this material's discards writes depth for fragments the main pass throws away.
+    ///
+    /// The WDL hull is the coarse horizon, and its fragment stage cuts everything NEARER than
+    /// `farclip − 33` so the fine terrain owns the near field. Bevy's stock prepass has no such cut,
+    /// so an armed prepass wrote the whole hull's depth — including the near part that never draws.
+    /// The coarse surface sits above the fine one wherever the ground is flat, which is exactly the
+    /// river valleys and lake beds, so the detailed terrain there failed `GreaterEqual` against a
+    /// horizon that was not drawn either, and the sky came through the hole. That is the
+    /// "terrain vanishes wherever a river or lake runs over it" this whole prepass has been off for.
+    ///
+    /// Opting out costs the water nothing: it measures its column against the real terrain, and the
+    /// coarse hull only exists past the far-clip wall where there is no water to measure.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wdl.wgsl".into()
     }
@@ -523,6 +583,47 @@ pub struct LiquidExt {
     #[texture(100, dimension = "2d_array", visibility(fragment))]
     #[sampler(101, visibility(fragment))]
     pub frames: Handle<Image>,
+    /// The **stylised** look's generated ripple map (`benilla_world::liquid::ripple`): R/G hold a
+    /// tiling slope field, B the height it came from. Bound on every liquid material and sampled
+    /// only under `path.y` — one small shared texture is cheaper than a second material lane, and
+    /// a binding that exists unconditionally is what keeps the toggle a uniform write.
+    #[texture(103, visibility(fragment))]
+    #[sampler(104, visibility(fragment))]
+    pub ripples: Handle<Image>,
+    /// The **stylised** look's planar reflection (`benilla_world::liquid::reflect`): the world as a
+    /// camera mirrored through the water plane saw it, at half the main view's resolution, with
+    /// **alpha as coverage** — 0 wherever that camera drew nothing, which is what lets the water
+    /// keep its sky mix there instead of sampling a hole. Re-pointed when the target is rebuilt (a
+    /// resize); otherwise the handle is fixed and only the image's contents move.
+    #[texture(105, visibility(fragment))]
+    #[sampler(106, visibility(fragment))]
+    pub reflection: Handle<Image>,
+    /// The **stylised** look's live wave field (`benilla_world::liquid::ripple_sim`): a window of
+    /// simulated water carried along with the viewer, R/G its surface slope and B the foam its
+    /// disturbance has whipped up — the same channel convention as `ripples` above, so the shader
+    /// reads the two the same way. Rewritten every frame; the handle is fixed at build, like the
+    /// reflection's.
+    #[texture(108, visibility(fragment))]
+    #[sampler(109, visibility(fragment))]
+    pub wake: Handle<Image>,
+
+    /// The opaque scene, snapshotted after the world has drawn and before anything transparent has
+    /// (`benilla_world::liquid::scene_color`) — what a screen-space reflection reads once its ray
+    /// has found a hit in the prepass depth.
+    ///
+    /// Bound unconditionally, like the mirror beside it and for the same reason: a binding that
+    /// only exists under `waterStyle` would make the toggle a pipeline rebuild instead of a uniform
+    /// write.
+    #[texture(111, visibility(fragment))]
+    #[sampler(112, visibility(fragment))]
+    pub scene_color: Handle<Image>,
+    /// The reflection's per-frame parameters — plane height, strength, distortion — in one 16-byte
+    /// buffer written once a frame in the render world (`benilla_world::liquid::reflect`). A
+    /// *buffer* rather than a uniform on this material for the reason the light buffer beside it is
+    /// one: a per-frame material write marks every liquid material Modified and rebuilds its bind
+    /// group, which this project measured and retired once already.
+    #[storage(107, read_only, buffer, visibility(fragment))]
+    pub reflect_buf: Buffer,
     /// The per-material constants that pick which *lanes* of the shared light this surface reads.
     /// None of them is a light value; all four are fixed at material creation.
     ///
@@ -544,7 +645,13 @@ pub struct LiquidExt {
     ///   MCLQ (`ocean0_s.bls`), `1` = WMO exterior (`MapObjExtWater0.bls`), `2` = WMO interior
     ///   (fixed-function, unlit). The reference has three liquid renderers with genuinely different
     ///   combines, stage counts and opacity sources; this is which one `liquid.wgsl` runs.
-    /// - `y`/`z`/`w` reserved.
+    /// - `y` = **the stylised look** (>0.5): draw this surface with benilla's own water instead of
+    ///   the reference's combine — the `waterStyle` CVar's second lane (`benilla_world::liquid::WaterStyle`,
+    ///   the Graphics page's Water Style row). It is a *look*, not a fidelity claim, and it is the one
+    ///   input on this material that moves after build: the toggle rewrites it on every liquid
+    ///   material rather than rebuilding them. Ignored on the fullbright kinds, which have no water
+    ///   to restyle.
+    /// - `z`/`w` reserved.
     #[uniform(102)]
     pub path: Vec4,
     /// `x` = reserved (frame 0), `y` = frame count, `z` = scroll flag, `w` = clock enable —
@@ -561,6 +668,30 @@ pub struct LiquidExt {
     pub light_buf: Buffer,
 }
 
+/// A liquid vertex's **offset to the nearest point on the waterline**, in world XZ yards
+/// (`benilla_world::liquid::surface`).
+///
+/// It replaces carrying the shore DISTANCE and interpolating that, and the difference is the whole
+/// point. Distance to a curve is not a linear function — it has a V-shaped crease along the curve
+/// itself — so interpolating it across a triangle cuts that crease's corner, and where the crease
+/// falls inside a triangle the reconstructed zero lands in the wrong place by up to half a vertex
+/// spacing. With a foam band a fifth of a yard wide drawn from vertices half a yard apart, that is
+/// most of a band, and it is why the line jogged, thinned and doubled as the camera moved along it.
+///
+/// The offset has no crease: `nearest − position` is smooth wherever the nearest point is, and both
+/// terms interpolate linearly, so the interpolated offset is exactly the offset of the interpolated
+/// point. Taking its LENGTH in the fragment shader puts the non-linearity where it belongs, after
+/// interpolation, and the band comes out the same width everywhere at any mesh density.
+///
+/// Own attribute id and shader location 10, for the same reason the rig's attributes have theirs —
+/// Bevy's builtin set ends at 7 and a mesh must not accidentally look like one of its lanes.
+pub const ATTRIBUTE_WOW_SHORE_OFFSET: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_ShoreOffset",
+        988_540_921,
+        bevy::render::render_resource::VertexFormat::Float32x2,
+    );
+
 impl MaterialExtension for LiquidExt {
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
@@ -569,6 +700,10 @@ impl MaterialExtension for LiquidExt {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
     }
 
+    /// Admit [`ATTRIBUTE_WOW_SHORE_OFFSET`] into the vertex layout. Bevy built the layout without
+    /// it — it is not one of Bevy's — so the layout is rebuilt here with the standard attributes it
+    /// did find plus ours, exactly as the model extension does for the rig's.
+    ///
     /// **`WATER_BIAS` is a SORT rung; keep it out of the rasterizer** — the same split the far-side
     /// twin and the WMO skybox make above, for the one surface that most needs it.
     ///
@@ -584,12 +719,41 @@ impl MaterialExtension for LiquidExt {
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
-        _layout: &MeshVertexBufferLayoutRef,
+        layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // Clear the depth bias that StandardMaterial would have added
         if let Some(ds) = descriptor.depth_stencil.as_mut() {
             ds.bias.constant = 0;
         }
+
+        // Add shore offset attribute if present
+        if !layout.0.contains(ATTRIBUTE_WOW_SHORE_OFFSET) {
+            return Ok(());
+        }
+        descriptor
+            .vertex
+            .shader_defs
+            .push("LIQUID_SHORE_OFFSET".into());
+        descriptor
+            .fragment
+            .as_mut()
+            .map(|f| f.shader_defs.push("LIQUID_SHORE_OFFSET".into()));
+        let mut attrs = Vec::with_capacity(6);
+        for (attr, loc) in [
+            (Mesh::ATTRIBUTE_POSITION, 0),
+            (Mesh::ATTRIBUTE_NORMAL, 1),
+            (Mesh::ATTRIBUTE_UV_0, 2),
+            (Mesh::ATTRIBUTE_UV_1, 3),
+            (Mesh::ATTRIBUTE_TANGENT, 4),
+            (Mesh::ATTRIBUTE_COLOR, 5),
+        ] {
+            if layout.0.contains(attr) {
+                attrs.push(attr.at_shader_location(loc));
+            }
+        }
+        attrs.push(ATTRIBUTE_WOW_SHORE_OFFSET.at_shader_location(10));
+        descriptor.vertex.buffers = vec![layout.0.get_layout(&attrs)?];
         Ok(())
     }
 }

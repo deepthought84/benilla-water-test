@@ -2541,13 +2541,15 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             continue;
         }
         // The deliberate exceptions (1639 Render Scale, 1650 Display Mode, 1847 Enable Sound in
-        // Background, 2182 Brightness). None has a 1.12 counterpart whose `OPTION_TOOLTIP_*` could
-        // be resolved — Render Scale has no era row at all, Display Mode's era row was a CHECKBOX
-        // whose string says "Check to…", 1.12 has no background-sound setting at all (it mutes on
-        // its window-activation event and offers no way out), and `OPTION_TOOLTIP_GAMMA` spends
-        // its second sentence on "all 21 levels of gray bars to the right", which is the stock
-        // video window's own calibration art and not something this page has — and each is a row a
-        // player needs a description for. Each carries one under a `BENILLA_` prefix so the reference's
+        // Background, 2182 Brightness, and Water Style with the stylised look). None has a 1.12
+        // counterpart whose `OPTION_TOOLTIP_*` could be resolved — Render Scale has no era row at
+        // all, Display Mode's era row was a CHECKBOX whose string says "Check to…", 1.12 has no
+        // background-sound setting at all (it mutes on its window-activation event and offers no
+        // way out), `OPTION_TOOLTIP_GAMMA` spends its second sentence on "all 21 levels of gray
+        // bars to the right", which is the stock video window's own calibration art and not
+        // something this page has, and the reference has exactly one water and no dial for it —
+        // and each is a row a player needs a description for. Each carries one under a `BENILLA_`
+        // prefix so the reference's
         // namespace stays the reference's, which is exactly what this guard is here to protect.
         // Everything the guard was built to catch — an invented or typo'd `OPTION_TOOLTIP_` key
         // that silently resolves to nothing — is untouched: the pairing below is exact, so a
@@ -2560,6 +2562,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "AudioRowBackgroundSound",
             ),
             ("BENILLA_TOOLTIP_BRIGHTNESS", "GraphicsRowBrightness"),
+            ("BENILLA_TOOLTIP_WATER_STYLE", "GraphicsRowWaterStyle"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2618,7 +2621,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // …and Brightness (2182), the FOURTH row whose description is benilla's own rather than 1.12
     // GlobalStrings — OPTION_TOOLTIP_GAMMA spends its second sentence on the stock window's
     // 21-step grey ramp, which this page does not have (see the guard above). 77 -> 78.
-    assert_eq!(checked, 78, "every tipped row carries a live key");
+    // …and Water Style, benilla's own Graphics row for the stylised look — a dropdown with no 1.12
+    // counterpart, so its description is a `BENILLA_` string like Render Scale's. 78 -> 79.
+    assert_eq!(checked, 79, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2724,9 +2729,9 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // (the lock 1136, Always Show
     // ActionBars 1500), the Chat page's 1 (Remove Chat Hover Delay, 1589) and 6 API rows (Show
     // Cloak / Show Helm, 1472; the four multibar switches, 1500).
-    // …plus the Graphics page's Render Scale (1639) and Display Mode (1650) and the Audio page's
-    // Enable Sound in Background (1847), the three rows whose descriptions are benilla's own
-    // rather than 1.12 GlobalStrings — see the guard above.
+    // …plus the Graphics page's Render Scale (1639), Display Mode (1650) and Water Style, and the
+    // Audio page's Enable Sound in Background (1847), the four rows whose descriptions are
+    // benilla's own rather than 1.12 GlobalStrings — see the guard above.
     // …and Block Trades (1764), the Controls page's 28th CVar row, and Enable Error Speech
     // (1815), the Audio page's fourth checkbox and 1.12's own.
     // …and Show Tutorials (2077), the Interface page's seventh API row.
@@ -2738,7 +2743,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // own key, which is what makes the count move by exactly the number of rows added.
     // …and Weather Intensity (2181) and Brightness (2182), the Graphics page's fourth and fifth
     // sliders.
-    assert_eq!(raised, 78, "every row but Auto Loot raises a description");
+    // …and Water Style, the Graphics page's fourth benilla-owned description.
+    assert_eq!(raised, 79, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

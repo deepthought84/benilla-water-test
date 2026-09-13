@@ -108,13 +108,60 @@ struct StarDome {
     weight: f32,
 }
 
+/// **How much of the sun actually reaches the world this frame**, in `[0, 1]`.
+///
+/// The sun's day/night curve × the below-horizon smoothstep × the cloud coverage over its sky point
+/// × the fraction of its disc the terrain leaves clear — the lens flare's own terms, computed the
+/// same way, minus the one that does not belong.
+///
+/// It began as the flare's envelope republished, and that was a bug with a very wide face: the flare
+/// zeroes itself the instant the camera is claimed by a WMO interior, because there is no lens flare
+/// from a sun the eye cannot see. Stormwind's canals are open to the sky and the city is one
+/// enormous WMO, so standing beside the water there claimed the camera and took the sun off every
+/// canal in the game. What lights a surface is what stands between that surface and the sun, not
+/// what stands over the eye.
+///
+/// The stylised water reads it, because a sun glitter path that shines out of a hillside — or out
+/// of an overcast sky, or after dark — is the single loudest tell that the highlight is painted on
+/// rather than lit. The value is slewed, so it fades rather than pops when the sun goes behind a
+/// ridge.
+///
+/// Defaults to fully visible: a scene with no sky pass at all (the debug dome kill, the assetless
+/// dev world) should light its water, not black out its highlights.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct SunVisibility(pub f32);
+
+impl Default for SunVisibility {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+/// **How much of the white moon reaches the world this frame**, in `[0, 1]` — the moon's answer to
+/// [`SunVisibility`], and deliberately NOT the moon's own flare envelope.
+///
+/// The flare's is the wrong quantity here twice over. Its cloud term is the thin-cloud tent
+/// (`occ1_moon`), which is zero in a perfectly clear sky because the reference's moon HALO is a
+/// wisp effect — but a clear night is exactly when the moon lays a path across the water. And its
+/// day/night curve is flat until 22:45, because the halo is a deep-night thing, while moonlight on
+/// water is there from moonrise. So this is built from the two terms that do apply: the moon is
+/// above the horizon, and cloud is not covering it.
+///
+/// It carries no terrain occlusion, where [`SunVisibility`] does — that term comes free with the
+/// sun's flare probe and there is no second probe to borrow for the moon. A moon behind a ridge
+/// still glitters; it is the smaller error by far next to having no moonlight on the water at all.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Default)]
+pub struct MoonVisibility(pub f32);
+
 /// Sun-sprite subsystem: spawns the disc + glow billboards (+ the two moons + the stars) at startup and pins
 /// them to their bodies each frame (camera-facing, at each body's world direction just inside the far plane).
 pub(crate) struct SunPlugin;
 
 impl Plugin for SunPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<CelestialMaterial>::default())
+        app.init_resource::<SunVisibility>()
+            .init_resource::<MoonVisibility>()
+            .add_plugins(MaterialPlugin::<CelestialMaterial>::default())
             .add_plugins(MaterialPlugin::<StarMaterial>::default())
             .add_systems(Startup, setup_sun.after(AssetSet::Open))
             // Post-propagation camera-anchored placement (the BillboardPlace slot): the follows read
@@ -123,7 +170,14 @@ impl Plugin for SunPlugin {
             // distance, a visible halo swim/size-pump while moving (decision 0504).
             .add_systems(
                 PostUpdate,
-                (follow_sun, follow_moons, follow_stars).in_set(crate::billboard::BillboardPlace),
+                (
+                    follow_sun,
+                    follow_moons,
+                    follow_stars,
+                    follow::publish_sun_visibility,
+                    follow::publish_moon_visibility,
+                )
+                    .in_set(crate::billboard::BillboardPlace),
             )
             // The WMO-skybox + submersion suppression, ordered after both resolves for the same
             // reason `crate::sky`'s dome gate is: backdrop and atmosphere must agree WITHIN a
