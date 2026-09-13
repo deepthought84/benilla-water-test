@@ -351,6 +351,31 @@ fn stamp_world_camera_layers(
     }
 }
 
+/// The mirror's **view-key shape** — the components that decide which pipelines its draws need,
+/// kept in one place because a second camera has to reproduce them exactly.
+///
+/// A pipeline is specialized against the VIEW as well as the material, so this bundle is the whole
+/// reason the mirror does not share the world camera's pipelines: no multisampling and no glow pass
+/// (this image is sampled through a rippling normal at half resolution, where neither is
+/// recoverable), and — the axis that actually bites — **no `DepthPrepass`**. `liquid::depth` puts
+/// one on the `WorldCamera` alone, so every material this camera draws needs a second pipeline
+/// compiled without `DEPTH_PREPASS`. Measured at the Elwynn golden: the mirrored pass adds ten
+/// pipelines over `$WOW_NO_REFLECT=1`, and all ten differ from their main-view twin by that one
+/// def and nothing else.
+///
+/// Extracted so `pipe_warm`'s warm mirror can be built from the SAME bundle. Warming a view key by
+/// hand-copying four components is how a warm pass silently stops covering the thing it was written
+/// for: the copy keeps compiling, the keys quietly diverge, and the only symptom is the tripwire
+/// firing months later with no obvious connection to whatever changed here.
+pub fn mirror_view_shape() -> impl Bundle {
+    (
+        Camera3d::default(),
+        bevy::render::view::Msaa::Off,
+        Hdr,
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
+    )
+}
+
 fn setup_reflection(
     mut commands: Commands,
     device: Res<RenderDevice>,
@@ -361,15 +386,10 @@ fn setup_reflection(
     let camera = commands
         .spawn((
             Name::new("water reflection camera"),
-            Camera3d::default(),
+            mirror_view_shape(),
             // Never `WorldCamera`: that marker means *the* viewer, and every "where is the eye"
             // consumer in the client filters on it.
             ReflectionCamera,
-            // No multisampling and no glow pass: this image is sampled through a rippling normal at
-            // half resolution, where neither is recoverable.
-            bevy::render::view::Msaa::Off,
-            Hdr,
-            bevy::core_pipeline::tonemapping::Tonemapping::None,
             RenderTarget::Image(image.clone().into()),
             Camera {
                 // Ahead of the world camera (order 0), so the water samples this frame's image rather

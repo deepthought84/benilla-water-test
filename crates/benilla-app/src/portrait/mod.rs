@@ -233,13 +233,23 @@ pub(crate) const MINIMAP_COMPOSITE_LAYER: usize = WARM_BOOTH_LAYER + 1;
 /// The UI model tiles' layer (`crate::ui_models`, decision 2008): every `<Model>` widget's M2
 /// renders into one atlas through one camera on this layer.
 pub(crate) const UI_MODELS_LAYER: usize = MINIMAP_COMPOSITE_LAYER + 1;
+/// The pipe_warm **warm mirror**'s render layer — the next one past the UI model tiles', by the
+/// same ladder rule, and computed HERE for the reason [`GLUE_LAYER`] gives rather than in
+/// `pipe_warm` where it is used.
+///
+/// The stylised water's mirrored camera is a second view of the world with a view key the world
+/// camera does not have (no `DepthPrepass`; see `benilla_world::liquid::mirror_view_shape`), so
+/// every lane it draws needs pipelines nothing else compiles. This layer belongs to the warm twin
+/// that compiles them behind the entry cover; it lives only while the warm pass runs, and nothing
+/// but menagerie rigs ever rides it.
+pub(crate) const WARM_MIRROR_LAYER: usize = UI_MODELS_LAYER + 1;
 /// The base of the **perspective model panes'** layer block (decision 2027). A `<Model>` framed
 /// by its file's own camera cannot share the tile atlas's one orthographic camera — it needs a
 /// camera of its own, rendering into its own cell of the same atlas through a viewport — and one
 /// camera per pane means one layer per pane, or every perspective camera would draw every other
 /// pane's model over its cell. The block runs `BASE + i` for `i < UI_MODEL_CAM_LAYERS` and sits at
 /// the TOP of the ladder, so it can be widened without colliding with anything above it.
-pub(crate) const UI_MODEL_CAM_LAYER_BASE: usize = UI_MODELS_LAYER + 1;
+pub(crate) const UI_MODEL_CAM_LAYER_BASE: usize = WARM_MIRROR_LAYER + 1;
 /// How many perspective model panes can draw at once — the size of the layer block above and of
 /// the camera pool beside it. Each is a full render pass into the atlas, and a UI showing eight
 /// authored-camera 3-D scenes at once is already far past anything the reference's interface or
@@ -264,7 +274,8 @@ const _: () = assert!(
         && WARM_BOOTH_LAYER > DRESSUP_LAYER
         && MINIMAP_COMPOSITE_LAYER > WARM_BOOTH_LAYER
         && UI_MODELS_LAYER > MINIMAP_COMPOSITE_LAYER
-        && UI_MODEL_CAM_LAYER_BASE > UI_MODELS_LAYER,
+        && WARM_MIRROR_LAYER > UI_MODELS_LAYER
+        && UI_MODEL_CAM_LAYER_BASE > WARM_MIRROR_LAYER,
     "booth render layers must be distinct — see GLUE_LAYER"
 );
 const _: () = assert!(
@@ -277,8 +288,9 @@ const _: () = assert!(
 // the assert that keeps it there — a booth sharing water's layer would render the world's lakes
 // into a portrait and, worse, silently take water out of the reflection's exclusion.
 const _: () = assert!(
-    MINIMAP_COMPOSITE_LAYER < benilla_world::liquid::WATER_RENDER_LAYER,
-    "the booth ladder must stay clear of the liquid render layer"
+    UI_MODEL_CAM_LAYER_BASE + UI_MODEL_CAM_LAYERS - 1
+        < benilla_world::liquid::UNMIRRORED_RENDER_LAYER,
+    "the booth ladder must stay clear of the liquid render layers"
 );
 /// The baked image is high-res (vs the ref's 64²) — the crisp modern look. Square; the UI quad
 /// shader cuts the inscribed circle at draw time (`ui_quad.wgsl`'s `circular`, the ref's stencil).

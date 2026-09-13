@@ -185,7 +185,7 @@ pub use query::{
     Underwater, WaterChunkInfo, WmoPool,
 };
 pub(crate) use reflect::ReflectionCamera;
-pub use reflect::{UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER};
+pub use reflect::{mirror_view_shape, UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER};
 pub(crate) use spatial::{maintain_water_index, WaterIndex};
 pub(crate) use surface::{
     spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WetLattice,

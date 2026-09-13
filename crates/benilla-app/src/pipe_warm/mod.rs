@@ -62,7 +62,7 @@ use benilla_world::particles::buffer::{
 };
 
 mod menagerie;
-use menagerie::{spawn_menagerie, BoothCamQuery, WarmLanes};
+use menagerie::{spawn_menagerie, spawn_warm_mirror, BoothCamQuery, WarmLanes};
 
 /// The cross-world channel: cloned into the render app at plugin build. Frame alignment between
 /// the two worlds is ±1 frame under pipelined rendering — fine for counters and a tripwire.
@@ -461,6 +461,10 @@ fn run_warm_pass(
         commands
             .entity(warm_booth.0)
             .insert((WarmRig, WarmBoothCam));
+        // The warm mirror: the stylised water's mirrored view key (no `DepthPrepass`), which no
+        // other camera in the pass has. Also a `WarmRig`, so it despawns with them.
+        let warm_mirror = spawn_warm_mirror(&mut commands, &mut lanes.images);
+        commands.entity(warm_mirror.0).insert(WarmRig);
         // The effect lane's stand-in texture — held for the life of the pass.
         warm.effect_tex = Some(lanes.images.add(Image::default()));
         let count = spawn_menagerie(
@@ -468,6 +472,7 @@ fn run_warm_pass(
             cam,
             booth.iter().next(),
             &warm_booth,
+            &warm_mirror,
             &mut meshes,
             &mut materials,
             &mut lanes,

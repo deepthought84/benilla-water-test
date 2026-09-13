@@ -95,6 +95,7 @@ pub(super) fn spawn_menagerie(
     cam: Entity,
     booth: Option<(Entity, &bevy::camera::visibility::RenderLayers)>,
     warm_booth: &(Entity, bevy::camera::visibility::RenderLayers),
+    warm_mirror: &(Entity, bevy::camera::visibility::RenderLayers),
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<WowModelMaterial>,
     lanes: &mut WarmLanes,
@@ -409,6 +410,19 @@ pub(super) fn spawn_menagerie(
                 mat,
             );
             count += 1;
+            // …and the mirrored view. Until this camera existed the model cross was covered for
+            // that key only because a portrait booth happens to share it; stated here rather than
+            // inherited, so a change to `booth_view_shape()` cannot quietly take it away.
+            spawn_model_rig(
+                commands,
+                warm_mirror.0,
+                Some(warm_mirror.1.clone()),
+                mesh,
+                aabb,
+                *skinned,
+                mat,
+            );
+            count += 1;
         }
         if !*skinned {
             for mat in shard_mats.iter().chain(far_shard_mats.iter()) {
@@ -467,10 +481,10 @@ pub(super) fn spawn_menagerie(
     let liquid_mesh = meshes.add(warm_liquid_mesh());
     // Celestial discs + glares (`sun::setup` quads: position+normal+UV).
     for mat in lane_handles(&mut lanes.celestial) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
@@ -480,11 +494,19 @@ pub(super) fn spawn_menagerie(
     // Stars: the real `Stars.m2` patches carry position+UV only; the assetless fallback dome
     // carries normals too — two distinct pipeline keys, warm both.
     for mat in lane_handles(&mut lanes.stars) {
-        spawn_lane_rig(commands, cam, None, &posuv, None, mat.clone(), &mut count);
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
+            warm_mirror,
+            &posuv,
             None,
+            mat.clone(),
+            &mut count,
+        );
+        spawn_lane_rig_both(
+            commands,
+            cam,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
@@ -493,10 +515,10 @@ pub(super) fn spawn_menagerie(
     }
     // The cloud dome (position+normal+UV+colour) and the gradient dome (position+normal+UV).
     for mat in lane_handles(&mut lanes.clouds) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &colours_mesh,
             colours_aabb.as_ref(),
             mat,
@@ -504,10 +526,10 @@ pub(super) fn spawn_menagerie(
         );
     }
     for mat in lane_handles(&mut lanes.sky) {
-        spawn_lane_rig(
+        spawn_lane_rig_both(
             commands,
             cam,
-            None,
+            warm_mirror,
             &plain_mesh,
             plain_aabb.as_ref(),
             mat,
@@ -515,6 +537,9 @@ pub(super) fn spawn_menagerie(
         );
     }
     // Liquid: every kind × fog-block material `setup_liquid` built, on the liquid grid layout.
+    // World camera ONLY, and that is not an oversight: liquid surfaces sit on
+    // `WATER_RENDER_LAYER`, which the mirrored camera excludes by construction — a mirror that
+    // reflects the water is a feedback loop — so the mirrored view key never needs this lane.
     for mat in lane_handles(&mut lanes.liquid) {
         spawn_lane_rig(commands, cam, None, &liquid_mesh, None, mat, &mut count);
     }
@@ -611,11 +636,98 @@ fn far_twins_of(
 
 /// Strong handles to every material currently in a lane's store (the iterate-the-store warm:
 /// what exists is what gets compiled).
+/// A sky/water lane rig on the world camera **and** on the warm mirror — the two views that draw
+/// these lanes, and two pipelines per variant because they disagree on `DEPTH_PREPASS`.
+///
+/// The model cross gets the same treatment in the layout loop above; it is spelled out as a helper
+/// here only because the sky lanes each spawn from their own store with their own mesh layout.
+fn spawn_lane_rig_both<M: Material>(
+    commands: &mut Commands,
+    cam: Entity,
+    mirror: &(Entity, bevy::camera::visibility::RenderLayers),
+    mesh: &Handle<Mesh>,
+    aabb: Option<&bevy::camera::primitives::Aabb>,
+    mat: Handle<M>,
+    count: &mut usize,
+) {
+    spawn_lane_rig(commands, cam, None, mesh, aabb, mat.clone(), count);
+    spawn_lane_rig(
+        commands,
+        mirror.0,
+        Some(mirror.1.clone()),
+        mesh,
+        aabb,
+        mat,
+        count,
+    );
+}
+
 fn lane_handles<M: Material>(assets: &mut Assets<M>) -> Vec<Handle<M>> {
     let ids: Vec<AssetId<M>> = assets.iter().map(|(id, _)| id).collect();
     ids.into_iter()
         .filter_map(|id| assets.get_strong_handle(id))
         .collect()
+}
+
+/// The pipe_warm **warm mirror** — a camera carrying the stylised water's mirrored view key, so the
+/// pipelines that view needs are compiled behind the entry cover instead of on the first frame that
+/// shows water.
+///
+/// The mirrored pass is a second view of the world, and a pipeline is specialized against the view
+/// as well as the material. `liquid::depth` puts a `DepthPrepass` on the `WorldCamera` alone, so
+/// every lane the mirror draws needs a twin compiled **without** `DEPTH_PREPASS`. Measured at the
+/// Elwynn golden with `$WOW_PIPE_TRACE`: the mirrored pass adds ten pipelines over
+/// `$WOW_NO_REFLECT=1`, and all ten differ from their main-view twin by that one def and nothing
+/// else.
+///
+/// **The shape comes from `benilla_world::liquid::mirror_view_shape`, not from a copy of it here.**
+/// Before this camera existed the model cross was warmed for that key by accident — the portrait
+/// booths happen to be `Hdr` + `Tonemapping::None` + `Msaa::Off` with no prepass, which is
+/// key-identical to the mirror — while the sky lanes, which ride no booth, were not warmed at all.
+/// Coverage that depends on an unrelated camera agreeing on four view bits is coverage nobody can
+/// see, and a change to `booth_view_shape()` would have taken it away with no symptom but the
+/// tripwire firing months later.
+///
+/// A tiny target: the warm pass compiles PIPELINES, and neither the size nor the aspect keys one
+/// (the twin booth's own note says the same). Carries [`super::WarmRig`] at the call site, so every
+/// despawn path cleans it up with the rigs.
+pub(super) fn spawn_warm_mirror(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+) -> (Entity, bevy::camera::visibility::RenderLayers) {
+    use bevy::camera::{ClearColorConfig, RenderTarget};
+    let layer = bevy::camera::visibility::RenderLayers::layer(crate::portrait::WARM_MIRROR_LAYER);
+    let mut image = Image::new_fill(
+        bevy::render::render_resource::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        &[0; 8],
+        // The mirror's own target format — `reflect::reflection_image`'s, because the colour
+        // target format is part of the pipeline too.
+        bevy::render::render_resource::TextureFormat::Rgba16Float,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
+        | bevy::render::render_resource::TextureUsages::COPY_DST
+        | bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT;
+    let cam = commands
+        .spawn((
+            Name::new("pipe_warm mirror twin"),
+            benilla_world::liquid::mirror_view_shape(),
+            Camera {
+                // Behind every real camera, and behind the twin booth.
+                order: -200,
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                ..default()
+            },
+            RenderTarget::Image(images.add(image).into()),
+            layer.clone(),
+        ))
+        .id();
+    (cam, layer)
 }
 
 /// One model-lane menagerie entity: a 1 cm rig in front of the camera (world or booth — `layers`
@@ -864,6 +976,22 @@ mod tests {
         // Lanes that never need the menagerie, each with the reason it is safe:
         // - TerrainMaterial / WdlMaterial: the ground the player spawns on and its horizon
         //   ring — always drawn under the entry cover by construction, no per-variant key axis.
+        //
+        //   **That reason is now only half true, and the other half is a KNOWN GAP.** It held
+        //   while the world camera was the only view of layer 0. The stylised water's mirrored
+        //   camera is a second one, and it carries no `DepthPrepass` — so terrain and the WDL
+        //   horizon each have a second pipeline, keyed on `DEPTH_PREPASS` being absent, whose
+        //   first draw is the first frame that shows water rather than anything under the cover.
+        //   `$WOW_PIPE_TRACE` at the Elwynn golden: the mirrored pass adds ten pipelines over
+        //   `$WOW_NO_REFLECT=1`, one of them terrain's and one the horizon's.
+        //
+        //   The other eight are warmed now (the model cross and the sky lanes ride
+        //   `spawn_warm_mirror`). These two are NOT, and warming them was deliberately not
+        //   faked: a terrain rig needs terrain's own vertex layout and a material with a real
+        //   splat, and warming it on any other layout compiles a pipeline that is not the one
+        //   the mirror will ask for — coverage that reads as green and is not. Closing it means
+        //   giving the menagerie a real terrain mesh + material the way the merged-blob rows
+        //   already use the production builder, which is a change of its own.
         // - AddUiMaterial: drawn only by the glue screens, and every pre-world frame counts
         //   as covered (`publish_cover`: `state != InWorld`).
         let families: [(&str, &[&str]); 3] = [
