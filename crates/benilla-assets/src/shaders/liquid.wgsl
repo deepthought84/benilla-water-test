@@ -149,10 +149,15 @@ struct WaterReflect {
     // through. Water reflects moonlight as readily as sunlight and the first pass had it reflecting
     // none.
     moon: vec4<f32>,
-    /// `x` = the screen-space march is switched off (`$WOW_NO_SSR`); `y` = paint its confidence
-    /// instead of the water (`$WOW_SSR_SHOW`); `z` = the march's OWN strength — 1 on the stylised
-    /// lane unless `x`, and pointedly independent of `params.y`, which is the mirror's; `w` =
-    /// composite the tiers the old layered way (`$WOW_REFLECT_LAYER`).
+    /// `x` = the mirror capture's blur radius in capture texels (`$WOW_REFLECT_BLUR`, 0 = off —
+    /// see [`sample_mirror`]); `y` = paint the march's confidence instead of the water
+    /// (`$WOW_SSR_SHOW`); `z` = the march's OWN strength — 0 unless `$WOW_SSR=1` asks for it, and
+    /// pointedly independent of `params.y`, which is the mirror's; `w` = composite the tiers the
+    /// old layered way (`$WOW_REFLECT_LAYER`).
+    ///
+    /// `x` carried `$WOW_NO_SSR` until the march was gated off, and was dead weight even then: the
+    /// gate the shader actually reads is `z`. The row is full at four lanes and the params buffer
+    /// is sized to it, so a dead lane is the cheapest place for the blur to live.
     flags: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<storage, read> water_reflect: WaterReflect;
@@ -481,6 +486,46 @@ fn surface_tilt(world_pos: vec3<f32>) -> f32 {
     }
     // Only the magnitude of the tilt matters, so the facet's winding is irrelevant.
     return acos(clamp(abs(g.y / len), 0.0, 1.0));
+}
+
+/// The mirror capture, read through a **4-tap box blur** — the reference pipeline's own shape.
+///
+/// Cataclysm's Ultra water does not sample its mirrored capture directly. It renders the mirror
+/// into a downscaled target, runs a 4-tap box blur into a second target, and the water shader
+/// samples *that* (`/data/scratch/done/water-ultra/UltraWater_Cata_4.3.4_Spec.md` §5.2). This pass
+/// had the downscale and not the blur, and the difference is most of why the reflection read as
+/// hard-edged debris rather than as a reflection: a capture is a sharp image of the world, and the
+/// ripple offset below *displaces* the sample rather than softening it, so every artefact in the
+/// capture arrives at full contrast with a crisp edge on it. Blurring is the step that makes a
+/// wrong sample read as water instead of as a mistake — and it is also why the reference's own
+/// reflections are faint and broken up, which the shore-band note above says in the other
+/// direction.
+///
+/// Four bilinear taps on the diagonals, which is the whole kernel: at `radius` = 1 each tap already
+/// averages the 2x2 it lands between, so the four together cover 3x3 with tent weights for the cost
+/// of four fetches.
+///
+/// **The average is premultiplied, and it has to be.** The capture clears to *transparent black*
+/// (alpha is coverage — see `benilla_world::liquid::reflect`), so a straight RGBA mean drags colour
+/// toward black wherever a tap lands off the drawn geometry, and every silhouette in the reflection
+/// would gain a dark fringe exactly where the blur was supposed to soften it. Dividing the summed
+/// colour by the summed coverage is the mean of what was actually *drawn*, and leaves the coverage
+/// itself to fade the tier out the way it already does.
+///
+/// `textureSampleLevel` rather than `textureSample`: this is called under a per-fragment branch,
+/// where implicit derivatives are undefined, and the capture is a single-mip image so level 0 is
+/// the only level there is.
+fn sample_mirror(uv: vec2<f32>, radius: f32) -> vec4<f32> {
+    if (radius <= 0.0) {
+        return textureSampleLevel(reflection_tex, reflection_samp, uv, 0.0);
+    }
+    let o = radius / vec2<f32>(textureDimensions(reflection_tex));
+    var acc = textureSampleLevel(reflection_tex, reflection_samp, uv + vec2<f32>(-o.x, -o.y), 0.0);
+    acc += textureSampleLevel(reflection_tex, reflection_samp, uv + vec2<f32>(o.x, -o.y), 0.0);
+    acc += textureSampleLevel(reflection_tex, reflection_samp, uv + vec2<f32>(-o.x, o.y), 0.0);
+    acc += textureSampleLevel(reflection_tex, reflection_samp, uv + vec2<f32>(o.x, o.y), 0.0);
+    acc *= 0.25;
+    return vec4<f32>(acc.rgb / max(acc.a, 1.0e-4), acc.a);
 }
 
 /// How much of the planar reflection a surface `err` yards off the capture plane keeps.
@@ -1175,7 +1220,7 @@ fn stylised_water(
             vec2<f32>(0.002),
             vec2<f32>(0.998),
         );
-        let mirrored = textureSample(reflection_tex, reflection_samp, ruv);
+        let mirrored = sample_mirror(ruv, water_reflect.flags.x);
         // Schlick again, on the same normal: water reflects almost nothing straight down and almost
         // everything at a glancing angle, which is most of why a lake reads as a lake.
         //

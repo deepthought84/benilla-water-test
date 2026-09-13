@@ -417,13 +417,57 @@ fn no_reflect() -> bool {
     *OFF.get_or_init(|| std::env::var_os("WOW_NO_REFLECT").is_some())
 }
 
-/// `$WOW_NO_SSR=1` — the screen-space march's kill switch, in the mould of `$WOW_NO_REFLECT`.
+/// `$WOW_SSR=1` — the screen-space march, **off by default**, and the default is the point.
 ///
-/// The march and the mirror answer the same question by different means, so the only way to grade
-/// either is to turn the other off. Read once, like every lever here.
-fn no_ssr() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("WOW_NO_SSR").is_some())
+/// The march traces `reflect(-V, N)` on the fragment's own normal, which has the ambient ripple and
+/// the wave field already summed into it. Neighbouring pixels therefore get meaningfully different
+/// ray directions, land on unrelated geometry or leave the frame, and the hit/miss flips pixel to
+/// pixel — so the blend between the march's colour and the mirror's flickers at pixel scale and the
+/// reflection tears into horizontal streaks. Measured at a grazing Stranglethorn lake: the march's
+/// own confidence flips between vertically adjacent pixels on 14% of pairs while only 20% of pixels
+/// get an answer at all, i.e. the hits are one or two pixels tall.
+///
+/// The later ray-traced work reached this conclusion independently and designed around it — rays
+/// cast flat, the ripple applied where the traced image is *read* — and that fix was never carried
+/// back here. Neither reference does what this does: the sandbox this water was ported from
+/// (`/data/games/water-test`) has no march at all, and in the Cataclysm spec screen-space
+/// reflection is `reflectionMode` **0**, the cheapest of four modes, below sky and sky+terrain —
+/// the fallback for a machine that cannot afford a mirror, not the top of the range.
+///
+/// Kept rather than deleted because the problem it was written for is real: one horizontal plane is
+/// wrong by twice the tilt on a sloped stream. The per-fragment plane reprojection added after it
+/// addresses much of that without a march, which is the measurement to make before removing this.
+/// Read once, like every lever here.
+fn ssr_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WOW_SSR").as_deref() == Ok("1"))
+}
+
+/// How far the mirror capture is blurred before the water reads it, in **capture texels**.
+///
+/// The reference pipeline blurs: Cataclysm's Ultra water renders the mirror into a downscaled
+/// target and then runs a 4-tap box blur into a second target before the water samples it. This
+/// pass took the downscale and skipped the blur, so it sampled a sharp image through a displacing
+/// ripple offset — which delivers every artefact in the capture at full contrast with a crisp edge.
+/// See `sample_mirror` in `liquid.wgsl` for the kernel and why its average is premultiplied.
+///
+/// One texel by default, which at [`REFLECT_DOWNSCALE`] is two of the main view's. It is a *look*
+/// number and belongs to whoever is looking at the water; `$WOW_REFLECT_BLUR=0` turns it off and
+/// gives back the image every capture before this was graded against.
+const REFLECT_BLUR_TEXELS: f32 = 1.0;
+
+/// `$WOW_REFLECT_BLUR=<texels>` — [`REFLECT_BLUR_TEXELS`], for sweeping the softness without a
+/// rebuild. Clamped: past a few texels the capture stops holding an image at all.
+fn reflect_blur() -> f32 {
+    static BLUR: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *BLUR.get_or_init(|| {
+        std::env::var("WOW_REFLECT_BLUR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(REFLECT_BLUR_TEXELS)
+            .clamp(0.0, 8.0)
+    })
 }
 
 /// `$WOW_REFLECT_DEBUG=1` — draw the mirrored camera's image **to the window** instead of into the
@@ -1037,8 +1081,10 @@ fn drive_reflection(
         moon_visible.0
     };
     data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_w]);
-    // The flag row. `x` = the screen-space march's kill switch (`$WOW_NO_SSR`), which is the A/B
-    // this tier is priced and graded with — the same shape `$WOW_NO_REFLECT` gives the mirror.
+    // The flag row. `x` = the mirror capture's blur radius in capture texels (`$WOW_REFLECT_BLUR`).
+    // It held `$WOW_NO_SSR` until the march was gated off, and the shader never read it even then —
+    // the gate it actually reads is `z`. The row is four lanes and the buffer is sized to it, so a
+    // dead lane is the cheapest place to put the blur.
     // `y` = `$WOW_SSR_SHOW`, which paints the march's confidence instead of the water.
     let ssr_show = f32::from(std::env::var_os("WOW_SSR_SHOW").is_some());
     // `z` = **the march's own strength, deliberately not the mirror's.** It used to have none: the
@@ -1051,7 +1097,7 @@ fn drive_reflection(
     // What it legitimately depends on is the look and its own kill switch, and that is all. The
     // shader adds the two conditions that are genuinely per-fragment — a depth prepass to march
     // against, and an eye above the surface.
-    let ssr_on = f32::from(*style == WaterStyle::Stylised && !no_ssr());
+    let ssr_on = f32::from(*style == WaterStyle::Stylised && ssr_enabled());
     // `w` = `$WOW_REFLECT_LAYER=1`, which restores the composite the tiers used to have, where each
     // of them mixed OVER a water that had already had its full Fresnel share of sky mixed in. That
     // layering is what made a river read as unreflective: the sky mix and the tier mix carry the
@@ -1062,7 +1108,7 @@ fn drive_reflection(
     // river in a gorge, where they do not. Kept as a knob because it is the image every capture
     // before this was graded against.
     let layer = f32::from(std::env::var("WOW_REFLECT_LAYER").as_deref() == Ok("1"));
-    data.0[24..28].copy_from_slice(&[f32::from(no_ssr()), ssr_show, ssr_on, layer]);
+    data.0[24..28].copy_from_slice(&[reflect_blur(), ssr_show, ssr_on, layer]);
     let (zenith, horizon) = (light.sky[0], light.sky[4]);
     // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
     let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());
