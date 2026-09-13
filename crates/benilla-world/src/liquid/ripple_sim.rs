@@ -520,7 +520,7 @@ fn drive_ripple_sim(
 ) {
     // x/y = the window's lower corner, z = 1/extent, w = strength.
     let mut params = [0.0f32; 4];
-    if *style != WaterStyle::Stylised {
+    if !style.is_stylised() {
         data.0[16..20].copy_from_slice(&params);
         return;
     }

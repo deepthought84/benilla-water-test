@@ -438,7 +438,7 @@ fn emit_water_foam(
     // stencil of a wake on top of a wake would be two of them. Emission stops here rather than at
     // the draw so the pool empties as well: the records already alive are left to age out, which
     // is a second of fade rather than a frame of pop when the player flips the setting.
-    if style.is_some_and(|s| *s == crate::liquid::WaterStyle::Stylised) {
+    if style.is_some_and(|s| s.is_stylised()) {
         for uf in foam.units.values_mut() {
             uf.active = false;
         }

@@ -437,7 +437,13 @@ fn no_reflect() -> bool {
     *OFF.get_or_init(|| std::env::var_os("WOW_NO_REFLECT").is_some())
 }
 
-/// `$WOW_SSR=1` — the screen-space march, **off by default**, and the default is the point.
+/// `$WOW_SSR=1` — the screen-space march **on top of the planar capture**, off by default.
+///
+/// This lever is about the *hybrid*, and only about the hybrid. [`WaterStyle::StylisedSsr`] does not
+/// consult it: on that lane the march is the only reflection there is, so there is nothing for a
+/// kill switch to fall back to and choosing the lane is already the request. What follows is the
+/// case against layering the march over a capture that is also running, which is a different
+/// question from whether the march is worth having alone.
 ///
 /// The march traces `reflect(-V, N)` on the fragment's own normal, which has the ambient ripple and
 /// the wave field already summed into it. Neighbouring pixels therefore get meaningfully different
@@ -448,8 +454,11 @@ fn no_reflect() -> bool {
 /// get an answer at all, i.e. the hits are one or two pixels tall.
 ///
 /// The later ray-traced work reached this conclusion independently and designed around it — rays
-/// cast flat, the ripple applied where the traced image is *read* — and that fix was never carried
-/// back here. Neither reference does what this does: the sandbox this water was ported from
+/// cast flat, the ripple applied where the traced image is *read* — and **that fix has now been
+/// carried back**: `liquid.wgsl`'s `ssr_trace` casts on the geometric facet normal and displaces
+/// the read by `SSR_READ_DISTORT`. It is what turned the march from 11.8% of water pixels answered
+/// in a pixel-scale confetti into coherent regions of reflection, and it is why the SSR-only lane
+/// is offerable at all. The tearing described above was measured before that change. Neither reference does what this does: the sandbox this water was ported from
 /// (`/data/games/water-test`) has no march at all, and in the Cataclysm spec screen-space
 /// reflection is `reflectionMode` **0**, the cheapest of four modes, below sky and sky+terrain —
 /// the fallback for a machine that cannot afford a mirror, not the top of the range.
@@ -457,6 +466,13 @@ fn no_reflect() -> bool {
 /// Kept rather than deleted because the problem it was written for is real: one horizontal plane is
 /// wrong by twice the tilt on a sloped stream. The per-fragment plane reprojection added after it
 /// addresses much of that without a march, which is the measurement to make before removing this.
+///
+/// Note that the tearing above is a *blend* artefact — the march's answer and the mirror's flipping
+/// against each other pixel to pixel — so it is specific to running both. With the capture stood
+/// down there is no second image to flicker against, and what the march misses fades to the sky mix
+/// over `SSR_EDGE_FADE` (`liquid.wgsl`) instead of to a different reflection. That is the argument for offering
+/// the SSR-only lane and not for turning this on.
+///
 /// Read once, like every lever here.
 fn ssr_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1117,7 +1133,16 @@ fn drive_reflection(
     // What it legitimately depends on is the look and its own kill switch, and that is all. The
     // shader adds the two conditions that are genuinely per-fragment — a depth prepass to march
     // against, and an eye above the surface.
-    let ssr_on = f32::from(*style == WaterStyle::Stylised && ssr_enabled());
+    //
+    // On [`WaterStyle::StylisedSsr`] the march is not a knob at all: it is the ONLY reflection that
+    // lane has, so `$WOW_SSR` does not gate it and cannot turn it off. Choosing that lane IS asking
+    // for the march. `$WOW_SSR=1` keeps its old meaning of adding the march on top of the full
+    // stylised lane's capture.
+    let ssr_on = f32::from(match *style {
+        WaterStyle::Reference => false,
+        WaterStyle::Stylised => ssr_enabled(),
+        WaterStyle::StylisedSsr => true,
+    });
     // `w` = `$WOW_REFLECT_LAYER=1`, which restores the composite the tiers used to have, where each
     // of them mixed OVER a water that had already had its full Fresnel share of sky mixed in. That
     // layering is what made a river read as unreflective: the sky mix and the tier mix carry the
@@ -1145,7 +1170,11 @@ fn drive_reflection(
         // The mirror's lanes only — see [`WaterReflectData`].
         data.0[..4].copy_from_slice(&[0.0; 4]);
     };
-    if *style != WaterStyle::Stylised || no_reflect() {
+    // **[`WaterStyle::StylisedSsr`] leaves by this door**, and that is the whole of what makes it
+    // cheap: `off` writes the mirror's four uniform lanes to zero, which is the same state the
+    // shader already reads as "no capture" (`water_reflect.params.y > 0.0` fails), and it
+    // deactivates the camera so the second view is never queued, never culled and never drawn.
+    if !style.wants_mirror() || no_reflect() {
         off(&mut mirror_cam, &mut data);
         return;
     }
@@ -1760,5 +1789,32 @@ mod tests {
         let mf: Vec3 = mirrored.forward().into();
         assert!((mf.y + f.y).abs() < 1e-5, "{f:?} vs {mf:?}");
         assert!((mf.x - f.x).abs() < 1e-5 && (mf.z - f.z).abs() < 1e-5);
+    }
+
+    /// The SSR lane is defined by exactly two answers, and they are opposite to the full stylised
+    /// lane's: the march is armed unconditionally, and the mirror camera is not driven at all.
+    ///
+    /// Worth pinning because the second half is invisible in this file — it is a `!wants_mirror()`
+    /// taking the same early return that `$WOW_NO_REFLECT` takes, so a refactor that folded the two
+    /// stylised lanes back together would cost a millisecond a frame and change no test.
+    #[test]
+    fn the_ssr_lane_marches_and_never_mirrors() {
+        assert!(!WaterStyle::StylisedSsr.wants_mirror());
+        assert!(WaterStyle::Stylised.wants_mirror());
+        assert!(!WaterStyle::Reference.wants_mirror());
+        // Both of benilla's own looks share the surface — the ripple sim, the scene snapshot and
+        // the depth prepass all gate on this and all are needed by the march.
+        assert!(WaterStyle::StylisedSsr.is_stylised());
+        assert!(WaterStyle::Stylised.is_stylised());
+        assert!(!WaterStyle::Reference.is_stylised());
+        // And the dropdown's values survive the round trip the options page reads them back through.
+        for style in [
+            WaterStyle::Reference,
+            WaterStyle::Stylised,
+            WaterStyle::StylisedSsr,
+        ] {
+            let back = WaterStyle::from_cvar(style.cvar().parse::<f32>().unwrap());
+            assert_eq!(back, style, "{style:?} did not survive its own CVar string");
+        }
     }
 }

@@ -133,11 +133,58 @@ mod surface; // the against-real-client-files tests — they span both halves
 pub enum WaterStyle {
     /// The 1.12 client's water, which is what the rest of this subsystem implements.
     Reference,
-    /// benilla's own stylised water.
+    /// benilla's own stylised water, with the planar capture and the screen-space march layered
+    /// over the sky mix.
     Stylised,
+    /// The stylised water with **the screen-space march as its only reflection** — no second
+    /// camera, no capture, no blur.
+    ///
+    /// This is the cheap lane, and it is cheap by subtraction rather than by cutting quality out
+    /// of the march. [`Stylised`](Self::Stylised) draws the world twice: the mirror camera is a
+    /// whole extra view with its own culling, its own pipelines and its own 500-yard reach, and it
+    /// costs about a millisecond of every frame near water even before the march runs. Standing it
+    /// down leaves the march holding the whole reflection, which it can do — it traces the
+    /// fragment's own normal, so it is right at any surface orientation, and a stream in a gorge
+    /// or a pond ringed by banks is exactly the case it handles best.
+    ///
+    /// What is lost is what a screen-space trace structurally cannot see: anything off the frame
+    /// or behind the eye. On open water viewed at a grazing angle the ray runs off the top of the
+    /// screen within a few steps, so the reflection there falls back to the sky mix underneath —
+    /// which is a plausible image for open water and the reason this lane is offered at all rather
+    /// than being a strictly worse [`Stylised`](Self::Stylised). Trees on the far bank of a lake
+    /// will pop in as they enter frame; that is the honest cost, and the tooltip says so.
+    ///
+    /// **How much water it actually answers for, measured:** on `water-noon` the march reaches
+    /// about 14% of water pixels and changes about 4% of the frame against a no-reflection
+    /// baseline, where the planar mirror changes about 15%. Open water at a grazing angle is the
+    /// case it cannot serve — those rays leave the top of the frame — so this lane is for water
+    /// with something standing around it: a stream in a gorge, a pond ringed by banks, exactly the
+    /// geometry a single horizontal plane gets wrong. Offering it as a general replacement for the
+    /// mirror would be overselling it.
+    ///
+    /// **It is not currently the cheaper lane, and that is measured rather than assumed.** On
+    /// `water-noon` at 1600x900 with MSAA off (RX 6500 XT, RADV), the whole-frame GPU spans are
+    /// 1.17 ms for [`Reference`](Self::Reference), 1.73 ms for [`Stylised`](Self::Stylised) and
+    /// 2.36 ms for this — because the march cost 0.98 ms where the mirror it replaces costs
+    /// 0.36 ms. (Casting the ray flat later took the march to 0.70 ms; the gap narrowed, it did
+    /// not close.) The march is full-resolution and per water pixel; the capture is half-resolution
+    /// and once per frame, and no amount of tuning the step count closes a gap of that shape. What
+    /// would is tracing into a downscaled buffer in a pass of its own (`ssr_trace`'s doc carries
+    /// the argument).
+    ///
+    /// Two things it *is* better at today, both worth keeping in view. It is the only stylised
+    /// lane that survives `WOW_MSAA=4` — the mirror view is `Msaa::Off` while `static_gx` keys its
+    /// pipeline on the world camera's sample count, so the planar lane panics there on an
+    /// incompatible sample count. And it costs no second view on the CPU: the mirror's culling and
+    /// queueing are gone, which showed as roughly 1.5 ms of `cpu_ms` on the same shot.
+    ///
+    /// Take the absolute numbers as one batch's, not as constants: this rig moved every figure
+    /// above by a factor of three between sessions, so what is durable here is the *ordering* —
+    /// which held in every batch — and not the milliseconds. Compare arms inside one batch.
+    StylisedSsr,
 }
 
-/// `$WOW_WATER_STYLE=1` boots into the stylised look — the A/B lever, in the mould of
+/// `$WOW_WATER_STYLE=1` boots into the stylised look, `=2` into its SSR-only lane — the A/B lever, in the mould of
 /// `$WOW_RENDER_SCALE` and `$WOW_CLUTTER_DENSITY`, and the only way to reach this look from the
 /// world viewer, which has no CVar host to read a config with. Session-only: `cvars` marks the row
 /// env-overridden so a comparison run cannot pin itself into `config.toml`.
@@ -145,6 +192,7 @@ impl Default for WaterStyle {
     fn default() -> Self {
         match std::env::var("WOW_WATER_STYLE").as_deref() {
             Ok("1") => Self::Stylised,
+            Ok("2") => Self::StylisedSsr,
             _ => Self::Reference,
         }
     }
@@ -155,11 +203,38 @@ impl WaterStyle {
     /// posture `FollowStyle::from_cvar` takes, and the right one for a look: an unknown value must
     /// land on what the client would draw with no setting at all, never on a dead surface.
     pub fn from_cvar(v: f32) -> Self {
-        if v != 0.0 {
+        // `2` is exact in f32 and the CVar layer hands this the parsed number, so an equality test
+        // is safe here — but it is written as a window anyway, because the rule this posture is
+        // built on is that an unrecognised value lands on a look the client can draw, and a
+        // half-open window is the shape that keeps holding when a fourth lane arrives.
+        if v >= 2.0 {
+            Self::StylisedSsr
+        } else if v != 0.0 {
             Self::Stylised
         } else {
             Self::Reference
         }
+    }
+
+    /// Is this one of benilla's own looks, as opposed to the 1.12 client's?
+    ///
+    /// **Almost every gate in this subsystem wants this rather than an equality test.** The
+    /// stylised lane's machinery — the ripple simulation, the scene-colour snapshot, the depth
+    /// prepass, the silenced splash decals — is shared by both stylised variants, and the only
+    /// things that genuinely distinguish them are the mirror camera and the march's own strength,
+    /// both of which live in `reflect.rs`. A `== Stylised` anywhere else is a bug waiting for the
+    /// day someone selects the SSR lane and finds the water has no ripples.
+    pub fn is_stylised(self) -> bool {
+        matches!(self, Self::Stylised | Self::StylisedSsr)
+    }
+
+    /// Does this look drive the planar reflection camera?
+    ///
+    /// Only the full stylised lane does. Kept as a name rather than an inline comparison because
+    /// the mirror is spawned, aimed, sized and torn down in four different places, and they have
+    /// to agree.
+    pub(crate) fn wants_mirror(self) -> bool {
+        matches!(self, Self::Stylised)
     }
 
     /// What `GetCVar("waterStyle")` answers for this state.
@@ -167,6 +242,7 @@ impl WaterStyle {
         match self {
             Self::Reference => "0",
             Self::Stylised => "1",
+            Self::StylisedSsr => "2",
         }
     }
 
@@ -174,7 +250,13 @@ impl WaterStyle {
     pub(crate) fn shader_flag(self) -> f32 {
         match self {
             Self::Reference => 0.0,
-            Self::Stylised => 1.0,
+            // **Both stylised lanes are the same shader lane.** What separates them is not the
+            // surface — the ripple, the glitter, the Fresnel sky mix and the foam are identical —
+            // but which reflection tiers are armed, and those arrive on the reflection uniform
+            // (`WaterReflectData`) rather than here. Giving the SSR lane its own `path.y` would
+            // make the dropdown a pipeline rebuild for a difference the fragment shader does not
+            // need to know about.
+            Self::Stylised | Self::StylisedSsr => 1.0,
         }
     }
 }

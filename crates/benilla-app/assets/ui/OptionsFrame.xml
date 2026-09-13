@@ -790,7 +790,11 @@
             .. "shoreline. It keeps each zone's own water colours and follows the time of day "
             .. "like the reference does.\n\n"
             .. "The reflection draws the world a second time and costs a little frame rate; it "
-            .. "only runs near water."
+            .. "only runs near water.\n\n"
+            .. "Stylised (SSR) is the same look without that second drawing: reflections are "
+            .. "traced from what is already on your screen, which is faster, but things that are "
+            .. "off the edge of the screen or behind you cannot be reflected and fade to sky "
+            .. "instead."
 
         -- Display Mode (1650). 1.12's own OPTION_TOOLTIP_WINDOWED_MODE cannot ride this row: it
         -- is written for the checkbox it belonged to ("Check to play in a non-fullscreen
@@ -3162,9 +3166,20 @@
                                                 -- the shore of a lake with the window open.
                                                 OptionsRow_OnLoad(self, "waterStyle", "Water Style",
                                                     "BENILLA_TOOLTIP_WATER_STYLE")
+                                                --
+                                                -- THREE entries, not two, because the third is a
+                                                -- performance choice and a dropdown is where a
+                                                -- player looks for one. "Stylised (SSR)" is the
+                                                -- same water with the second camera stood down:
+                                                -- see WaterStyle::StylisedSsr for what that
+                                                -- trades. It sits AFTER the full stylised entry
+                                                -- so the list reads as increasing cheapness
+                                                -- downward, which is the order every other
+                                                -- quality dropdown on this page uses.
                                                 OptionsDropdownRow_Setup(self, {
                                                     { text = "Reference (1.12)", value = "0" },
                                                     { text = "Stylised", value = "1" },
+                                                    { text = "Stylised (SSR)", value = "2" },
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>

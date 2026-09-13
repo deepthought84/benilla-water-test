@@ -119,7 +119,10 @@ fn maintain_depth_prepass(
     style: Res<WaterStyle>,
     cameras: Query<(Entity, Has<DepthPrepass>), With<WorldCamera>>,
 ) {
-    let want = *style == WaterStyle::Stylised && depth_enabled();
+    // The SSR lane needs this more than the full stylised lane does: the march reads the prepass
+    // and there is no planar capture behind it to fall back on, so a prepass-less SSR lane would
+    // draw water with no reflection at all beyond the sky mix.
+    let want = style.is_stylised() && depth_enabled();
     for (entity, has) in &cameras {
         if want == has {
             continue;

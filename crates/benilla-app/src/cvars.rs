@@ -3035,11 +3035,24 @@ mod tests {
         assert_eq!(knobs.minimap.inside, MINIMAP_ZOOM_LEVELS - 1);
         assert!(apply_to_knobs("minimapZoom", "-2", &mut knobs));
         assert_eq!(knobs.minimap.outdoor, 0);
-        // waterStyle: "0" is Reference, anything else is Stylised (from_cvar).
+        // waterStyle: "0" is Reference, "2" and up the SSR-only lane, anything else Stylised.
         assert!(apply_to_knobs("waterStyle", "1", &mut knobs));
         assert_eq!(*knobs.water_style, WaterStyle::Stylised);
+        assert!(apply_to_knobs("waterStyle", "2", &mut knobs));
+        assert_eq!(*knobs.water_style, WaterStyle::StylisedSsr);
         assert!(apply_to_knobs("waterstyle", "0", &mut knobs));
         assert_eq!(*knobs.water_style, WaterStyle::Reference);
+        // The dropdown's three rows have to survive the round trip they are read back through, or
+        // the page reopens on a different entry than the one the player picked.
+        for (value, want) in [
+            ("0", WaterStyle::Reference),
+            ("1", WaterStyle::Stylised),
+            ("2", WaterStyle::StylisedSsr),
+        ] {
+            assert!(apply_to_knobs("waterStyle", value, &mut knobs));
+            assert_eq!(*knobs.water_style, want);
+            assert_eq!(knobs.water_style.cvar(), value);
+        }
         // A bad value is consumed (known key) and the resource keeps its truth.
         assert!(apply_to_knobs("uiScale", "banana", &mut knobs));
         assert_eq!(knobs.scale.0, 0.9);

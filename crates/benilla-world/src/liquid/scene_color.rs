@@ -101,7 +101,9 @@ fn drive_scene_color(
     mut images: ResMut<Assets<Image>>,
     cameras: Query<&Camera, With<crate::view::WorldCamera>>,
 ) {
-    snap.armed = *style == WaterStyle::Stylised;
+    // Both stylised lanes read the snapshot: it is what the march samples the reflected colour
+    // from, and the SSR lane is nothing BUT the march.
+    snap.armed = style.is_stylised();
     let Ok(camera) = cameras.single() else {
         return;
     };

@@ -93,7 +93,8 @@
     mesh_functions,
     forward_io::Vertex,
     view_transformations::{
-        position_world_to_clip, position_world_to_ndc, ndc_to_uv, frag_coord_to_uv,
+        position_world_to_clip, position_world_to_ndc, direction_world_to_clip, ndc_to_uv,
+        frag_coord_to_uv,
         depth_ndc_to_view_z,
     },
     mesh_view_bindings::{view, globals},
@@ -488,6 +489,22 @@ fn surface_tilt(world_pos: vec3<f32>) -> f32 {
     return acos(clamp(abs(g.y / len), 0.0, 1.0));
 }
 
+/// The **geometric** normal of the water facet under this fragment — the heightfield's own
+/// orientation, with none of the ripple in it.
+///
+/// Same derivative cross as [`surface_tilt`] and the same uniform-control-flow rule: call it before
+/// any per-fragment branch. The winding IS forced here, because this one is a direction rather than
+/// a magnitude and a liquid surface is always seen from above.
+fn surface_normal(world_pos: vec3<f32>) -> vec3<f32> {
+    let g = cross(dpdx(world_pos), dpdy(world_pos));
+    let len = length(g);
+    if (len < 1e-12) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    let n = g / len;
+    return select(-n, n, n.y >= 0.0);
+}
+
 /// The mirror capture, read through a **4-tap box blur** — the reference pipeline's own shape.
 ///
 /// Cataclysm's Ultra water does not sample its mirrored capture directly. It renders the mirror
@@ -720,6 +737,14 @@ const SSR_REFINE: i32 = 5;
 // at all. The red speckle inside that stream's confidence is therefore NOT undersampling; it is
 // the thickness rejection and the genuine gaps between its rocks, and more steps only cost more.
 // Anyone reaching for these numbers to clean that speckle should look at [`SSR_THICKNESS`] instead.
+//
+// That note was right about the cause and wrong about the remedy, and the difference is worth
+// keeping. The thickness rejection was firing because it was evaluated at the COARSE step rather
+// than at the crossing — see the ordering argument in [`ssr_trace`] — so it was measuring how far
+// the march had overshot rather than how thick the geometry was. Which is also why a finer march
+// appeared to buy nothing while looking like it should: halving the step halves the overshoot and
+// the constant it is compared against did not move, so the rejection simply re-drew itself at a
+// finer pitch. Reordering the test is the fix; the step counts here were never the problem.
 
 /// How far behind a surface a crossing may be and still count as a hit, in yards.
 ///
@@ -729,6 +754,34 @@ const SSR_REFINE: i32 = 5;
 /// does not overhang. Six yards is generous enough for real geometry and mean enough to reject a
 /// ray that has left the visible world.
 const SSR_THICKNESS: f32 = 6.0;
+
+/// How far the ripple displaces the march's READ, in UV — the other half of casting rays flat.
+///
+/// **This is the whole reason the march finds anything.** Tracing `reflect(-V, N)` on the rippled
+/// normal gives neighbouring pixels meaningfully different ray directions, so they land on
+/// unrelated geometry or leave the frame independently, and the hit rate collapses into a
+/// pixel-scale confetti: measured on `water-noon`, 11.8% of water pixels got an answer at all, and
+/// those that did were one or two pixels tall. Blended at Fresnel weight that is not a faint
+/// reflection, it is no reflection — which is exactly what it looked like.
+///
+/// So the ray is cast on the GEOMETRIC facet normal ([`surface_normal`]) and the ripple is applied
+/// where the traced image is *read*, as a displacement of the hit's UV. This is not a compromise:
+/// it is the same decomposition the planar capture has always used (`n.xz * params.z` on its own
+/// sample), and it is the conclusion the ray-traced work reached independently and recorded in
+/// `reflect.rs` as "rays cast flat, the ripple applied where the traced image is read". The macro
+/// slope stays in the ray, so a sloped stream is still traced correctly and the march keeps the
+/// one property that made it worth having; only the sub-wave crinkle moves to the read.
+///
+/// **It is also 28% faster**, which is the tell that the incoherence was real and not a theory:
+/// three interleaved reps on `water-noon` at 1600x900 put the march at 1.66/0.97/0.94 ms with the
+/// ray rippled against 0.70/0.70/0.66 with it flat. Note the spread as much as the median — thirty
+/// dependent depth reads per pixel are a texture-cache problem, and neighbouring pixels that walk
+/// the buffer together both hit more often and cost less each time. Prettier and cheaper at once is
+/// rare enough to be worth naming as the reason.
+///
+/// Matches `REFLECT_DISTORT` on the CPU side, because the two tiers should wobble by the same
+/// amount or the water changes texture depending on which one answered.
+const SSR_READ_DISTORT: f32 = 0.055;
 
 /// How far from the edge of the frame the march's confidence starts falling, in UV.
 ///
@@ -846,77 +899,185 @@ fn foam_noise(p: vec2<f32>, t: f32, ddx: vec2<f32>, ddy: vec2<f32>) -> FoamNoise
 }
 
 #ifdef DEPTH_PREPASS
-/// The scene depth under a world point, and the point's own depth, both in view space.
+/// One step of the march: what the prepass recorded where the ray currently is, and where the ray
+/// itself is, both in **raw reverse-Z NDC depth rather than view-space yards**.
 ///
-/// View Z runs negative into the screen, so "the ray is behind the surface" reads as `ray < scene`.
-/// A pixel the prepass never wrote clears to reverse-Z zero, which is the far plane — returned as
-/// a sentinel rather than taken at face value, exactly as the thickness lane does with it.
-fn ssr_probe(p: vec3<f32>, sample_index: u32) -> vec3<f32> {
-    let ndc = position_world_to_ndc(p);
+/// The space is the optimisation. The only question asked 28 times a march is "is the ray behind
+/// the surface yet", and `depth_ndc_to_view_z` is monotonic, so that comparison gives the same
+/// answer on the raw depths as on the converted ones — which means the conversion belongs at the
+/// one step that crosses, not at every step that does not. Only the thickness test needs yards,
+/// and only a crossing reaches it.
+struct SsrStep {
+    /// The prepass depth at this screen position, or a negative sentinel meaning "do not use this
+    /// step": off the frame, behind the eye, or a pixel nothing was drawn into. A pixel the prepass
+    /// never wrote clears to reverse-Z zero, which is the far plane — treated as unknown rather
+    /// than taken at face value, exactly as the thickness lane does with it.
+    scene: f32,
+    /// The ray's own depth at this step, in the same space.
+    ray: f32,
+    /// Where on screen the ray is. Carried so that a hit can read the scene colour and measure its
+    /// own distance to the frame's edge without projecting the point a second time.
+    uv: vec2<f32>,
+}
+
+/// Read the depth buffer where a **clip-space** point lands — see [`ssr_trace`] for why the
+/// caller already has it.
+fn ssr_depth_at(clip: vec4<f32>) -> SsrStep {
+    var out: SsrStep;
+    out.scene = -1.0;
+    out.ray = 0.0;
+    out.uv = vec2<f32>(0.0);
+    let ndc = clip.xyz / clip.w;
+    // Reverse-Z puts the far plane at zero and folds anything behind the eye to a negative `z`
+    // through the divide, so this one test catches both, as it did before the hoist.
     if (ndc.z <= 0.0 || any(abs(ndc.xy) > vec2<f32>(1.0))) {
-        return vec3<f32>(0.0, 0.0, -1.0); // off screen or behind the eye
+        return out;
     }
     let uv = ndc_to_uv(ndc.xy);
     let px = uv * view.viewport.zw + view.viewport.xy;
-    let d = prepass_depth(vec4<f32>(px, 0.0, 0.0), sample_index);
+    // Sample 0, never `@builtin(sample_index)` — see the fragment entry point for why that builtin
+    // is not in this shader's signature any more.
+    let d = prepass_depth(vec4<f32>(px, 0.0, 0.0), 0u);
     if (d <= 0.0) {
-        return vec3<f32>(0.0, 0.0, -1.0); // nothing was drawn here — unknown, not infinitely far
+        return out;
     }
-    // x = the scene's view z, y = the ray's, z = the smaller UV distance to the frame's edge.
-    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    return vec3<f32>(depth_ndc_to_view_z(d), depth_ndc_to_view_z(ndc.z), edge);
+    out.scene = d;
+    out.ray = ndc.z;
+    out.uv = uv;
+    return out;
 }
 
 /// March the reflected ray through the prepass depth and read the scene snapshot where it lands.
 ///
 /// **This is the half of the water's reflection that a plane cannot do.** The direction traced is
-/// `reflect(-V, N)` on the fragment's OWN normal — ripple, wave sim and macro surface slope already
-/// summed — so a sloped stream and a rippled lake are the same code path, and neither needs a
-/// mirror to be built for it. What it cannot do is see off the screen, which is why it returns a
+/// `reflect(-V, N)` on the fragment's GEOMETRIC normal ([`surface_normal`]) — the heightfield's own
+/// facet, so a sloped stream is traced at its real orientation and needs no mirror built for it.
+///
+/// The fine ripple is deliberately NOT in that direction; it arrives as `read_offset`, displacing
+/// the hit's UV instead. [`SSR_READ_DISTORT`] carries the measurement and the reasoning, and it is
+/// the difference between this mode showing reflections and showing nothing at all. What it cannot do is see off the screen, which is why it returns a
 /// confidence rather than just a colour: where the ray leaves the frame the planar capture and the
-/// sky mix behind it take over.
+/// sky mix behind it take over. Under [`WaterStyle::StylisedSsr`] there is no capture behind it and
+/// the sky mix alone catches what it misses, which is the trade that lane is offered for.
 ///
 /// The water itself is not in the prepass (Bevy excludes alpha-blended materials, and
 /// `liquid::depth`'s doc keeps it that way deliberately), so there is no self-intersection to bias
 /// against — the first step off the surface is already reading opaque geometry only.
-fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, sample_index: u32) -> SsrHit {
+///
+/// **The whole march costs two matrix multiplies, not thirty-three.** Clip space is a linear
+/// function of world space, so the clip position of `origin + dir * t` is exactly
+/// `clip_o + clip_d * t` — the projection of the origin plus `t` times the projection of the
+/// direction as a vector. That is an identity, not an approximation: the image is unchanged and a
+/// `mat4 * vec4` per step becomes a `vec4` multiply-add. It is the reason the loop below takes a
+/// clip position rather than a world one.
+///
+/// **Directionally worth about 17%, and honestly below this rig's noise floor.** Six interleaved
+/// before/after repetitions on `water-noon` at 1600x900, MSAA off (RX 6500 XT on RADV), taking the
+/// march as the `main_transparent_pass_3d` span with it minus without (`WOW_WATER_STYLE=2` against
+/// `WOW_WATER_STYLE=1 WOW_NO_REFLECT=1`): 0.86 1.11 1.03 1.17 0.89 0.85 ms before, median 0.96,
+/// against 0.62 0.82 1.09 0.95 0.76 0.78 after, median 0.80. Mann-Whitney U is 29 of 36, p about
+/// 0.09 — every summary statistic favours the change and none of them proves it.
+///
+/// Keep it, and keep the number modest. Both changes are *identities*, so the image is unchanged
+/// and the only question was ever whether they cost less, never whether they cost correctness.
+/// What the exercise really established is that this rig swings +-20% run to run at this setting,
+/// which is what to know before trusting any single pair of runs here: interleave the arms inside
+/// one batch, because two batches taken twenty minutes apart differ by more than any change in
+/// this file does.
+///
+/// **What it does NOT fix is the march's shape.** 0.98 ms still buys less than the planar capture
+/// buys for 0.36 ms on the same shot, because the march runs at full screen resolution on every
+/// water pixel while the capture runs once, at half resolution, for the whole frame. Thirty-three
+/// dependent depth reads per pixel is a resolution problem rather than a tuning one: halving
+/// [`SSR_STEPS`] would land it at rough parity with the mirror while giving up the near field, and
+/// the fix that actually changes the ranking is tracing into a downscaled buffer in a pass of its
+/// own — which is what `reflectionMode` 0 is in the Cataclysm spec, and why that mode is the
+/// CHEAPEST of the four there and the most expensive tier here.
+fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, read_offset: vec2<f32>) -> SsrHit {
     var out: SsrHit;
     out.rgb = vec3<f32>(0.0);
     out.conf = 0.0;
+
+    // Bevy names both halves of this: a point carries a 1 in `w` and a direction a 0, which is
+    // exactly the difference that makes the sum below the projection of the offset point.
+    let clip_o = position_world_to_clip(origin);
+    let clip_d = direction_world_to_clip(dir);
 
     var step = SSR_FIRST_STEP;
     var t = SSR_FIRST_STEP;
     var prev_t = 0.0;
     for (var i = 0; i < SSR_STEPS; i = i + 1) {
-        let probe = ssr_probe(origin + dir * t, sample_index);
-        if (probe.z < 0.0) {
+        let here = ssr_depth_at(clip_o + clip_d * t);
+        if (here.scene < 0.0) {
             return out; // ran off the frame or into a pixel with no depth: no hit, no confidence
         }
-        // Crossed behind the surface, and not so far behind that the ray has left the world the
-        // depth buffer can describe — see [`SSR_THICKNESS`].
-        if (probe.y < probe.x && probe.x - probe.y < SSR_THICKNESS) {
-            // Bisect the interval the march just stepped over.
+        // Crossed behind the surface. Reverse-Z, so a smaller depth is further away, and this is
+        // the same test `ray_view_z < scene_view_z` was — see [`SsrStep`] on why it needs no
+        // conversion to be.
+        if (here.ray < here.scene) {
+            // **Bisect FIRST, then judge the thickness** — the order is the whole correctness of
+            // this test and getting it backwards is a visible bug, not a subtlety.
+            //
+            // [`SSR_THICKNESS`] asks "did the ray pass behind a thin object rather than hit it",
+            // and that question is only meaningful AT the crossing. Asked at the coarse step it
+            // measures the overshoot instead: steps grow by [`SSR_GROWTH`] every iteration, so far
+            // along a ray one step spans many yards, and a ray crossing a large surface lands tens
+            // of yards behind it in a single jump. Judged there, a solid hillside reads as
+            // something the ray flew past, and the reflection breaks into alternating accept and
+            // reject bands — diagonal STRIPES across the reflected terrain, widening with distance
+            // because the steps do. Distant slender geometry (a palm on a headland) is rejected
+            // outright by the same arithmetic and simply never reflects.
+            //
+            // **Measured on `water-noon`: the hit rate goes 13.9% to 31.6% of water pixels**, and
+            // the reflection's contribution against a no-reflection baseline goes from 0.52 to
+            // 0.87 mean absolute difference (the planar mirror, for scale, is 1.93). That shot is
+            // the MILD case for this bug — a narrow river with close trees, where crossings happen
+            // early while the steps are still short. The harsh case is a long grazing view over
+            // open water at a big distant landform, which is where it was reported from.
+            //
+            // It is not quite free: three interleaved reps put the march at 0.58/0.52/0.58 ms
+            // judging at the coarse step against 0.68/0.64/0.66 judging at the crossing, about
+            // +14%, because the bisection now runs on every crossing including the ones that go on
+            // to be rejected. Doubling the reflection for a fourteenth of the march is not a close
+            // call.
             var lo = prev_t;
             var hi = t;
+            var hit = here;
             for (var r = 0; r < SSR_REFINE; r = r + 1) {
                 let mid = 0.5 * (lo + hi);
-                let m = ssr_probe(origin + dir * mid, sample_index);
-                if (m.z < 0.0) {
+                let refined = ssr_depth_at(clip_o + clip_d * mid);
+                if (refined.scene < 0.0) {
                     break;
                 }
-                if (m.y < m.x) {
+                if (refined.ray < refined.scene) {
                     hi = mid;
+                    hit = refined;
                 } else {
                     lo = mid;
                 }
             }
-            let hit = origin + dir * hi;
-            let ndc = position_world_to_ndc(hit);
-            let uv = ndc_to_uv(ndc.xy);
-            out.rgb = textureSampleLevel(scene_tex, scene_samp, uv, 0.0).rgb;
-            let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-            out.conf = smoothstep(0.0, SSR_EDGE_FADE, edge);
-            return out;
+            // Now the gap is the one at the crossing, which is what the constant was written for.
+            let depth_gap = depth_ndc_to_view_z(hit.scene) - depth_ndc_to_view_z(hit.ray);
+            if (depth_gap < SSR_THICKNESS) {
+                // The ripple lands HERE and not on the ray — see [`SSR_READ_DISTORT`]. Clamped
+                // inside the frame because the snapshot has nothing outside it, and the confidence
+                // is measured on the displaced UV so a wobble that walks off the edge fades out
+                // with everything else rather than clamping to a smeared border pixel.
+                let read_uv = clamp(
+                    hit.uv + read_offset,
+                    vec2<f32>(0.002),
+                    vec2<f32>(0.998),
+                );
+                out.rgb = textureSampleLevel(scene_tex, scene_samp, read_uv, 0.0).rgb;
+                let edge = min(
+                    min(read_uv.x, 1.0 - read_uv.x),
+                    min(read_uv.y, 1.0 - read_uv.y),
+                );
+                out.conf = smoothstep(0.0, SSR_EDGE_FADE, edge);
+                return out;
+            }
+            // Genuinely passed behind something thin: keep marching rather than give up, which is
+            // what lets the ray find the wall behind a railing.
         }
         prev_t = t;
         step = step * SSR_GROWTH;
@@ -929,8 +1090,9 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, sample_index: u32) -> SsrHit {
 fn stylised_water(
     world_pos: vec3<f32>,
     frag_coord: vec2<f32>,
-    /// Which MSAA sample this fragment is — the prepass depth is multisampled and the march has to
-    /// read the same one the thickness lane does.
+    /// Which prepass sample the thickness lane reads. Always 0 now — see the fragment entry point
+    /// for why this shader no longer takes `@builtin(sample_index)` — but kept as a parameter
+    /// rather than inlined so the one place that decides it stays the one place that decides it.
     sample_index: u32,
     // Yards of water between this fragment and whatever opaque surface is behind it, or a negative
     // number where the scene depth is unavailable (the reference lane, no prepass) — in which case
@@ -948,6 +1110,9 @@ fn stylised_water(
     let xz = world_pos.xz;
     // In uniform control flow, before anything branches — see [`surface_tilt`].
     let tilt = surface_tilt(world_pos);
+    // Beside the tilt, and for the same reason: both read screen-space derivatives, which are only
+    // defined before the per-fragment branches below. This is the direction the march is cast on.
+    let flat_n = surface_normal(world_pos);
     // One tile every 12 yd at scale 1; the three layers run at 3.4x, 1x and 0.3x of it.
     let inv_tile = 1.0 / 12.0;
     // The fourth layer is the smallest and does the most: at ~1.4 yd it is the only one whose
@@ -1171,7 +1336,11 @@ fn stylised_water(
     ssr.conf = 0.0;
 #ifdef DEPTH_PREPASS
     if (water_reflect.flags.z > 0.0 && view.world_position.y > world_pos.y) {
-        ssr = ssr_trace(world_pos, reflect(-to_view, n), sample_index);
+        ssr = ssr_trace(
+            world_pos,
+            reflect(-to_view, flat_n),
+            n.xz * SSR_READ_DISTORT,
+        );
     }
 #endif
 
@@ -1586,15 +1755,37 @@ fn swatch_at(shallow: vec4<f32>, deep: vec4<f32>, v: f32, ocean: bool) -> vec4<f
 @fragment
 fn fragment(
     in: LiquidVsOut,
-#ifdef MULTISAMPLED
-    // `prepass_depth` reads a multisampled texture and needs to know which sample this is. The
-    // world camera runs at four, so this is the live path.
-    @builtin(sample_index) sample_index: u32,
-#endif
 ) -> @location(0) vec4<f32> {
-#ifndef MULTISAMPLED
+    // **This shader reads prepass sample 0 and takes no `@builtin(sample_index)`, deliberately.**
+    //
+    // It used to take one, because `prepass_depth` wants a sample and the world camera runs at four
+    // (`view::MsaaSetting`). That builtin is `SampleId` in SPIR-V, and asking for it turns on
+    // sample-rate shading: the whole fragment body — surface normal, foam, glitter, Fresnel, and
+    // the screen-space march with its thirty-odd dependent depth loads — is then invoked once per
+    // sample rather than once per pixel. Four times the work, for a shading difference that MSAA
+    // exists precisely not to need. Loading a *fixed* sample from a multisampled texture requires
+    // no such capability, so naming sample 0 outright costs nothing and drops the multiplier.
+    //
+    // What is given up is per-sample scene depth at geometry silhouettes, which is a fraction of a
+    // yard of thickness on a one-pixel seam. What is kept is every bit of the edge antialiasing
+    // that matters here: MSAA coverage still antialiases the water's own outline, because coverage
+    // is resolved per sample whatever rate the shading runs at.
+    //
+    // **Worth 45% of the water shader at `WOW_MSAA=4`, and nothing at the default** — which is the
+    // part to keep in mind before reaching for this again. Interleaved before/after on `water-noon`
+    // at 1600x900 (RX 6500 XT, RADV), `main_transparent_pass_3d` with the march off: 0.85 and 0.90
+    // ms before against 0.43 and 0.54 after. The whole GPU frame on the SSR lane goes 5.38/5.34 to
+    // 3.81/3.78 ms, a 29% cut repeating to within 0.03 ms — by far the largest and most
+    // reproducible win in this file, and available only to players who have turned MSAA on.
+    //
+    // Nothing at the default because `gxMultisample` registers at "1" (the reference client's own
+    // default), and bevy only defines `MULTISAMPLED` above one sample (`bevy_pbr`'s `mesh.rs`,
+    // `key.msaa_samples() > 1`) — so the old shader already took the `#ifndef` branch for every
+    // player who had not turned MSAA on. The same measurement at MSAA off moves 0.37/0.46 ms to
+    // 0.47/0.42, i.e. not at all. A comment here used to assert that "the world camera runs at
+    // four"; it was wrong, and believing it is how this was mistaken for the biggest win available
+    // rather than the conditional one it is.
     let sample_index = 0u;
-#endif
     // HARD FAR-CLIP WALL (same as terrain/models, see terrain.wgsl): discard water beyond the
     // projection far plane so lakes/rivers don't render past the wall. `fog_params.w` = farclip
     // (0 ⇒ disabled).
