@@ -651,7 +651,13 @@ pub struct LiquidExt {
     ///   input on this material that moves after build: the toggle rewrites it on every liquid
     ///   material rather than rebuilding them. Ignored on the fullbright kinds, which have no water
     ///   to restyle.
-    /// - `z`/`w` reserved.
+    /// - `z` = **magma, as opposed to slime** (>0.5). `kind.x` says only "fullbright", which both
+    ///   share, and the two want opposite treatments the moment the stylised look touches them: one
+    ///   is molten rock that should glow and crust over, the other is cold sludge that should do
+    ///   neither. The reference never needed to tell them apart — it draws the kind's own animated
+    ///   sheet either way — so this lane exists only for the stylised lane and is ignored by the
+    ///   faithful one.
+    /// - `w` reserved.
     #[uniform(102)]
     pub path: Vec4,
     /// `x` = reserved (frame 0), `y` = frame count, `z` = scroll flag, `w` = clock enable —

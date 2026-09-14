@@ -1307,7 +1307,18 @@ fn drive_reflection(
     // 1.7 % and costs the judder, so there is no knob here — a choice that cheap is not a choice.
     mirror_cam.is_active = true;
     *held_plane = Some(plane);
-    data.0[..4].copy_from_slice(&[plane, 1.0, REFLECT_DISTORT, PLANE_TOLERANCE]);
+    // `$WOW_MIRROR_SHOW` rides the strength lane's spare headroom, exactly as `$WOW_SCENE_SHOW`
+    // rides the moon's and `$WOW_WAKE_SHOW` the sim's: strength is a 0..1 fraction, so anything past
+    // 1.5 is unambiguous. It paints the capture the water is about to sample — its colour where the
+    // mirror drew something, red where its alpha says it drew nothing — which is the only way to
+    // tell "the capture has no sky in it" apart from "the capture has sky and the composite is
+    // dropping it". Those need opposite fixes and the water itself cannot distinguish them.
+    let strength = if std::env::var_os("WOW_MIRROR_SHOW").is_some() {
+        2.0
+    } else {
+        1.0
+    };
+    data.0[..4].copy_from_slice(&[plane, strength, REFLECT_DISTORT, PLANE_TOLERANCE]);
 }
 
 /// Re-point every liquid material at the reflection image after a rebuild. Change-gated on the

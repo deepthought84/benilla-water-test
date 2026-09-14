@@ -755,6 +755,53 @@ const SSR_REFINE: i32 = 5;
 /// ray that has left the visible world.
 const SSR_THICKNESS: f32 = 6.0;
 
+/// The stylised lava look, in three numbers: how dark the crust goes, how hot the molten goes, and
+/// how large the plates are in yards.
+///
+/// **Lava is the one liquid with no reflection to give it structure**, and on the faithful lane it
+/// needs none — the reference draws magma as its animated sheet, fogged, and that sheet is the whole
+/// surface. Ported unchanged onto the stylised lane it is the only liquid there that reads as a
+/// scrolling texture rather than as a material, because every other kind got a normal, a Fresnel mix
+/// and a reflection and magma got nothing.
+///
+/// What it wants instead of a reflection is **temperature**. Real lava is a dark basalt skin broken
+/// into slow plates with molten seams between them, and the plates are what make it read as a crust
+/// with something underneath rather than as a moving picture. So: a slow two-octave field off the
+/// ripple map picks the plates, the sheet's own luminance says which parts are already hot, and the
+/// surface is graded between a darkened crust and a molten seam that is pushed ABOVE 1.0 so the
+/// glow pass blooms it. Nothing here invents colour — both ends are the zone's own animated texture
+/// scaled — which is the same rule the water's tiers follow: change the treatment, never the
+/// palette.
+///
+/// [`LAVA_GLOW`] above 1 is the point and not an accident. The pipeline is HDR with `ffx_glow`
+/// downstream, so a seam at 2.6 blooms and a crust at 0.45 does not, and the difference between
+/// them is most of what makes the plates read as solid.
+const LAVA_CRUST: f32 = 0.45;
+const LAVA_GLOW: f32 = 2.6;
+/// Plate size in yards, and the finer break laid across it.
+const LAVA_PLATE_YD: f32 = 19.0;
+const LAVA_BREAK_YD: f32 = 5.5;
+
+/// How far the march's READ is blurred, in **main-view texels** — the march's answer to the
+/// downscale-and-blur the planar capture already gets.
+///
+/// **The march's hits are hard-edged, and that is information rather than texture.** Where the
+/// planar capture is half resolution and then 4-tap blurred ([`sample_mirror`]), the snapshot is
+/// full resolution and unfiltered, so the march's own discontinuities — the boundary between a
+/// pixel that found something and one that did not, the quantisation of the refined crossing, the
+/// edge-fade ramp — arrive at full contrast. Displaced per-pixel by the ripple, they read as crisp
+/// striations across the surface, which is easy to mistake for wave detail and is nothing of the
+/// kind: it is the shape of what the march does not know.
+///
+/// Two taps' worth of radius covers the same ~6 main-view texels the planar tier's kernel does (one
+/// capture texel at [`REFLECT_DOWNSCALE`](benilla_world::liquid) 2, tented over 3x3), which is the
+/// point — the two tiers should not be distinguishable by their grain. This is the cheap half of
+/// "trace into a downscaled buffer and blur it": the *colour* is filtered here, for four fetches on
+/// a path that was already about to make one. The march's hit-finding is untouched and stays exact,
+/// because it walks the depth prepass at full resolution and never reads the snapshot to find a
+/// crossing — only to colour one.
+const SSR_READ_BLUR: f32 = 2.0;
+
 /// How far the ripple displaces the march's READ, in UV — the other half of casting rays flat.
 ///
 /// **This is the whole reason the march finds anything.** Tracing `reflect(-V, N)` on the rippled
@@ -898,6 +945,45 @@ fn foam_noise(p: vec2<f32>, t: f32, ddx: vec2<f32>, ddy: vec2<f32>) -> FoamNoise
     return out;
 }
 
+// ---- lava ------------------------------------------------------------------------------------
+//
+// **Outside the `DEPTH_PREPASS` guard below, and that placement is load-bearing.** The march and
+// everything it needs only exist when the depth prepass does, and on the faithful lane it does not
+// (`liquid::depth` arms the prepass for the stylised look only). Magma is drawn on BOTH lanes, so a
+// lava helper defined inside that guard is missing exactly where the reference needs the shader to
+// compile — and a liquid shader that fails to compile does not fall back, it drops the draw: every
+// magma surface in the zone stops being drawn at all. That is what happened. It was invisible from
+// the stylised lane, which has the prepass and compiled fine, and the only sign was one
+// `failed to process shader` line in the log under a pile of unrelated asset warnings.
+/// One slow scalar octave of the ripple map, read in world yards.
+///
+/// `textureSampleLevel` rather than `textureSample`: this is called under the kind branch, and an
+/// implicit-LOD fetch there needs a uniformity proof naga will not give it. Level 0 is the honest
+/// level anyway — the features are tens of yards across, so there is nothing for a mip to prefilter.
+fn lava_field(world_xz: vec2<f32>, wavelength_yd: f32, drift: vec2<f32>, t: f32) -> f32 {
+    let uv = world_xz / wavelength_yd + drift * t;
+    return textureSampleLevel(ripples, ripples_samp, uv, 0.0).b;
+}
+
+/// Grade the kind's animated sheet into crust and molten seam — see [`LAVA_CRUST`].
+///
+/// Takes the sheet's colour as it comes and only scales it, so a zone that authored dull red magma
+/// keeps dull red magma and one that authored orange keeps orange. The drifts are deliberately an
+/// order below the water's: lava moves, but it moves like something with a skin on it.
+fn stylised_lava(sheet: vec3<f32>, world_xz: vec2<f32>, t: f32) -> vec3<f32> {
+    let plates = lava_field(world_xz, LAVA_PLATE_YD, vec2<f32>(0.0041, 0.0024), t);
+    let breaks = lava_field(world_xz, LAVA_BREAK_YD, vec2<f32>(-0.0063, 0.0038), t);
+    // Thin crust = hot seam. The two octaves are weighted so the plates decide and the breaks only
+    // roughen their edges; an even mix reads as noise rather than as plates.
+    let crust = saturate(plates * 0.74 + breaks * 0.26);
+    let seam = 1.0 - smoothstep(0.34, 0.62, crust);
+    // The sheet is already painted with hot and cool regions; take them rather than fight them, so
+    // the seams land where the artist put the bright parts and the plates where they did not.
+    let lum = dot(sheet, vec3<f32>(0.299, 0.587, 0.114));
+    let molten = saturate(max(seam, smoothstep(0.35, 0.85, lum)));
+    return sheet * mix(LAVA_CRUST, LAVA_GLOW, molten);
+}
+
 #ifdef DEPTH_PREPASS
 /// One step of the march: what the prepass recorded where the ray currently is, and where the ray
 /// itself is, both in **raw reverse-Z NDC depth rather than view-space yards**.
@@ -908,10 +994,13 @@ fn foam_noise(p: vec2<f32>, t: f32, ddx: vec2<f32>, ddy: vec2<f32>) -> FoamNoise
 /// one step that crosses, not at every step that does not. Only the thickness test needs yards,
 /// and only a crossing reaches it.
 struct SsrStep {
-    /// The prepass depth at this screen position, or a negative sentinel meaning "do not use this
-    /// step": off the frame, behind the eye, or a pixel nothing was drawn into. A pixel the prepass
-    /// never wrote clears to reverse-Z zero, which is the far plane — treated as unknown rather
-    /// than taken at face value, exactly as the thickness lane does with it.
+    /// What this step found — one of [`SSR_OPAQUE`], [`SSR_SKY`] or [`SSR_LOST`].
+    ///
+    /// **Telling sky apart from lost is the point.** Both used to be one sentinel, and collapsing
+    /// them threw away the answer: a pixel the prepass never wrote is not "unknown", it is a pixel
+    /// where the only thing in the world along that ray is the sky.
+    state: i32,
+    /// The prepass depth at this screen position. Meaningless unless `state` is [`SSR_OPAQUE`].
     scene: f32,
     /// The ray's own depth at this step, in the same space.
     ray: f32,
@@ -920,11 +1009,23 @@ struct SsrStep {
     uv: vec2<f32>,
 }
 
+/// What one step of the march landed on.
+///
+/// `SSR_LOST` means the step carries no information — off the frame, or behind the eye — and the
+/// march has to give up, because the screen cannot say what is out there. `SSR_SKY` means the step
+/// is *on* the frame at a pixel the depth prepass never wrote, which is a very different thing: the
+/// prepass draws opaque geometry, the sky dome is not in it, so "no depth here" means "the sky is
+/// what is here". See [`ssr_trace`] for why that is a hit and not a miss.
+const SSR_OPAQUE: i32 = 0;
+const SSR_SKY: i32 = 1;
+const SSR_LOST: i32 = 2;
+
 /// Read the depth buffer where a **clip-space** point lands — see [`ssr_trace`] for why the
 /// caller already has it.
 fn ssr_depth_at(clip: vec4<f32>) -> SsrStep {
     var out: SsrStep;
-    out.scene = -1.0;
+    out.state = SSR_LOST;
+    out.scene = 0.0;
     out.ray = 0.0;
     out.uv = vec2<f32>(0.0);
     let ndc = clip.xyz / clip.w;
@@ -934,16 +1035,50 @@ fn ssr_depth_at(clip: vec4<f32>) -> SsrStep {
         return out;
     }
     let uv = ndc_to_uv(ndc.xy);
+    out.uv = uv;
+    out.ray = ndc.z;
     let px = uv * view.viewport.zw + view.viewport.xy;
     // Sample 0, never `@builtin(sample_index)` — see the fragment entry point for why that builtin
     // is not in this shader's signature any more.
     let d = prepass_depth(vec4<f32>(px, 0.0, 0.0), 0u);
     if (d <= 0.0) {
+        // On the frame, and the prepass wrote nothing: sky. The UV stays valid — it is where the
+        // sky the ray is looking at was drawn.
+        out.state = SSR_SKY;
         return out;
     }
+    out.state = SSR_OPAQUE;
     out.scene = d;
-    out.ray = ndc.z;
-    out.uv = uv;
+    return out;
+}
+
+
+/// Read the scene snapshot where the ray landed, and score how much to believe it.
+///
+/// The ripple lands HERE and not on the ray — see [`SSR_READ_DISTORT`]. Clamped inside the frame
+/// because the snapshot has nothing outside it, and the confidence is measured on the DISPLACED UV
+/// so a wobble that walks off the edge fades out with everything else rather than clamping to a
+/// smeared border pixel.
+///
+/// Shared by both of the march's terminations — opaque geometry and sky — because the two differ
+/// only in how the UV was arrived at, never in what is done with it.
+fn ssr_read(uv: vec2<f32>, read_offset: vec2<f32>) -> SsrHit {
+    var out: SsrHit;
+    let read_uv = clamp(uv + read_offset, vec2<f32>(0.002), vec2<f32>(0.998));
+    // Four bilinear taps on the diagonals — [`sample_mirror`]'s kernel, and deliberately the same
+    // one. No premultiplied divide here: the snapshot is a copy of an opaque frame, so every tap
+    // has something in it and there is no coverage to weight by. See [`SSR_READ_BLUR`].
+    let o = SSR_READ_BLUR / vec2<f32>(textureDimensions(scene_tex));
+    var acc = textureSampleLevel(scene_tex, scene_samp, read_uv + vec2<f32>(-o.x, -o.y), 0.0).rgb;
+    acc += textureSampleLevel(scene_tex, scene_samp, read_uv + vec2<f32>(o.x, -o.y), 0.0).rgb;
+    acc += textureSampleLevel(scene_tex, scene_samp, read_uv + vec2<f32>(-o.x, o.y), 0.0).rgb;
+    acc += textureSampleLevel(scene_tex, scene_samp, read_uv + vec2<f32>(o.x, o.y), 0.0).rgb;
+    out.rgb = acc * 0.25;
+    let edge = min(
+        min(read_uv.x, 1.0 - read_uv.x),
+        min(read_uv.y, 1.0 - read_uv.y),
+    );
+    out.conf = smoothstep(0.0, SSR_EDGE_FADE, edge);
     return out;
 }
 
@@ -1008,12 +1143,43 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, read_offset: vec2<f32>) -> SsrHi
     var prev_t = 0.0;
     for (var i = 0; i < SSR_STEPS; i = i + 1) {
         let here = ssr_depth_at(clip_o + clip_d * t);
-        if (here.scene < 0.0) {
-            return out; // ran off the frame or into a pixel with no depth: no hit, no confidence
+        if (here.state == SSR_LOST) {
+            return out; // off the frame or behind the eye: the screen cannot say, so no confidence
+        }
+        if (here.state == SSR_SKY) {
+            // **The sky is a HIT, not a miss**, and treating it as one was most of why this mode
+            // fell back to a flat colour over open water.
+            //
+            // Reflecting off a surface below the eye sends the ray up and FORWARD — at the sky
+            // above the horizon in front of you, which is on the screen. The depth prepass draws
+            // opaque geometry only and the dome is not in it, so the march read "no depth" and gave
+            // up, at exactly the pixels whose answer was sitting in the snapshot all along. And it
+            // is the real dome: the five DBC stops, the fog rim, the dawn/dusk azimuthal warp and
+            // whatever clouds were drawn over them, rather than the two-colour ramp
+            // [`sky_reflection`] falls back to.
+            //
+            // Terminal, with no further marching: a ray that has left the silhouette into sky
+            // climbs away from the world and cannot come back down onto geometry, so there is
+            // nothing further along worth looking for.
+            //
+            // **Measured on `water-noon`: the hit rate goes 31.6% to 46.4% of water pixels**, and
+            // the reflection's contribution against a no-reflection baseline 0.87 to 1.08 (the
+            // planar mirror is 1.93, so this closes a quarter of what was left of that gap). It is
+            // FREE, and not in the way one might guess: the old code already returned here, on the
+            // same step, having walked exactly as far — it simply returned nothing. The step count
+            // is unchanged and the only new work is one texture read on a path that was about to
+            // give up, so an A/B across three reps finds no difference (0.61/0.97/0.80 ms against
+            // 0.56/0.89/0.95). This was free information being discarded, not work being saved.
+            //
+            // That `water-noon` is a forest river in shade makes it the MILD case again: most of
+            // its reflected rays find canopy rather than sky. Open water under a low sun is where
+            // this matters, and it is where it was reported from.
+            return ssr_read(here.uv, read_offset);
         }
         // Crossed behind the surface. Reverse-Z, so a smaller depth is further away, and this is
         // the same test `ray_view_z < scene_view_z` was — see [`SsrStep`] on why it needs no
         // conversion to be.
+        // From here on the step is opaque geometry, which is the only state with a usable depth.
         if (here.ray < here.scene) {
             // **Bisect FIRST, then judge the thickness** — the order is the whole correctness of
             // this test and getting it backwards is a visible bug, not a subtlety.
@@ -1046,7 +1212,7 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, read_offset: vec2<f32>) -> SsrHi
             for (var r = 0; r < SSR_REFINE; r = r + 1) {
                 let mid = 0.5 * (lo + hi);
                 let refined = ssr_depth_at(clip_o + clip_d * mid);
-                if (refined.scene < 0.0) {
+                if (refined.state != SSR_OPAQUE) {
                     break;
                 }
                 if (refined.ray < refined.scene) {
@@ -1059,22 +1225,7 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>, read_offset: vec2<f32>) -> SsrHi
             // Now the gap is the one at the crossing, which is what the constant was written for.
             let depth_gap = depth_ndc_to_view_z(hit.scene) - depth_ndc_to_view_z(hit.ray);
             if (depth_gap < SSR_THICKNESS) {
-                // The ripple lands HERE and not on the ray — see [`SSR_READ_DISTORT`]. Clamped
-                // inside the frame because the snapshot has nothing outside it, and the confidence
-                // is measured on the displaced UV so a wobble that walks off the edge fades out
-                // with everything else rather than clamping to a smeared border pixel.
-                let read_uv = clamp(
-                    hit.uv + read_offset,
-                    vec2<f32>(0.002),
-                    vec2<f32>(0.998),
-                );
-                out.rgb = textureSampleLevel(scene_tex, scene_samp, read_uv, 0.0).rgb;
-                let edge = min(
-                    min(read_uv.x, 1.0 - read_uv.x),
-                    min(read_uv.y, 1.0 - read_uv.y),
-                );
-                out.conf = smoothstep(0.0, SSR_EDGE_FADE, edge);
-                return out;
+                return ssr_read(hit.uv, read_offset);
             }
             // Genuinely passed behind something thin: keep marching rather than give up, which is
             // what lets the ray find the wall behind a railing.
@@ -1390,6 +1541,13 @@ fn stylised_water(
             vec2<f32>(0.998),
         );
         let mirrored = sample_mirror(ruv, water_reflect.flags.x);
+        // `$WOW_MIRROR_SHOW` — the capture as the water sees it, red where it has no coverage.
+        if (water_reflect.params.y > 1.5) {
+            return vec4<f32>(
+                select(vec3<f32>(1.0, 0.0, 0.0), mirrored.rgb, mirrored.a > 0.001),
+                1.0,
+            );
+        }
         // Schlick again, on the same normal: water reflects almost nothing straight down and almost
         // everything at a glancing angle, which is most of why a lake reads as a lake.
         //
@@ -1820,7 +1978,24 @@ fn fragment(
     // depth instead of one that recedes into the murk. (VERIFIED wow-re `liquid-render-state-sided`
     // §3/§3.1/§5, which corrects that row.)
     if (w.kind.x > 0.5) {
-        return vec4<f32>(apply_fog(detail.rgb, in.world_position.xyz, in.room_fog), 1.0);
+        // The stylised lane grades magma into crust and seam ([`stylised_lava`]); slime keeps the
+        // sheet, having no heat to render, and the faithful lane keeps it for both. Fog applies to
+        // all four cases — see the module note on why skipping it was wrong.
+        //
+        // **`select`, not an `if`, and that is a correctness fix rather than a style choice.**
+        // `detail` above is a `textureSampleBias`, which needs implicit derivatives, and wrapping
+        // the code after it in a branch was enough to cost it a mip level: the FAITHFUL lane's lava
+        // came back duller and greyer (−76 red, +9 green, +13 blue over the magma silhouette — the
+        // signature of a blurrier mip, not of a grade), on a path where none of this code runs.
+        // Caught by capturing `WOW_WATER_STYLE=0` before and after and diffing; it would have been
+        // invisible in any stylised shot. A `select` has no control flow for the sample to be
+        // reachable-from differently, so the derivatives stay put.
+        //
+        // The cost of evaluating the grade on surfaces that discard it is two `textureSampleLevel`
+        // taps on magma and slime fragments only, which is a rounding error next to being wrong.
+        let graded = stylised_lava(detail.rgb, in.world_position.xz, anim_time());
+        let full = select(detail.rgb, graded, w.path.y > 0.5 && w.path.z > 0.5);
+        return vec4<f32>(apply_fog(full, in.world_position.xyz, in.room_fog), 1.0);
     }
 
     // Per-vertex swatch coord V (in `in.depth`, computed CPU-side in wow-formats/liquid.rs): river/lake

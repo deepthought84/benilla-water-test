@@ -1143,8 +1143,15 @@ pub(super) fn setup_liquid(
                     ),
                     // x = which of the reference's three liquid renderers `liquid.wgsl` runs;
                     // y = the stylised-look lane, seeded from the resource here and rewritten in
-                    // place by [`apply_water_style`] whenever the player changes it.
-                    path: Vec4::new(path.shader_id(), style.shader_flag(), 0.0, 0.0),
+                    // place by [`apply_water_style`] whenever the player changes it;
+                    // z = magma rather than slime, which `kind.x`'s "fullbright" cannot say and the
+                    // stylised lava treatment needs (slime is not molten and must not glow).
+                    path: Vec4::new(
+                        path.shader_id(),
+                        style.shader_flag(),
+                        if kind == LiquidKind::Magma { 1.0 } else { 0.0 },
+                        0.0,
+                    ),
                     // x = reserved (frame 0; the shader derives the live index from its own
                     // clock); y = frame count; z = the SCROLL FLAG (1 = this lane takes the
                     // stage-0 v-scroll — [`scrolls`]' nibble-6/7 WMO lane); w = the clock
