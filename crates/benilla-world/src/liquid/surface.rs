@@ -23,6 +23,7 @@ use benilla_assets::LockRecover;
 use benilla_assets::{liquid_frame_array, RenderConfig, WorldAssets};
 use benilla_formats::{
     read_texture_mip_chain, terrain_height_at, BlpMipChain, ChunkMesh, LiquidKind, LiquidMesh,
+    PlanarMap,
 };
 
 /// The shared liquid materials by [`LiquidKey`]; absent without client data.
@@ -151,6 +152,8 @@ pub(crate) fn spawn_liquids<'a>(
     // rises through the water plane, and nothing in the liquid data alone records it
     // ([`shore_distances`]).
     chunks: &[ChunkMesh],
+    // Which of the tile's water the mirrors serve, judged with its neighbours by the tile's loader.
+    planar: Option<&PlanarMap>,
     liquid_assets: Option<&LiquidAssets>,
     meshes: &mut Assets<Mesh>,
     entities: &mut Vec<Entity>,
@@ -168,7 +171,8 @@ pub(crate) fn spawn_liquids<'a>(
         let Some(material) = liquid.material(lq.kind, LiquidPath::Adt, false) else {
             continue; // this kind's frames failed to load (warned at setup)
         };
-        let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk);
+        let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
+            .with_votes(planar.map(|p| p.votes(lq)));
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
         entities.push(
             commands
@@ -177,6 +181,7 @@ pub(crate) fn spawn_liquids<'a>(
                         lq,
                         None,
                         lattice.as_ref(),
+                        planar,
                         shoreline.as_ref(),
                     ))),
                     MeshMaterial3d(material),
@@ -654,6 +659,7 @@ fn liquid_bevy_mesh(
     lq: &LiquidMesh,
     body_color: Option<[f32; 3]>,
     lattice: Option<&WetLattice>,
+    planar: Option<&PlanarMap>,
     shoreline: Option<&Shoreline>,
 ) -> Mesh {
     let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
@@ -693,8 +699,14 @@ fn liquid_bevy_mesh(
     let mut uv1: Vec<[f32; 2]> = Vec::new();
     let mut shore_offsets: Vec<[f32; 2]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut planar_w: Vec<f32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let corner_n = corner_normals(lq, level);
+    let corner_w: Vec<f32> = lq
+        .positions
+        .iter()
+        .map(|p| planar.map_or(1.0, |m| m.corner(p[0], p[1])))
+        .collect();
     let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
 
     for j in 0..yt {
@@ -739,6 +751,8 @@ fn liquid_bevy_mesh(
                         .lerp(Vec3::from(cn(1)), fu)
                         .lerp(Vec3::from(cn(2)).lerp(Vec3::from(cn(3)), fu), fv);
                     normals.push(wow_to_bevy(blend.normalize_or(Vec3::Z).to_array()).to_array());
+                    let cw = |k: usize| corner_w[corner[k]];
+                    planar_w.push(mix(mix(cw(0), cw(1), fu), mix(cw(2), cw(3), fu), fv));
                 }
             }
             let stride = (sub + 1) as u32;
@@ -772,6 +786,8 @@ fn liquid_bevy_mesh(
         benilla_assets::materials::ATTRIBUTE_WOW_SURFACE_NORMAL,
         normals,
     );
+    // How far a planar mirror may serve this water, 0 on probe water; see `liquid::planar`.
+    mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_PLANAR, planar_w);
     // An interior pool's `MOMT.diffColor` rides the vertex colour, where the reference's interior
     // vertex carries it, keeping one material per lane; other lanes take the shader's white.
     if let Some([red, green, blue]) = body_color {
@@ -799,6 +815,8 @@ pub(crate) fn spawn_wmo_liquids<'a>(
     // the whole surface, which leaves the depth-field half of the shore distance with nothing to
     // find; it needs the WHOLE model's because a WMO's liquid is not one grid.
     lattice: Option<&WetLattice>,
+    // The whole placement's mirror classes, for the same reason as the lattice.
+    planar: Option<&PlanarMap>,
     entities: &mut Vec<Entity>,
 ) {
     let Some(liquid) = liquid_assets else {
@@ -828,7 +846,7 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         }
         let surface = commands
             .spawn((
-                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color, lattice, None))),
+                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color, lattice, planar, None))),
                 MeshMaterial3d(material),
                 transform,
                 LiquidSurface,
@@ -843,11 +861,10 @@ pub(crate) fn spawn_wmo_liquids<'a>(
             ))
             .id();
         // Every kind carries the swim grid, so lava and slime swim; their damage is not modelled.
-        commands.entity(surface).insert(wet_footprint(
-            lq,
-            &transform,
-            LiquidSource::WmoGroup(pool),
-        ));
+        commands.entity(surface).insert(
+            wet_footprint(lq, &transform, LiquidSource::WmoGroup(pool))
+                .with_votes(planar.map(|p| p.votes(lq))),
+        );
         if !lq.kind.is_fullbright() {
             commands.entity(surface).insert(FoamPatch);
         }
@@ -1161,6 +1178,7 @@ mod tests {
                         &mut commands,
                         sheets.iter(),
                         &[],
+                        None,
                         Some(&assets),
                         &mut meshes,
                         &mut ents,
@@ -1200,11 +1218,17 @@ mod tests {
             .collect();
         lq.uvs = vec![[0.0, 0.0]; 9];
         lq.depths = vec![1.0; 9];
-        let mesh = liquid_bevy_mesh(&lq, Some([1.0, 1.0, 1.0]), None, None);
+        let mesh = liquid_bevy_mesh(&lq, Some([1.0, 1.0, 1.0]), None, None, None);
         let n = mesh.count_vertices();
         assert_eq!(n, 16, "four wet cells, four corners each");
         for (attr, values) in mesh.attributes() {
-            assert_eq!(values.len(), n, "{} has {} entries", attr.name, values.len());
+            assert_eq!(
+                values.len(),
+                n,
+                "{} has {} entries",
+                attr.name,
+                values.len()
+            );
         }
     }
 }

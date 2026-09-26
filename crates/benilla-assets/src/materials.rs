@@ -466,6 +466,18 @@ pub const ATTRIBUTE_WOW_SURFACE_NORMAL: bevy::mesh::MeshVertexAttribute =
         bevy::render::render_resource::VertexFormat::Float32x3,
     );
 
+/// How far a planar mirror may serve this water, 0 to 1 per vertex: 0 on falls, descending rivers
+/// and small pools (`benilla_world::liquid::planar`), ramping to 1 over a few cells, so the mirror
+/// fades into the cube probe beneath it. Read by the stylised lane only; 1 on a mesh without it.
+///
+/// Own attribute id and shader location 12, beside [`ATTRIBUTE_WOW_SURFACE_NORMAL`].
+pub const ATTRIBUTE_WOW_PLANAR: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_Planar",
+        988_540_923,
+        bevy::render::render_resource::VertexFormat::Float32,
+    );
+
 impl MaterialExtension for LiquidExt {
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
@@ -474,7 +486,8 @@ impl MaterialExtension for LiquidExt {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
     }
 
-    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`] and [`ATTRIBUTE_WOW_SURFACE_NORMAL`] into the vertex
+    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`], [`ATTRIBUTE_WOW_SURFACE_NORMAL`] and
+    /// [`ATTRIBUTE_WOW_PLANAR`] into the vertex
     /// layout, each behind its shader def, since Bevy builds the layout from its own attributes only.
     ///
     /// `sky_order::WATER_BIAS` (−2e4) is a sort rung, kept out of the rasterizer: as a depth-bias
@@ -495,6 +508,7 @@ impl MaterialExtension for LiquidExt {
         let ours = [
             (ATTRIBUTE_WOW_SHORE_OFFSET, 10, "LIQUID_SHORE_OFFSET"),
             (ATTRIBUTE_WOW_SURFACE_NORMAL, 11, "LIQUID_SURFACE_NORMAL"),
+            (ATTRIBUTE_WOW_PLANAR, 12, "LIQUID_PLANAR"),
         ];
         if !ours.iter().any(|(a, _, _)| layout.0.contains(*a)) {
             return Ok(());

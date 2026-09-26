@@ -304,6 +304,8 @@ struct LiquidVsOut {
     @location(8) @interpolate(flat) room_fog: u32,
     // The heightfield's smooth normal, world space; zero on a mesh without it.
     @location(9) surface_normal: vec3<f32>,
+    // How far a planar mirror may serve this water (`ATTRIBUTE_WOW_PLANAR`); 1 without it.
+    @location(10) planar: f32,
 }
 
 // Sun sheen (`secondary`): the Blinn highlight `light_spec.rgb · (N·H)^shininess`.
@@ -1697,6 +1699,8 @@ fn stylised_water(
     shore_offset: vec2<f32>,
     // The heightfield's smooth normal (zero where the mesh has none).
     smooth_normal: vec3<f32>,
+    /// How far a planar mirror may serve this water, 0 to 1 — see `ATTRIBUTE_WOW_PLANAR`.
+    planar: f32,
     shallow: vec4<f32>,
     deep: vec4<f32>,
     lit: vec3<f32>,
@@ -2272,8 +2276,10 @@ fn stylised_water(
 
     // Each mirror serves the water near its own plane: its colour and its weight here — strength
     // times coverage times trust. Where both reach a fragment they blend by weight.
-    let m1 = planar_read(water_reflect.params, false, world_pos, n, frag_coord, tilt);
-    let m2 = planar_read(water_reflect.mirror2, true, world_pos, n, frag_coord, tilt);
+    // Off probe water the mirrors stand down, so the probe beneath them shows through.
+    let serve = vec4<f32>(1.0, 1.0, 1.0, smoothstep(0.0, 1.0, planar));
+    let m1 = planar_read(water_reflect.params, false, world_pos, n, frag_coord, tilt) * serve;
+    let m2 = planar_read(water_reflect.mirror2, true, world_pos, n, frag_coord, tilt) * serve;
     // The colour favours the mirror whose plane is nearer this water — both are trusted across
     // their whole tolerance, so without this a body between the two planes took an even mix of a
     // right image and a wrong one. The overall weight below is untouched.
@@ -2572,6 +2578,9 @@ struct LiquidVertex {
 #ifdef LIQUID_SURFACE_NORMAL
     @location(11) surface_normal: vec3<f32>,
 #endif
+#ifdef LIQUID_PLANAR
+    @location(12) planar: f32,
+#endif
 }
 
 @vertex
@@ -2587,6 +2596,11 @@ fn vertex(in: LiquidVertex) -> LiquidVsOut {
         mesh_functions::mesh_normal_local_to_world(in.surface_normal, in.instance_index);
 #else
     out.surface_normal = vec3<f32>(0.0);
+#endif
+#ifdef LIQUID_PLANAR
+    out.planar = in.planar;
+#else
+    out.planar = 1.0;
 #endif
     out.uv = in.uv;
 #ifdef VERTEX_COLORS
@@ -2787,6 +2801,7 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
             in.shore,
             in.shore_offset,
             in.surface_normal,
+            in.planar,
             body_shallow,
             body_deep,
             lit,

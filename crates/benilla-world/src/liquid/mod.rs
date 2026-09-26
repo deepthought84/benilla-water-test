@@ -121,15 +121,8 @@ pub enum WaterStyle {
     /// itself (`liquid::probe`) — off-screen content at the fragment's own reflected orientation,
     /// which is the one thing none of the other three tiers can supply.
     ///
-    /// **The probe is armed here and nowhere else, and that is measured rather than tidy.** On the
-    /// full [`Stylised`](Self::Stylised) lane the mirror has complete coverage over any water it is
-    /// aimed at, so its composite weight is 1 and it replaces whatever the probe wrote, wholesale:
-    /// an A/B at Mirror Lake with the probe on and off came back at **0 pixels of 1.44M different**.
-    /// Computing a tier that is guaranteed to be discarded is waste the code should state, not
-    /// perform. On this lane, with no mirror to overwrite it, the same probe changes **46.8% of the
-    /// water band at a mean absolute difference of 1.68** — against 1.93 for the planar mirror,
-    /// which is most of what a whole second scene render buys, for six 128-pixel faces every six
-    /// seconds.
+    /// On the full [`Stylised`](Self::Stylised) lane the same probe runs under the mirrors and
+    /// shows only where they stand down (`liquid::planar`).
     StylisedProbe,
     /// **The hybrid: the screen-space march over the cubemap probe, with no planar camera at all.**
     ///
@@ -216,11 +209,13 @@ impl WaterStyle {
 
     /// Does this look drive the cubemap probe?
     ///
-    /// [`StylisedProbe`](Self::StylisedProbe) and the hybrid. See the former for the measurement:
-    /// with a mirror running, the probe's contribution is exactly zero pixels, so arming it
-    /// anywhere else is capturing six faces to throw them away.
+    /// Every lane but the march alone. Beside the mirrors it serves the water they stand down
+    /// over — falls, descending rivers, small pools (`liquid::planar`).
     pub(crate) fn wants_probe(self) -> bool {
-        matches!(self, Self::StylisedProbe | Self::StylisedSsrProbe)
+        matches!(
+            self,
+            Self::Stylised | Self::StylisedProbe | Self::StylisedSsrProbe
+        )
     }
 
     /// What `GetCVar("waterStyle")` answers for this state.

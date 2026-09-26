@@ -760,6 +760,7 @@ fn stream_terrain(
             &mut commands,
             adt.chunks.iter().flat_map(|c| c.liquids.iter()),
             &adt.chunks,
+            adt.planar.as_ref(),
             liquid_assets.as_deref(),
             &mut meshes,
             &mut liquid_ents,

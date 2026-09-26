@@ -5,11 +5,12 @@
 //! `COLOR` the 4 layers and `UV1` the alpha (`.x`) and shadow (`.y`, `-1` none), so a whole tile
 //! shares one material.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use benilla_formats::{
-    adt_to_tile_mesh, blp_bytes_to_native_chain, ChunkMesh, Doodad, WmoInstance, ALPHA_MAP_SIZE,
-    SHADOW_MAP_SIZE,
+    adt_liquids, adt_to_tile_mesh, blp_bytes_to_native_chain, ChunkMesh, Doodad, LiquidMesh,
+    PlanarMap, WmoInstance, ALPHA_MAP_SIZE, SHADOW_MAP_SIZE,
 };
 use bevy::asset::io::Reader;
 use bevy::asset::{Asset, AssetLoader, LoadContext, RenderAssetUsages};
@@ -40,6 +41,9 @@ pub struct AdtTile {
     /// The decoded MCNK chunks, kept resident: the app derives the collider, the MCLQ liquids and
     /// the ground clutter from them.
     pub chunks: Vec<ChunkMesh>,
+    /// Which of the tile's water the planar mirrors serve, judged with its eight neighbours;
+    /// `None` on a dry tile.
+    pub planar: Option<PlanarMap>,
 }
 
 /// One drawn chunk's array indices, uniform over its vertices.
@@ -215,6 +219,8 @@ impl AssetLoader for AdtLoader {
             shadow_count = 1;
         }
 
+        let planar = tile_planar(ctx, &tile.chunks).await;
+
         let layer_count = layers.len() as u32 + 1;
         let packed = pack_layers([107, 133, 82, 0], layers);
         // Per tile, so a log shows which tiles fell back to the decoded format.
@@ -236,6 +242,7 @@ impl AssetLoader for AdtLoader {
             doodads: tile.doodads,
             wmos: tile.wmos,
             chunks: tile.chunks,
+            planar,
         })
     }
 
@@ -263,6 +270,72 @@ async fn read_layer(ctx: &mut LoadContext<'_>, key: &str) -> Option<RawLayer> {
 }
 
 /// An internal path as an `mpq://` URL.
+/// Recently read tiles' MCLQ water, by asset path, so a tile read as eight neighbours' neighbour
+/// is parsed once.
+static WATER: LazyLock<Mutex<WaterCache>> = LazyLock::new(Default::default);
+
+/// Insertion order, then the water by asset path.
+type WaterCache = (VecDeque<String>, HashMap<String, Arc<Vec<LiquidMesh>>>);
+
+/// How many tiles' water [`WATER`] holds: a 5 × 5 streaming block and its rim.
+const WATER_KEEP: usize = 64;
+
+/// The tile's [`PlanarMap`], its sections measured across its eight neighbours. The neighbours'
+/// water comes from [`WATER`] or is read and parsed here; a missing neighbour has none.
+async fn tile_planar(ctx: &mut LoadContext<'_>, chunks: &[ChunkMesh]) -> Option<PlanarMap> {
+    let own: Vec<&LiquidMesh> = chunks.iter().flat_map(|c| c.liquids.iter()).collect();
+    if own.is_empty() {
+        return None;
+    }
+    let path = ctx.path().path().to_string_lossy().replace('\\', "/");
+    let (stem, ext) = path.rsplit_once('.')?;
+    let mut parts = stem.rsplitn(3, '_');
+    let ty: i32 = parts.next()?.parse().ok()?;
+    let tx: i32 = parts.next()?.parse().ok()?;
+    let prefix = parts.next()?;
+    remember(
+        path.clone(),
+        Arc::new(own.iter().map(|&l| l.clone()).collect()),
+    );
+    let mut window: Vec<Arc<Vec<LiquidMesh>>> = Vec::with_capacity(8);
+    for (dx, dy) in (-1..=1).flat_map(|a| (-1..=1).map(move |b| (a, b))) {
+        if (dx, dy) == (0, 0) {
+            continue;
+        }
+        let key = format!("{prefix}_{}_{}.{ext}", tx + dx, ty + dy);
+        let cached = WATER.lock().ok().and_then(|w| w.1.get(&key).cloned());
+        let water = match cached {
+            Some(w) => w,
+            None => {
+                let parsed = match ctx.read_asset_bytes(mpq_url(&key)).await {
+                    Ok(bytes) => adt_liquids(&bytes).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+                let water = Arc::new(parsed);
+                remember(key, water.clone());
+                water
+            }
+        };
+        window.push(water);
+    }
+    PlanarMap::build_tile(own.into_iter(), window.iter().flat_map(|w| w.iter()))
+}
+
+/// File a tile's water in [`WATER`], dropping the oldest past [`WATER_KEEP`].
+fn remember(key: String, water: Arc<Vec<LiquidMesh>>) {
+    let Ok(mut w) = WATER.lock() else {
+        return;
+    };
+    if w.1.insert(key.clone(), water).is_none() {
+        w.0.push_back(key);
+    }
+    while w.0.len() > WATER_KEEP {
+        if let Some(old) = w.0.pop_front() {
+            w.1.remove(&old);
+        }
+    }
+}
+
 fn mpq_url(key: &str) -> String {
     format!("mpq://{}", key.replace('\\', "/"))
 }

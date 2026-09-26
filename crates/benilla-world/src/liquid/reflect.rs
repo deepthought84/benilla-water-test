@@ -731,7 +731,7 @@ fn wet_height_near(chunk: &WaterChunkInfo, x: f32, y: f32, lattice: bool) -> Opt
     let [[min_x, min_y], [max_x, max_y]] = chunk.xy_bounds()?;
     let (cx, cy) = (x.clamp(min_x, max_x), y.clamp(min_y, max_y));
     let d2 = |px: f32, py: f32| (px - x) * (px - x) + (py - y) * (py - y);
-    if let Some(z) = chunk.surface_z_at(cx, cy) {
+    if let Some(z) = chunk.planar_z_at(cx, cy) {
         return Some((z, d2(cx, cy)));
     }
     // Only for the surfaces near enough to be the fallback plane. The lattice is 25 grid probes and
@@ -739,7 +739,8 @@ fn wet_height_near(chunk: &WaterChunkInfo, x: f32, y: f32, lattice: bool) -> Opt
     // paying it on every one of them, once a frame, to rescue the rare distant WMO pool whose
     // near corner happens to be dry is the wrong trade. A far surface that misses simply is not a
     // candidate, which is the behaviour this walk had at every distance before.
-    if !lattice {
+    // A surface only partly planar is searched too: its nearest point may sit on its fall.
+    if !lattice && !chunk.votes_partly() {
         return None;
     }
     const N: i32 = 4;
@@ -748,7 +749,7 @@ fn wet_height_near(chunk: &WaterChunkInfo, x: f32, y: f32, lattice: bool) -> Opt
         for j in 0..=N {
             let px = min_x + (max_x - min_x) * i as f32 / N as f32;
             let py = min_y + (max_y - min_y) * j as f32 / N as f32;
-            let Some(z) = chunk.surface_z_at(px, py) else {
+            let Some(z) = chunk.planar_z_at(px, py) else {
                 continue;
             };
             let d = d2(px, py);
@@ -811,10 +812,8 @@ fn plane_near(
             continue;
         }
         // Near enough to be the *fallback* plane, which is a shorter reach than the look test's.
-        // Falls and rapids get no mirror: a plane cannot serve water that drops several yards
-        // across one surface, and electing one makes the mirror wander with every bob of the eye.
-        // The slope trust in the shader already hands such water to the other tiers.
-        if chunk.height_span() > MIRROR_MAX_SPAN_YD {
+        // Only planar water votes: falls, descending rivers and small pools are the probe's.
+        if !chunk.votes_any() {
             continue;
         }
         let near = foot_d2 <= REFLECT_RADIUS * REFLECT_RADIUS;
@@ -925,10 +924,6 @@ struct Prominence {
 
 /// How far apart two surface heights must be to be ranked separately, in yards.
 const BUCKET_YARDS: f32 = 0.5;
-
-/// The most a water surface's heights may range, in yards, for it to count towards a mirror's
-/// plane. A river reach drops a yard or two across a surface; a waterfall several.
-const MIRROR_MAX_SPAN_YD: f32 = 3.0;
 
 /// The least share of the wider view ([`SECOND_FOV_SCALE`]) a second water height must cover for
 /// the second mirror to render for it. Small, because the point is to be rendering before the body
@@ -2203,10 +2198,9 @@ mod tests {
         assert!(WaterStyle::StylisedSsr.is_stylised());
         assert!(WaterStyle::Stylised.is_stylised());
         assert!(!WaterStyle::Reference.is_stylised());
-        // The probe is armed on exactly one lane, and the reason is a measurement rather than
-        // tidiness: beside a mirror its contribution is zero pixels. See `WaterStyle::StylisedProbe`.
+        // The probe serves the water the mirrors stand down over, and is the probe lanes' tier.
         assert!(WaterStyle::StylisedProbe.wants_probe());
-        assert!(!WaterStyle::Stylised.wants_probe());
+        assert!(WaterStyle::Stylised.wants_probe());
         assert!(!WaterStyle::StylisedSsr.wants_probe());
         assert!(!WaterStyle::Reference.wants_probe());
         // ...and it brings no second camera with it, which is the whole point of the lane.

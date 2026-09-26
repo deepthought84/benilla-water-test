@@ -406,6 +406,8 @@ pub(super) fn spawn_loaded_placements(
                     let model_liquids: Vec<&_> = m.group_liquids.iter().flatten().collect();
                     let water_lattice =
                         crate::liquid::WetLattice::build(model_liquids.iter().copied());
+                    let water_planar =
+                        benilla_formats::PlanarMap::build(model_liquids.iter().copied());
                     for (gi, lq) in m.group_liquids.iter().enumerate() {
                         let Some(lq) = lq else { continue };
                         let first = ents.len();
@@ -428,6 +430,7 @@ pub(super) fn spawn_loaded_placements(
                             // The root's MOMT diffColor table: an interior pool's body colour.
                             &m.material_diff_color,
                             water_lattice.as_ref(),
+                            water_planar.as_ref(),
                             &mut ents,
                         );
                         // Another building's pool is exterior scene like its walls (`0x6856c0`),

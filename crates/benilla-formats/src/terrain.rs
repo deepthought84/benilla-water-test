@@ -292,6 +292,22 @@ pub(crate) fn snap_to_lattice(coord: f32) -> f32 {
     (map_center - idx * unit) as f32
 }
 
+/// One ADT file's MCLQ water only, as [`adt_to_tile_mesh`] builds it, without the terrain.
+pub fn adt_liquids(adt_bytes: &[u8]) -> Result<Vec<crate::liquid::LiquidMesh>> {
+    let mut cursor = Cursor::new(adt_bytes);
+    let parsed = parse_adt(&mut cursor).map_err(|e| anyhow::anyhow!("parsing ADT: {e}"))?;
+    let ParsedAdt::Root(root) = parsed;
+    Ok(root
+        .mcnk_chunks
+        .iter()
+        .flat_map(|mcnk| {
+            mcnk.liquids
+                .iter()
+                .filter_map(|mclq| crate::liquid::build_liquid_mesh(mclq, mcnk.header.position))
+        })
+        .collect())
+}
+
 /// Build per-chunk meshes from one vanilla (monolithic) ADT file's bytes.
 pub fn adt_to_tile_mesh(adt_bytes: &[u8]) -> Result<TileMesh> {
     let mut cursor = Cursor::new(adt_bytes);

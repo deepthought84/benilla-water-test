@@ -1010,13 +1010,13 @@ fn probe_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("WOW_PROBE").as_deref() != Ok("0"))
 }
 
-/// `$WOW_PROBE_LIVE=1` — one probe that follows the player, re-captured continuously, in place of
-/// the lattice (the single player-centred cube GTA V renders each frame). Time-sliced: one camera
+/// One probe that follows the player, re-captured continuously (the single player-centred cube GTA V
+/// renders each frame); `$WOW_PROBE_LIVE=0` goes back to the world lattice. Time-sliced: one camera
 /// renders one face a frame, so a cube completes every six frames. Slots 0 to 2 rotate: one being
 /// written and hidden, one fading in over the next cycle, one fading out.
 pub(crate) fn probe_live() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_PROBE_LIVE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("WOW_PROBE_LIVE").as_deref() != Ok("0"))
 }
 
 /// `$WOW_PROBE_SHOW=1` — paint the probe's own sample instead of the water.
@@ -1910,9 +1910,7 @@ pub(super) fn drive_probe(
     // The hold spans the whole capture and outlives it by a few frames — see [`ProbeCull`].
     cull.hold = cull.hold.saturating_sub(1);
     cull.active = cull.hold > 0;
-    // `wants_probe`, not `is_stylised`: this tier is armed on its own lane and nowhere else. With
-    // the mirror running its contribution measured at zero pixels — see `WaterStyle::StylisedProbe`
-    // — so arming it beside one would be capturing six faces a refresh in order to discard them.
+    // `wants_probe`, not `is_stylised`: the march-only lane has no probe.
     let want = style.wants_probe() && probe_enabled();
     probe.armed = want;
     probe.ever = probe.slots.iter().any(|s| s.captured);

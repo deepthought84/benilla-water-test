@@ -136,6 +136,8 @@ mod loading_screen;
 pub use loading_screen::{load_loading_screens, LoadingScreenCatalog};
 mod liquid;
 pub use liquid::{LiquidKind, LiquidMesh};
+mod liquid_planar;
+pub use liquid_planar::PlanarMap;
 mod maps;
 pub use maps::{load_map_catalog, MapBattlegroundColumns, MapCatalog};
 mod anim_data;
@@ -259,10 +261,10 @@ pub use models::{
 };
 mod terrain;
 pub use terrain::{
-    adt_to_tile_mesh, area_id_at, find_tile_near, ground_effect_at, impassable_at, load_tile_mesh,
-    load_tiles_around, mcsh_shadowed_at, terrain_height_at, triangle_z_at, ChunkMesh, Doodad,
-    MapTiles, TileMesh, WmoInstance, ALPHA_MAP_SIZE, CHUNK_SIZE, SHADOW_MAP_SIZE, STORMWIND_XY,
-    TERRAIN_LAYER_TILES, TILE_SIZE,
+    adt_liquids, adt_to_tile_mesh, area_id_at, find_tile_near, ground_effect_at, impassable_at,
+    load_tile_mesh, load_tiles_around, mcsh_shadowed_at, terrain_height_at, triangle_z_at,
+    ChunkMesh, Doodad, MapTiles, TileMesh, WmoInstance, ALPHA_MAP_SIZE, CHUNK_SIZE,
+    SHADOW_MAP_SIZE, STORMWIND_XY, TERRAIN_LAYER_TILES, TILE_SIZE,
 };
 mod wdl;
 /// World (x, y) to ADT tile `(col, row)`; minimap `map<X>_<Y>.blp` names use the same order.
