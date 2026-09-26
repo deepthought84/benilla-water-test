@@ -14,12 +14,13 @@ use crate::LiquidMesh;
 /// A cell whose corners differ by more than this is sloped water (a fall or rapids).
 const FLAT_YD: f32 = 0.5;
 
-/// A section is the connected cells within this of its seed height — the mirror's own bucket.
-const SECTION_YD: f32 = 0.5;
+/// A section is the connected flat cells within this of its seed height: water a mirror on the
+/// seed's plane still serves by its per-fragment height correction, and the least gap the second
+/// mirror keeps from the first. A stream easing down a yard or two stays one plane; a fall does not.
+const SECTION_YD: f32 = 3.0;
 
 /// The least area a flat section needs to earn a mirror plane, in square yards: just under one MCLQ
-/// chunk. At the Elwynn falls it keeps the 1,579-yd² pond and drops the 156-yd² sliver on the
-/// fall.
+/// chunk. It keeps Elwynn's 1,579-yd² pond and drops slivers of flat water caught in a fall.
 const MIN_AREA_YD2: f32 = 1_000.0;
 
 /// How many cells the mirror's weight takes to rise from a probe cell to full, so the two tiers
@@ -243,9 +244,10 @@ fn shore_distance(cells: &[Cell], index: &HashMap<Key, usize>) -> Vec<u32> {
     dist
 }
 
-/// Each cell's mirror plane, its section's mean height, or `None` on probe water. Sections are seeded at the most common remaining height and take
-/// the connected cells within [`SECTION_YD`] of it, so no section drifts: a descending river breaks
-/// into short steps and each is judged on its own size.
+/// Each cell's mirror plane, or `None` on probe water. Sections are seeded at the most common
+/// remaining height and take the connected flat cells within [`SECTION_YD`] of it, so no section
+/// drifts further than that: a long descending river breaks into stretches, each judged on its own
+/// size. A section's plane is its [`dominant_level`].
 fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<Option<f32>> {
     let mut planar = vec![None; cells.len()];
     let mut left: Vec<bool> = cells.iter().map(|c| c.flat).collect();
@@ -281,9 +283,9 @@ fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<Optio
                 }
             }
             let keep = comp.len() as f32 * cell * cell >= MIN_AREA_YD2;
-            let mean = comp.iter().map(|&k| cells[k].h).sum::<f32>() / comp.len() as f32;
+            let level = dominant_level(comp.iter().map(|&k| cells[k].h));
             for &k in &comp {
-                planar[k] = keep.then_some(mean);
+                planar[k] = keep.then_some(level);
             }
         }
         for k in group {
@@ -291,6 +293,22 @@ fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<Optio
         }
     }
     planar
+}
+
+/// The height most of a section lies at: the median of its most common quarter-yard bin — a
+/// lake's own level, not pulled off it by a stream easing into it.
+fn dominant_level(heights: impl Iterator<Item = f32> + Clone) -> f32 {
+    let bin = |h: f32| (h / 0.25).round() as i64;
+    let mut hist: HashMap<i64, u32> = HashMap::new();
+    for h in heights.clone() {
+        *hist.entry(bin(h)).or_default() += 1;
+    }
+    let Some((&mode, _)) = hist.iter().max_by_key(|(b, n)| (**n, -**b)) else {
+        return 0.0;
+    };
+    let mut level: Vec<f32> = heights.filter(|h| bin(*h) == mode).collect();
+    level.sort_by(f32::total_cmp);
+    level[level.len() / 2]
 }
 
 /// Each cell's weight: 0 on probe water, rising by `1/RAMP_CELLS` per cell away from it.
@@ -428,27 +446,43 @@ mod tests {
         );
     }
 
-    /// A stream rising 0.4 yd towards the foot of a fall is one section and votes one plane
-    /// everywhere, so the mirror does not move with the camera along it.
+    /// A lake at 33.30 with a stream easing 2 yd down out of it is one section voting the lake's
+    /// level everywhere, so the mirror does not move with the camera along the stream.
     #[test]
-    fn a_section_votes_one_plane() {
-        let lq = sheet(8, 40, |_, j| 33.30 + 0.01 * j as f32);
+    fn a_section_votes_its_dominant_level() {
+        let lq = sheet(8, 60, |_, j| {
+            if j < 40 {
+                33.30
+            } else {
+                33.30 - 0.1 * (j - 40) as f32
+            }
+        });
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
         let planes = map.planes(&lq);
         assert!(
-            planes.iter().all(|z| (*z - planes[0]).abs() < 1e-4),
+            planes.iter().all(|z| (*z - 33.30).abs() < 1e-3),
             "{planes:?}"
         );
-        assert!((planes[0] - 33.5).abs() < 0.01, "the section's mean");
     }
 
-    /// A 375-yd river descending 0.2 yd per cell breaks into short steps, none big enough for a
-    /// mirror, even though every neighbour is within the section tolerance of the next.
+    /// A 375-yd river descending 18 yd, 0.2 yd per cell, breaks into stretches of its own planes,
+    /// every cell within [`SECTION_YD`] of the plane it votes.
     #[test]
-    fn a_descending_river_is_probe_water() {
+    fn a_descending_river_breaks_into_planes() {
         let lq = sheet(8, 90, |_, j| 60.0 - 0.2 * j as f32);
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
-        assert!(map.weight.values().all(|w| *w == 0.0));
+        let planes = map.planes(&lq);
+        let mut distinct: Vec<f32> = planes.clone();
+        distinct.sort_by(f32::total_cmp);
+        distinct.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        assert!(distinct.len() >= 3, "{distinct:?}");
+        for (c, z) in planes.iter().enumerate() {
+            let h = 60.0 - 0.2 * ((c / 8) as f32 + 0.5);
+            assert!(
+                (h - z).abs() <= SECTION_YD + 1e-3,
+                "cell {c} at {h} votes {z}"
+            );
+        }
     }
 
     /// A tile's small piece of a lake that continues into the next tile is measured whole, and
