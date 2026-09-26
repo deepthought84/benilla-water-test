@@ -348,6 +348,34 @@ impl WaterChunkInfo {
             .any(|(v, w)| !*v && *w)
     }
 
+    /// The point of this surface's probe water nearest WoW `(x, y)`, with the water's height there
+    /// (WoW XYZ), and its squared horizontal distance; `None` without probe water.
+    pub(crate) fn nearest_probe_water(&self, x: f32, y: f32) -> Option<([f32; 3], f32)> {
+        let cells_x = self.grid.cols.checked_sub(1)?;
+        let mut best: Option<([f32; 3], f32)> = None;
+        for cell in (0..self.votes.len()).filter(|&c| !self.votes[c] && self.grid.wet[c]) {
+            let (i, j) = (cell % cells_x, cell / cells_x);
+            let corners = [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)]
+                .map(|(a, b)| self.grid.positions[b * self.grid.cols + a]);
+            let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+                (lo.min(p[0]), hi.max(p[0]))
+            });
+            let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+                (lo.min(p[1]), hi.max(p[1]))
+            });
+            let (px, py) = (x.clamp(x0, x1), y.clamp(y0, y1));
+            let d2 = (px - x) * (px - x) + (py - y) * (py - y);
+            if best.is_some_and(|(_, bd)| bd <= d2) {
+                continue;
+            }
+            let z = self
+                .surface_z_at(px, py)
+                .unwrap_or_else(|| corners.iter().map(|p| p[2]).sum::<f32>() / 4.0);
+            best = Some(([px, py, z], d2));
+        }
+        best
+    }
+
     /// Does any wet cell of this surface vote for a mirror plane?
     pub(crate) fn votes_any(&self) -> bool {
         self.votes.is_empty() || self.votes.iter().zip(&self.grid.wet).any(|(v, w)| *v && *w)

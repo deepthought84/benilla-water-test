@@ -1684,8 +1684,26 @@ fn place_probes(
     };
     let eye = eye.translation();
     let body = viewer.at.unwrap_or(eye);
-    probe.awake = *style != WaterStyle::Stylised || probe_wanted_near(&chunks, body, probe.awake);
+    // On the planar lane the probe serves probe water only, so it stands on it: at the point of
+    // it nearest the player, and asleep while none is near.
+    let bound = *style == WaterStyle::Stylised;
+    let seat = bound.then(|| nearest_probe_water(&chunks, body)).flatten();
+    probe.awake = !bound || seat.is_some_and(|(_, d)| d <= wake_reach(probe.awake));
     if !probe.awake {
+        return;
+    }
+    if let (true, Some((water, _))) = (probe_live(), seat) {
+        let at = water + Vec3::Y * PROBE_LIFT;
+        let (lo, hi) = derive_box(&chunks, at).unwrap_or((
+            at - Vec3::splat(PROBE_BOX_FALLBACK),
+            at + Vec3::splat(PROBE_BOX_FALLBACK),
+        ));
+        probe.live_target = Some(Wanted {
+            cell: IVec2::ZERO,
+            at,
+            lo,
+            hi,
+        });
         return;
     }
     if probe_live() {
@@ -1904,17 +1922,38 @@ const PROBE_WAKE_YD: f32 = 200.0;
 /// …and sleeps again only past this, so standing at the edge does not toggle it.
 const PROBE_SLEEP_YD: f32 = 250.0;
 
-/// Whether probe water (`liquid::planar`: falls, descending rivers, small pools) lies within
-/// [`PROBE_WAKE_YD`] of `body`, or within [`PROBE_SLEEP_YD`] while the probe is `awake`.
-fn probe_wanted_near(chunks: &Query<&super::WaterChunkInfo>, body: Vec3, awake: bool) -> bool {
-    let reach = if awake { PROBE_SLEEP_YD } else { PROBE_WAKE_YD };
+/// How near probe water must be for the probe to run: [`PROBE_WAKE_YD`] to wake it,
+/// [`PROBE_SLEEP_YD`] to keep it awake.
+fn wake_reach(awake: bool) -> f32 {
+    if awake {
+        PROBE_SLEEP_YD
+    } else {
+        PROBE_WAKE_YD
+    }
+}
+
+/// The point of probe water (`liquid::planar`: falls, descending rivers, small pools) nearest
+/// `body` within [`PROBE_SLEEP_YD`], on its surface in Bevy space, and its horizontal distance.
+fn nearest_probe_water(chunks: &Query<&super::WaterChunkInfo>, body: Vec3) -> Option<(Vec3, f32)> {
     let (x, y) = wow_xy(Vec2::new(body.x, body.z));
-    chunks.iter().filter(|c| c.has_probe_water()).any(|c| {
-        c.xy_bounds().is_some_and(|[[x0, y0], [x1, y1]]| {
-            let (dx, dy) = (x - x.clamp(x0, x1), y - y.clamp(y0, y1));
-            dx * dx + dy * dy <= reach * reach
-        })
-    })
+    let far = PROBE_SLEEP_YD * PROBE_SLEEP_YD;
+    let mut best: Option<([f32; 3], f32)> = None;
+    for c in chunks.iter().filter(|c| c.has_probe_water()) {
+        let Some([[x0, y0], [x1, y1]]) = c.xy_bounds() else {
+            continue;
+        };
+        let (dx, dy) = (x - x.clamp(x0, x1), y - y.clamp(y0, y1));
+        let box_d2 = dx * dx + dy * dy;
+        if box_d2 > far || best.is_some_and(|(_, bd)| bd <= box_d2) {
+            continue;
+        }
+        if let Some((p, d2)) = c.nearest_probe_water(x, y) {
+            if d2 <= far && best.is_none_or(|(_, bd)| d2 < bd) {
+                best = Some((p, d2));
+            }
+        }
+    }
+    best.map(|(p, d2)| (benilla_assets::coords::wow_to_bevy(p), d2.sqrt()))
 }
 
 /// Drop every cube and the live cycle, so a probe woken elsewhere warms up afresh instead of
