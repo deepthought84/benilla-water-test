@@ -75,6 +75,8 @@ pub struct WaterDebug {
     pub probe_minimap: bool,
     /// Draw the same probes in the world, as gizmo rings at the capture points.
     pub probe_world: bool,
+    /// Turn the reflection probe off: no capture, and the water falls back to the other tiers.
+    pub probe_off: bool,
 }
 
 impl Default for WaterDebug {
@@ -83,6 +85,7 @@ impl Default for WaterDebug {
         Self {
             probe_minimap: armed,
             probe_world: armed,
+            probe_off: false,
         }
     }
 }

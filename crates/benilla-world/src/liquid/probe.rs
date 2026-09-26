@@ -1674,9 +1674,15 @@ fn place_probes(
     chunks: Query<&super::WaterChunkInfo>,
     eye: Query<&GlobalTransform, With<crate::view::WorldCamera>>,
     viewer: Res<crate::view::Viewer>,
+    dev: Res<crate::dev_state::DebugState>,
     mut probe: ResMut<WaterProbe>,
 ) {
     if !(style.wants_probe() && probe_enabled()) {
+        return;
+    }
+    // The debug panel's "probe off": asleep, so it frees its cubes and warms up afresh after.
+    if dev.water.probe_off {
+        probe.awake = false;
         return;
     }
     let Ok(eye) = eye.single() else {
