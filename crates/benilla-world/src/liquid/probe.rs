@@ -1297,13 +1297,13 @@ fn next_capture(
     Some(i)
 }
 
-fn ramp_probe_fades(time: Res<Time>, mut probe: ResMut<WaterProbe>) {
+fn ramp_probe_fades(style: Res<WaterStyle>, time: Res<Time>, mut probe: ResMut<WaterProbe>) {
     let step = PROBE_FADE_RATE * time.delta_secs();
     for slot in probe.slots.iter_mut() {
         let r = slot.reach_target();
         slot.reach = (slot.reach + (r - slot.reach).clamp(-step, step)).clamp(0.0, 1.0);
     }
-    if probe_live() {
+    if probe_live() && !probes_bound(*style) {
         return;
     }
     let probe = &mut *probe;
@@ -1672,6 +1672,7 @@ fn place_probes(
     style: Res<WaterStyle>,
     time: Res<Time>,
     chunks: Query<&super::WaterChunkInfo>,
+    maps: Query<&super::WaterMapRef>,
     eye: Query<&GlobalTransform, With<crate::view::WorldCamera>>,
     viewer: Res<crate::view::Viewer>,
     dev: Res<crate::dev_state::DebugState>,
@@ -1690,28 +1691,37 @@ fn place_probes(
     };
     let eye = eye.translation();
     let body = viewer.at.unwrap_or(eye);
-    // On the planar lane the probe serves probe water only, so it stands in the middle of it: on
-    // the centre line nearest the player, never on the bank, and asleep while none is near.
-    let bound = *style == WaterStyle::Stylised;
-    let seat = bound.then(|| nearest_probe_water(&chunks, body)).flatten();
-    probe.awake = !bound || seat.is_some_and(|(_, d)| d <= wake_reach(probe.awake));
-    if !probe.awake {
+    // The planar lane's probes stand on the map's fixed spots nearest the player, each serving its
+    // own region, and sleep while none is near.
+    if probes_bound(*style) {
+        let held: Vec<u16> = probe
+            .slots
+            .iter()
+            .filter(|s| s.captured && !s.retire)
+            .filter_map(|s| s.cell.and_then(spot_of))
+            .collect();
+        let near = spots_near(&maps, body, wake_reach(probe.awake), &held);
+        probe.awake = !near.is_empty();
+        probe.wanted = near
+            .into_iter()
+            .take(probe_slots().saturating_sub(1).max(1))
+            .map(|(id, water)| {
+                let at = water + Vec3::Y * PROBE_LIFT;
+                let (lo, hi) = derive_box(&chunks, at).unwrap_or((
+                    at - Vec3::splat(PROBE_BOX_FALLBACK),
+                    at + Vec3::splat(PROBE_BOX_FALLBACK),
+                ));
+                Wanted {
+                    cell: spot_key(id),
+                    at,
+                    lo,
+                    hi,
+                }
+            })
+            .collect();
         return;
     }
-    if let (true, Some((water, _))) = (probe_live(), seat) {
-        let at = water + Vec3::Y * PROBE_LIFT;
-        let (lo, hi) = derive_box(&chunks, at).unwrap_or((
-            at - Vec3::splat(PROBE_BOX_FALLBACK),
-            at + Vec3::splat(PROBE_BOX_FALLBACK),
-        ));
-        probe.live_target = Some(Wanted {
-            cell: IVec2::ZERO,
-            at,
-            lo,
-            hi,
-        });
-        return;
-    }
+    probe.awake = true;
     if probe_live() {
         // Over the player (the camera where there is no player), on land as on water: at the
         // higher of the feet and the water surface nearby, so it is never under the ground on a
@@ -1938,28 +1948,53 @@ fn wake_reach(awake: bool) -> f32 {
     }
 }
 
-/// The middle of the probe water (`liquid::planar`: falls, descending rivers, small pools) nearest
-/// `body` within [`PROBE_SLEEP_YD`], on its surface in Bevy space, and its horizontal distance.
-fn nearest_probe_water(chunks: &Query<&super::WaterChunkInfo>, body: Vec3) -> Option<(Vec3, f32)> {
+/// The planar lane binds its probes to the map's fixed spots (`benilla_formats::PlanarMap`).
+pub(crate) fn probes_bound(style: WaterStyle) -> bool {
+    style == WaterStyle::Stylised
+}
+
+/// A fixed spot's slot key: its id in `x`, and a `y` no lattice cell reaches.
+const SPOT_ROW: i32 = i32::MIN;
+
+fn spot_key(id: u16) -> IVec2 {
+    IVec2::new(i32::from(id), SPOT_ROW)
+}
+
+fn spot_of(cell: IVec2) -> Option<u16> {
+    (cell.y == SPOT_ROW).then_some(cell.x as u16)
+}
+
+/// The map's probe spots within `reach` of `body`, nearest first — a spot already `held` counting
+/// as nearer by [`PROBE_KEEP_BIAS`], so two at nearly one distance do not trade a slot — each with
+/// its place on the water in Bevy space.
+fn spots_near(
+    maps: &Query<&super::WaterMapRef>,
+    body: Vec3,
+    reach: f32,
+    held: &[u16],
+) -> Vec<(u16, Vec3)> {
+    let Some(map) = maps.iter().next() else {
+        return Vec::new();
+    };
     let (x, y) = wow_xy(Vec2::new(body.x, body.z));
-    let far = PROBE_SLEEP_YD * PROBE_SLEEP_YD;
-    let mut best: Option<([f32; 3], f32)> = None;
-    for c in chunks.iter().filter(|c| c.has_probe_anchor()) {
-        let Some([[x0, y0], [x1, y1]]) = c.xy_bounds() else {
-            continue;
-        };
-        let (dx, dy) = (x - x.clamp(x0, x1), y - y.clamp(y0, y1));
-        let box_d2 = dx * dx + dy * dy;
-        if box_d2 > far || best.is_some_and(|(_, bd)| bd <= box_d2) {
-            continue;
-        }
-        if let Some((p, d2)) = c.nearest_probe_anchor(x, y) {
-            if d2 <= far && best.is_none_or(|(_, bd)| d2 < bd) {
-                best = Some((p, d2));
-            }
-        }
-    }
-    best.map(|(p, d2)| (benilla_assets::coords::wow_to_bevy(p), d2.sqrt()))
+    let mut near: Vec<(f32, u16, Vec3)> = map
+        .0
+        .spots()
+        .iter()
+        .enumerate()
+        .filter_map(|(id, s)| {
+            let d = (s.at[0] - x).hypot(s.at[1] - y);
+            let id = u16::try_from(id).ok()?;
+            let rank = if held.contains(&id) {
+                d * PROBE_KEEP_BIAS
+            } else {
+                d
+            };
+            (d <= reach).then(|| (rank, id, benilla_assets::coords::wow_to_bevy(s.at)))
+        })
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    near.into_iter().map(|(_, id, at)| (id, at)).collect()
 }
 
 /// Drop every cube and the live cycle, so a probe woken elsewhere warms up afresh instead of
@@ -2015,7 +2050,7 @@ pub(super) fn drive_probe(
         return;
     }
 
-    if probe_live() {
+    if probe_live() && !probes_bound(*style) {
         drive_live(&mut probe, &mut cull, &mut cameras);
         return;
     }
@@ -2768,8 +2803,11 @@ pub(crate) fn probe_debug_slot() -> f32 {
     })
 }
 
-pub(crate) fn probe_slot_lanes(probe: Option<&WaterProbe>) -> [f32; PROBE_SLOT_MAX * 12] {
-    let mut out = [0.0f32; PROBE_SLOT_MAX * 12];
+pub(crate) fn probe_slot_lanes(probe: Option<&WaterProbe>) -> [f32; PROBE_SLOT_MAX * 16] {
+    let mut out = [0.0f32; PROBE_SLOT_MAX * 16];
+    for k in 0..PROBE_SLOT_MAX {
+        out[k * 16 + 12] = -1.0; // no spot bound
+    }
     let Some(probe) = probe else {
         return out;
     };
@@ -2787,7 +2825,7 @@ pub(crate) fn probe_slot_lanes(probe: Option<&WaterProbe>) -> [f32; PROBE_SLOT_M
             slot.at + (slot.box_min - slot.at) * k,
             slot.at + (slot.box_max - slot.at) * k,
         );
-        let k = i * 12;
+        let k = i * 16;
         // `w` is the fade, not a flag: the shader weights the probe by it, so a slot on its way
         // somewhere else leaves the picture smoothly instead of vanishing on one frame.
         // `at.w` is REACH — has a cube, and how far it carries — which is what makes a slot
@@ -2795,6 +2833,8 @@ pub(crate) fn probe_slot_lanes(probe: Option<&WaterProbe>) -> [f32; PROBE_SLOT_M
         out[k..k + 4].copy_from_slice(&[slot.at.x, slot.at.y, slot.at.z, slot.reach]);
         out[k + 4..k + 8].copy_from_slice(&[lo.x, lo.y, lo.z, slot.mix]);
         out[k + 8..k + 12].copy_from_slice(&[hi.x, hi.y, hi.z, probe_sphere()]);
+        // The fixed spot this slot holds — see [`spot_key`].
+        out[k + 12] = slot.cell.and_then(spot_of).map_or(-1.0, |id| id as f32);
     }
     out
 }

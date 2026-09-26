@@ -277,7 +277,7 @@ pub(crate) struct WaterReflect {
 pub(crate) struct WaterReflectData(pub(crate) [f32; REFLECT_FLOATS]);
 
 /// Where the probe slots sit in [`WaterReflectData`].
-const PROBE_LANES: std::ops::Range<usize> = 48..48 + super::probe::PROBE_SLOT_MAX * 12;
+const PROBE_LANES: std::ops::Range<usize> = 48..48 + super::probe::PROBE_SLOT_MAX * 16;
 /// Where the dome's seven rows sit in [`WaterReflectData`] — `sky0..sky4`, `fog`, `warp`, as
 /// [`crate::sky::dome_uniforms`] hands them to the dome itself. The shader's `WaterReflect::dome`.
 const DOME_LANES: std::ops::Range<usize> = PROBE_LANES.end..PROBE_LANES.end + 28;
@@ -1475,7 +1475,8 @@ pub(super) fn drive_reflection(
         f32::from(pass_behind()),
         ripple_origin(),
         probe_soft(),
-        0.0,
+        // The probes stand on the map's fixed spots, each fragment reading its own region's.
+        f32::from(super::probe::probes_bound(*style)),
     ]);
     let mut dome = crate::sky::dome_uniforms(&light);
     dome[6].z = f32::from(sky_read_snapshot());
@@ -1697,7 +1698,7 @@ mod tests {
     #[test]
     fn the_reflect_block_matches_the_shader_struct() {
         assert_eq!(PROBE_LANES.start, 48);
-        assert_eq!(PROBE_LANES.len(), super::super::probe::PROBE_SLOT_MAX * 12);
+        assert_eq!(PROBE_LANES.len(), super::super::probe::PROBE_SLOT_MAX * 16);
         assert_eq!(DOME_LANES.start, PROBE_LANES.end);
         assert_eq!(DOME_LANES.len(), 7 * 4);
         assert_eq!(MARCH_LANES.start, DOME_LANES.end);

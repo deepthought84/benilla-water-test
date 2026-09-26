@@ -277,6 +277,8 @@ pub fn run(build: BuildId) -> AppExit {
             if let Err(e) = benilla_assets::register_mpq_source(&mut app, &data_dir) {
                 eprintln!("benilla-assets: mpq:// source unavailable ({e:#})");
             }
+            // The map water classification caches under the state folder; none in a capture.
+            benilla_assets::set_state_dir(crate::local_state::home());
         }
         None => eprintln!(
             "benilla: no WoW install found — looked in {:?}",

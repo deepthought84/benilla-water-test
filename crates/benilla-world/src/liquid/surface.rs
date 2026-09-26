@@ -23,7 +23,7 @@ use benilla_assets::LockRecover;
 use benilla_assets::{liquid_frame_array, RenderConfig, WorldAssets};
 use benilla_formats::{
     read_texture_mip_chain, terrain_height_at, BlpMipChain, ChunkMesh, LiquidKind, LiquidMesh,
-    PlanarMap,
+    PlanarMap, NO_SPOT,
 };
 
 /// The shared liquid materials by [`LiquidKey`]; absent without client data.
@@ -121,6 +121,11 @@ impl LiquidAssets {
     }
 }
 
+/// The map's water classification on an ADT surface: where the probe placement finds the fixed
+/// probe spots.
+#[derive(Component)]
+pub(crate) struct WaterMapRef(pub(crate) std::sync::Arc<PlanarMap>);
+
 /// Marks a spawned liquid surface: one per MCNK liquid layer or WMO group pool.
 #[derive(Component)]
 pub(crate) struct LiquidSurface;
@@ -152,8 +157,8 @@ pub(crate) fn spawn_liquids<'a>(
     // rises through the water plane, and nothing in the liquid data alone records it
     // ([`shore_distances`]).
     chunks: &[ChunkMesh],
-    // Which of the tile's water the mirrors serve, judged with its neighbours by the tile's loader.
-    planar: Option<&PlanarMap>,
+    // The map's water classification: which water the mirrors serve, where the probes stand.
+    planar: Option<&std::sync::Arc<PlanarMap>>,
     liquid_assets: Option<&LiquidAssets>,
     meshes: &mut Assets<Mesh>,
     entities: &mut Vec<Entity>,
@@ -172,8 +177,7 @@ pub(crate) fn spawn_liquids<'a>(
             continue; // this kind's frames failed to load (warned at setup)
         };
         let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
-            .with_planes(planar.map(|p| p.planes(lq)))
-            .with_anchors(planar.map(|p| p.anchors(lq)));
+            .with_planes(planar.map(|p| p.planes(lq)));
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
         entities.push(
             commands
@@ -182,7 +186,8 @@ pub(crate) fn spawn_liquids<'a>(
                         lq,
                         None,
                         lattice.as_ref(),
-                        planar,
+                        planar.map(|p| &**p),
+                        true,
                         shoreline.as_ref(),
                     ))),
                     MeshMaterial3d(material),
@@ -206,6 +211,11 @@ pub(crate) fn spawn_liquids<'a>(
             commands
                 .entity(*entities.last().expect("just pushed"))
                 .insert(FoamPatch);
+        }
+        if let Some(p) = planar {
+            commands
+                .entity(*entities.last().expect("just pushed"))
+                .insert(WaterMapRef(p.clone()));
         }
         // The waterline for the camera sweep under `cameraWaterCollision`; nothing else queries it.
         if let Some(collider) = liquid_collider(lq) {
@@ -661,6 +671,8 @@ fn liquid_bevy_mesh(
     body_color: Option<[f32; 3]>,
     lattice: Option<&WetLattice>,
     planar: Option<&PlanarMap>,
+    // Whether the spot ids are this batch's map's (ADT) and not a WMO placement's own.
+    bind_spots: bool,
     shoreline: Option<&Shoreline>,
 ) -> Mesh {
     let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
@@ -700,7 +712,8 @@ fn liquid_bevy_mesh(
     let mut uv1: Vec<[f32; 2]> = Vec::new();
     let mut shore_offsets: Vec<[f32; 2]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut planar_w: Vec<f32> = Vec::new();
+    let mut planar_w: Vec<[f32; 4]> = Vec::new();
+    let cell_water = planar.map(|p| p.cells(lq));
     let mut indices: Vec<u32> = Vec::new();
     let corner_n = corner_normals(lq, level);
     let corner_w: Vec<f32> = lq
@@ -753,7 +766,18 @@ fn liquid_bevy_mesh(
                         .lerp(Vec3::from(cn(2)).lerp(Vec3::from(cn(3)), fu), fv);
                     normals.push(wow_to_bevy(blend.normalize_or(Vec3::Z).to_array()).to_array());
                     let cw = |k: usize| corner_w[corner[k]];
-                    planar_w.push(mix(mix(cw(0), cw(1), fu), mix(cw(2), cw(3), fu), fv));
+                    let here = cell_water
+                        .as_ref()
+                        .and_then(|c| c.get(j * xt + i))
+                        .filter(|_| bind_spots);
+                    let (lo, hi, share) =
+                        here.map_or((NO_SPOT, NO_SPOT, 0.0), |c| (c.spots[0], c.spots[1], c.mix));
+                    planar_w.push([
+                        mix(mix(cw(0), cw(1), fu), mix(cw(2), cw(3), fu), fv),
+                        f32::from(lo),
+                        f32::from(hi),
+                        share,
+                    ]);
                 }
             }
             let stride = (sub + 1) as u32;
@@ -787,7 +811,7 @@ fn liquid_bevy_mesh(
         benilla_assets::materials::ATTRIBUTE_WOW_SURFACE_NORMAL,
         normals,
     );
-    // How far a planar mirror may serve this water, 0 on probe water; see `liquid::planar`.
+    // The mirrors' weight, 0 on probe water, and the probe spots read; see `ATTRIBUTE_WOW_PLANAR`.
     mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_PLANAR, planar_w);
     // An interior pool's `MOMT.diffColor` rides the vertex colour, where the reference's interior
     // vertex carries it, keeping one material per lane; other lanes take the shader's white.
@@ -847,7 +871,9 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         }
         let surface = commands
             .spawn((
-                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color, lattice, planar, None))),
+                Mesh3d(meshes.add(liquid_bevy_mesh(
+                    lq, body_color, lattice, planar, false, None,
+                ))),
                 MeshMaterial3d(material),
                 transform,
                 LiquidSurface,
@@ -864,8 +890,7 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         // Every kind carries the swim grid, so lava and slime swim; their damage is not modelled.
         commands.entity(surface).insert(
             wet_footprint(lq, &transform, LiquidSource::WmoGroup(pool))
-                .with_planes(planar.map(|p| p.planes(lq)))
-                .with_anchors(planar.map(|p| p.anchors(lq))),
+                .with_planes(planar.map(|p| p.planes(lq))),
         );
         if !lq.kind.is_fullbright() {
             commands.entity(surface).insert(FoamPatch);
@@ -1220,7 +1245,7 @@ mod tests {
             .collect();
         lq.uvs = vec![[0.0, 0.0]; 9];
         lq.depths = vec![1.0; 9];
-        let mesh = liquid_bevy_mesh(&lq, Some([1.0, 1.0, 1.0]), None, None, None);
+        let mesh = liquid_bevy_mesh(&lq, Some([1.0, 1.0, 1.0]), None, None, false, None);
         let n = mesh.count_vertices();
         assert_eq!(n, 16, "four wet cells, four corners each");
         for (attr, values) in mesh.attributes() {

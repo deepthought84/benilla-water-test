@@ -166,8 +166,6 @@ pub struct WaterChunkInfo {
     /// Per cell, the mirror plane it votes for, its section's height (`liquid::planar`), NaN on
     /// probe water; empty when every cell votes its own surface.
     planes: Vec<f32>,
-    /// Per cell, whether it is the middle of probe water, where the probe may stand; empty: none.
-    anchors: Vec<bool>,
 }
 
 /// A surface's vertex grid in world WoW space and its lattice basis. A MODF placement is affine, so
@@ -286,7 +284,6 @@ impl WaterChunkInfo {
                     fallback_z: f32::MIN,
                 },
                 planes: Vec::new(),
-                anchors: Vec::new(),
             };
         }
         let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
@@ -333,7 +330,6 @@ impl WaterChunkInfo {
                 fallback_z,
             },
             planes: Vec::new(),
-            anchors: Vec::new(),
         }
     }
 
@@ -344,43 +340,6 @@ impl WaterChunkInfo {
             self.planes = p;
         }
         self
-    }
-
-    /// Does this surface hold a cell the probe may stand on?
-    pub(crate) fn has_probe_anchor(&self) -> bool {
-        self.anchors
-            .iter()
-            .zip(&self.grid.wet)
-            .any(|(a, w)| *a && *w)
-    }
-
-    /// Which cells are the middle of probe water, where the probe may stand (`liquid::planar`).
-    pub(crate) fn with_anchors(mut self, anchors: Option<Vec<bool>>) -> Self {
-        if let Some(a) = anchors.filter(|a| a.len() == self.grid.wet.len()) {
-            self.anchors = a;
-        }
-        self
-    }
-
-    /// The centre of this surface's probe-anchor cell nearest WoW `(x, y)`, on the water (WoW XYZ),
-    /// and its squared horizontal distance; `None` without one.
-    pub(crate) fn nearest_probe_anchor(&self, x: f32, y: f32) -> Option<([f32; 3], f32)> {
-        let cells_x = self.grid.cols.checked_sub(1)?;
-        let mut best: Option<([f32; 3], f32)> = None;
-        for cell in (0..self.anchors.len()).filter(|&c| self.anchors[c] && self.grid.wet[c]) {
-            let (i, j) = (cell % cells_x, cell / cells_x);
-            let corners = [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)]
-                .map(|(a, b)| self.grid.positions[b * self.grid.cols + a]);
-            let cx = corners.iter().map(|p| p[0]).sum::<f32>() / 4.0;
-            let cy = corners.iter().map(|p| p[1]).sum::<f32>() / 4.0;
-            let d2 = (cx - x) * (cx - x) + (cy - y) * (cy - y);
-            if best.is_some_and(|(_, bd)| bd <= d2) {
-                continue;
-            }
-            let z = self.grid.height_in_cell(i, j, 0.5, 0.5);
-            best = Some(([cx, cy, z], d2));
-        }
-        best
     }
 
     /// Does any wet cell of this surface vote for a mirror plane?

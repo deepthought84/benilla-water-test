@@ -96,6 +96,21 @@ impl Chain {
         Ok(Self { archives })
     }
 
+    /// A hash of the mounted archives' paths, sizes and modification times: what a cache derived
+    /// from this chain's contents is keyed on, so a patched install invalidates it.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for a in &self.archives {
+            a.path().hash(&mut h);
+            if let Ok(meta) = std::fs::metadata(a.path()) {
+                meta.len().hash(&mut h);
+                meta.modified().ok().hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
     /// The highest-priority archive with an entry for `name`, a delete marker included, as a
     /// tombstone shadows every lower copy: check [`Archive::is_delete_marker`] for a readable file.
     fn resolve(&self, name: &str) -> Option<&Archive> {

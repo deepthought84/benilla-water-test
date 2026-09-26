@@ -256,7 +256,8 @@ pub(crate) use reflect::ReflectionCamera;
 pub use reflect::{mirror_view_shape, UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER};
 pub(crate) use spatial::{maintain_water_index, WaterIndex};
 pub(crate) use surface::{
-    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WetLattice,
+    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WaterMapRef,
+    WetLattice,
 };
 
 /// `WOW_FORCE_SUB=<frames>`: hold the camera-eye verdict submerged for the first `<frames>` frames,

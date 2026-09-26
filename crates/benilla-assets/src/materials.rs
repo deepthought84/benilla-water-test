@@ -466,16 +466,18 @@ pub const ATTRIBUTE_WOW_SURFACE_NORMAL: bevy::mesh::MeshVertexAttribute =
         bevy::render::render_resource::VertexFormat::Float32x3,
     );
 
-/// How far a planar mirror may serve this water, 0 to 1 per vertex: 0 on falls, descending rivers
-/// and small pools (`benilla_world::liquid::planar`), ramping to 1 over a few cells, so the mirror
-/// fades into the cube probe beneath it. Read by the stylised lane only; 1 on a mesh without it.
+/// Per vertex, the water's two reflection tiers (`benilla_formats::PlanarMap`): `x` how far the
+/// planar mirrors serve it, 0 on probe water ramping to 1 over a few cells; `y`, `z` the two probe
+/// spots it reads, lower id first (65535: none); `w` the second spot's share. The spot ids are
+/// constant across a cell, so interpolation leaves them whole. Read by the stylised lane only;
+/// `(1, 65535, 65535, 0)` on a mesh without it.
 ///
 /// Own attribute id and shader location 12, beside [`ATTRIBUTE_WOW_SURFACE_NORMAL`].
 pub const ATTRIBUTE_WOW_PLANAR: bevy::mesh::MeshVertexAttribute =
     bevy::mesh::MeshVertexAttribute::new(
         "Wow_Planar",
         988_540_923,
-        bevy::render::render_resource::VertexFormat::Float32,
+        bevy::render::render_resource::VertexFormat::Float32x4,
     );
 
 impl MaterialExtension for LiquidExt {

@@ -102,6 +102,9 @@ struct ProbeSlot {
     box_min: vec4<f32>,
     // w = the sphere proxy's radius, 0 meaning "use the box".
     box_max: vec4<f32>,
+    // x = the fixed probe spot this slot holds (`benilla_formats::PlanarMap`), -1 for none; yzw
+    // spare.
+    bind: vec4<f32>,
 };
 
 // ---- dome law: begin (shared verbatim by `sky.wgsl` and `liquid.wgsl`) ----------------------
@@ -248,7 +251,8 @@ struct WaterReflect {
     dome: DomeColors,
     // The march's own switches. `x` = rays may pass BEHIND a tile once they are behind the
     // thickness slab of its farthest surface (`$WOW_SSR_PASS_BEHIND=0` turns it off — see
-    // [`ssr_trace`]); `yzw` reserved.
+    // [`ssr_trace`]); `y` = the ripple's shift of the ray origin; `z` = the probe's softening; `w` = 1
+    // when the probes stand on fixed spots and each fragment reads its own region's (the planar lane).
     march: vec4<f32>,
     // The second planar mirror: the same four as `params` (plane, strength, distortion,
     // tolerance), zero while it is off.
@@ -304,8 +308,9 @@ struct LiquidVsOut {
     @location(8) @interpolate(flat) room_fog: u32,
     // The heightfield's smooth normal, world space; zero on a mesh without it.
     @location(9) surface_normal: vec3<f32>,
-    // How far a planar mirror may serve this water (`ATTRIBUTE_WOW_PLANAR`); 1 without it.
-    @location(10) planar: f32,
+    // The two reflection tiers' split (`ATTRIBUTE_WOW_PLANAR`): x the mirrors' weight, y z the two
+    // probe spots read, w the second's share.
+    @location(10) planar: vec4<f32>,
 }
 
 // Sun sheen (`secondary`): the Blinn highlight `light_spec.rgb · (N·H)^shininess`.
@@ -1699,8 +1704,9 @@ fn stylised_water(
     shore_offset: vec2<f32>,
     // The heightfield's smooth normal (zero where the mesh has none).
     smooth_normal: vec3<f32>,
-    /// How far a planar mirror may serve this water, 0 to 1 — see `ATTRIBUTE_WOW_PLANAR`.
-    planar: f32,
+    /// The mirrors' weight, then the two probe spots and the second's share — see
+    /// `ATTRIBUTE_WOW_PLANAR`.
+    planar: vec4<f32>,
     shallow: vec4<f32>,
     deep: vec4<f32>,
     lit: vec3<f32>,
@@ -1954,6 +1960,8 @@ fn stylised_water(
     // probe out of the taps, and it takes a tap only at the weight of the probe it replaces, which
     // is where both sit at zero above the cutoff. Ranked by distance, a probe arriving at nearly
     // zero strength displaced a contributing one on its first frame, and the water blinked.
+    // `march.w`: the probes stand on fixed spots and each fragment reads its own.
+    let bound = water_reflect.march.w > 0.5;
     var idx = array<i32, 4>(-1, -1, -1, -1);
     var wt = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
     for (var i = 0; i < PROBE_SLOT_MAX; i = i + 1) {
@@ -1964,7 +1972,15 @@ fn stylised_water(
         // Horizontal distance: probes stand on the water they answer for, so the vertical component
         // is noise from the lift.
         // Availability times share (`box_min.w`, 1 except in the live probe's crossfade).
-        let u = sl.at.w * sl.box_min.w / max(distance(world_pos.xz, sl.at.xz), 1e-4);
+        var u = sl.at.w * sl.box_min.w / max(distance(world_pos.xz, sl.at.xz), 1e-4);
+        // Bound to fixed spots (the planar lane): a fragment reads only its own region's probes, by
+        // the share its cell gives each — never the nearest probe of some other water.
+        if (bound) {
+            let id = sl.bind.x;
+            let own = select(0.0, 1.0 - planar.w, abs(id - planar.y) < 0.5)
+                + select(0.0, planar.w, abs(id - planar.z) < 0.5);
+            u = sl.at.w * sl.box_min.w * own;
+        }
         // Insertion into the short list, heaviest first, shifting the tail down.
         for (var k = 0; k <= taps; k = k + 1) {
             if (u > wt[k]) {
@@ -2013,12 +2029,18 @@ fn stylised_water(
             }
             let sl = water_reflect.probes[idx[k]];
             let share = w[k] / wsum;
-            strength = strength + share * sl.at.w * probe_weight(
-                world_pos,
-                sl.at.xyz,
-                water_reflect.probe_cfg.y,
-                water_reflect.probe_cfg.z,
+            // A bound probe serves its whole region, so it does not fade with distance from it.
+            let falloff = select(
+                probe_weight(
+                    world_pos,
+                    sl.at.xyz,
+                    water_reflect.probe_cfg.y,
+                    water_reflect.probe_cfg.z,
+                ),
+                1.0,
+                bound,
             );
+            strength = strength + share * sl.at.w * falloff;
             probe_rgb = probe_rgb
                 + sample_probe(sl, idx[k], probe_pos, r, i32(water_reflect.probe_extra.w)) * share;
         }
@@ -2277,7 +2299,7 @@ fn stylised_water(
     // Each mirror serves the water near its own plane: its colour and its weight here — strength
     // times coverage times trust. Where both reach a fragment they blend by weight.
     // Off probe water the mirrors stand down, so the probe beneath them shows through.
-    let serve = vec4<f32>(1.0, 1.0, 1.0, smoothstep(0.0, 1.0, planar));
+    let serve = vec4<f32>(1.0, 1.0, 1.0, smoothstep(0.0, 1.0, planar.x));
     let m1 = planar_read(water_reflect.params, false, world_pos, n, frag_coord, tilt) * serve;
     let m2 = planar_read(water_reflect.mirror2, true, world_pos, n, frag_coord, tilt) * serve;
     // The colour favours the mirror whose plane is nearer this water — both are trusted across
@@ -2579,7 +2601,7 @@ struct LiquidVertex {
     @location(11) surface_normal: vec3<f32>,
 #endif
 #ifdef LIQUID_PLANAR
-    @location(12) planar: f32,
+    @location(12) planar: vec4<f32>,
 #endif
 }
 
@@ -2600,7 +2622,7 @@ fn vertex(in: LiquidVertex) -> LiquidVsOut {
 #ifdef LIQUID_PLANAR
     out.planar = in.planar;
 #else
-    out.planar = 1.0;
+    out.planar = vec4<f32>(1.0, 65535.0, 65535.0, 0.0);
 #endif
     out.uv = in.uv;
 #ifdef VERTEX_COLORS
