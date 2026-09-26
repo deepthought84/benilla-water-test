@@ -51,7 +51,12 @@ struct WowLight {
 
 // The vertex-to-fragment payload; `specular` is clamped per vertex, then Gouraud-interpolated.
 struct TerrainVsOut {
-    @builtin(position) clip_position: vec4<f32>,
+    // `@invariant`, because this lane is in the DEPTH PREPASS. Bevy's prepass computes the same
+    // position in its own shader and the main pass then tests `GreaterEqual` against what it wrote;
+    // two compilations of one expression are not otherwise obliged to agree to the last bit, and a
+    // position one ULP short is a discarded fragment rather than a slightly wrong one. It cost
+    // nothing measurable here and is the standard guard for a material that draws in both passes.
+    @builtin(position) @invariant clip_position: vec4<f32>,
     @location(0) world_position: vec4<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) uv_b: vec2<f32>,

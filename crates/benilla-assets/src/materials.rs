@@ -122,6 +122,12 @@ pub struct WowModelExt {
 }
 
 impl MaterialExtension for WowModelExt {
+    /// Out of the depth prepass: `specialize` rebuilds the vertex layout around attributes Bevy's
+    /// prepass shader does not declare.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     /// Bevy's mesh vertex plus the point-light term, per vertex like the reference's FFP.
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wow_model.wgsl".into()
@@ -324,6 +330,23 @@ pub struct WdlExt {
 }
 
 impl MaterialExtension for WdlExt {
+    /// **Out of the depth prepass**, for the reason the model lane is out of it: a pass that cannot
+    /// reproduce this material's discards writes depth for fragments the main pass throws away.
+    ///
+    /// The WDL hull is the coarse horizon, and its fragment stage cuts everything NEARER than
+    /// `farclip − 33` so the fine terrain owns the near field. Bevy's stock prepass has no such cut,
+    /// so an armed prepass wrote the whole hull's depth — including the near part that never draws.
+    /// The coarse surface sits above the fine one wherever the ground is flat, which is exactly the
+    /// river valleys and lake beds, so the detailed terrain there failed `GreaterEqual` against a
+    /// horizon that was not drawn either, and the sky came through the hole. That is the
+    /// "terrain vanishes wherever a river or lake runs over it" this whole prepass has been off for.
+    ///
+    /// Opting out costs the water nothing: it measures its column against the real terrain, and the
+    /// coarse hull only exists past the far-clip wall where there is no water to measure.
+    fn enable_prepass() -> bool {
+        false
+    }
+
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/wdl.wgsl".into()
     }
@@ -344,6 +367,45 @@ pub struct LiquidExt {
     #[texture(100, dimension = "2d_array", visibility(fragment))]
     #[sampler(101, visibility(fragment))]
     pub frames: Handle<Image>,
+    /// The stylised look's generated ripple map (`benilla_world::liquid::ripple`): R/G a tiling
+    /// slope field, B its height.
+    #[texture(103, visibility(fragment))]
+    #[sampler(104, visibility(fragment))]
+    pub ripples: Handle<Image>,
+    /// The first planar mirror's capture (`benilla_world::liquid::reflect`), alpha as coverage.
+    #[texture(105, visibility(fragment))]
+    #[sampler(106, visibility(fragment))]
+    pub reflection: Handle<Image>,
+    /// The second planar mirror's capture, for a second water height in view; read through the
+    /// first one's sampler.
+    #[texture(110, visibility(fragment))]
+    pub reflection2: Handle<Image>,
+    /// The stylised look's live wave field (`benilla_world::liquid::ripple_sim`): R/G slope, B foam.
+    #[texture(108, visibility(fragment))]
+    #[sampler(109, visibility(fragment))]
+    pub wake: Handle<Image>,
+    /// The opaque scene before transparents (`benilla_world::liquid::scene_color`), which the
+    /// screen-space march reads its hits from.
+    #[texture(111, visibility(fragment))]
+    #[sampler(112, visibility(fragment))]
+    pub scene_color: Handle<Image>,
+    /// The cubemap reflection probes (`benilla_world::liquid::probe`), one cube per array slice.
+    #[texture(113, dimension = "cube_array", visibility(fragment))]
+    #[sampler(114, visibility(fragment))]
+    pub probe: Handle<Image>,
+    /// The march's nearest-depth pyramid (`benilla_world::liquid::hiz`), read by `textureLoad`.
+    #[texture(115, sample_type = "float", filterable = false, visibility(fragment))]
+    pub hiz: Handle<Image>,
+    /// The farthest-depth twin of [`Self::hiz`], which lets the march pass behind a tile.
+    #[texture(117, sample_type = "float", filterable = false, visibility(fragment))]
+    pub hiz_far: Handle<Image>,
+    /// `$WOW_SSR_PIP`'s image (`benilla_world::liquid::ssr_pip`); 1x1 while it is off.
+    #[storage_texture(116, image_format = Rgba16Float, access = WriteOnly, visibility(fragment))]
+    pub ssr_pip: Handle<Image>,
+    /// The reflection's per-frame parameters (`benilla_world::liquid::reflect`), a buffer so the
+    /// per-frame write does not rebuild every liquid material's bind group.
+    #[storage(107, read_only, buffer, visibility(fragment))]
+    pub reflect_buf: Buffer,
     /// Which lanes of the shared light this surface reads:
     /// - `x` = fullbright (magma, slime): the sheet is the opaque body.
     /// - `y` = ocean: rows 15/16 (`Light.dbc` IntBand 14/15), else rows 13/14 (IntBand 16/17).
@@ -355,6 +417,8 @@ pub struct LiquidExt {
     pub kind: Vec4,
     /// `x` = the renderer (`liquid::surface::LiquidPath`): `0` ADT MCLQ, `1` WMO exterior, `2` WMO
     /// interior.
+    /// `y` = the stylised look (`benilla_world::liquid::WaterStyle`), rewritten on toggle. `z` =
+    /// magma rather than slime, read by the stylised lane only.
     #[uniform(102)]
     pub path: Vec4,
     /// `y` = frame count, `z` = scroll flag, `w` = clock enable.
@@ -365,6 +429,43 @@ pub struct LiquidExt {
     pub light_buf: Buffer,
 }
 
+/// A liquid vertex's **offset to the nearest point on the waterline**, in world XZ yards
+/// (`benilla_world::liquid::surface`).
+///
+/// It replaces carrying the shore DISTANCE and interpolating that, and the difference is the whole
+/// point. Distance to a curve is not a linear function — it has a V-shaped crease along the curve
+/// itself — so interpolating it across a triangle cuts that crease's corner, and where the crease
+/// falls inside a triangle the reconstructed zero lands in the wrong place by up to half a vertex
+/// spacing. With a foam band a fifth of a yard wide drawn from vertices half a yard apart, that is
+/// most of a band, and it is why the line jogged, thinned and doubled as the camera moved along it.
+///
+/// The offset has no crease: `nearest − position` is smooth wherever the nearest point is, and both
+/// terms interpolate linearly, so the interpolated offset is exactly the offset of the interpolated
+/// point. Taking its LENGTH in the fragment shader puts the non-linearity where it belongs, after
+/// interpolation, and the band comes out the same width everywhere at any mesh density.
+///
+/// Own attribute id and shader location 10, for the same reason the rig's attributes have theirs —
+/// Bevy's builtin set ends at 7 and a mesh must not accidentally look like one of its lanes.
+pub const ATTRIBUTE_WOW_SHORE_OFFSET: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_ShoreOffset",
+        988_540_921,
+        bevy::render::render_resource::VertexFormat::Float32x2,
+    );
+
+/// The water surface's **smooth normal**, mesh-local: each lattice corner's normal from its
+/// neighbours' heights, blended bilinearly to the vertex — so the reflection direction bends
+/// smoothly across a sloping stream instead of stepping at every triangle edge. Read by the
+/// stylised lane only; `ATTRIBUTE_NORMAL` stays flat for the reference lane's lighting.
+///
+/// Own attribute id and shader location 11, beside [`ATTRIBUTE_WOW_SHORE_OFFSET`].
+pub const ATTRIBUTE_WOW_SURFACE_NORMAL: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_SurfaceNormal",
+        988_540_922,
+        bevy::render::render_resource::VertexFormat::Float32x3,
+    );
+
 impl MaterialExtension for LiquidExt {
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
@@ -373,18 +474,55 @@ impl MaterialExtension for LiquidExt {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
     }
 
+    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`] and [`ATTRIBUTE_WOW_SURFACE_NORMAL`] into the vertex
+    /// layout, each behind its shader def, since Bevy builds the layout from its own attributes only.
+    ///
     /// `sky_order::WATER_BIAS` (−2e4) is a sort rung, kept out of the rasterizer: as a depth-bias
     /// constant it would move the waterline, by an amount that doubles at every float exponent
     /// boundary, so neighbouring triangles' shorelines would disagree.
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
-        _layout: &MeshVertexBufferLayoutRef,
+        layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // Clear the depth bias that StandardMaterial would have added
         if let Some(ds) = descriptor.depth_stencil.as_mut() {
             ds.bias.constant = 0;
         }
+
+        // Our own attributes, where the mesh carries them, each behind its shader def.
+        let ours = [
+            (ATTRIBUTE_WOW_SHORE_OFFSET, 10, "LIQUID_SHORE_OFFSET"),
+            (ATTRIBUTE_WOW_SURFACE_NORMAL, 11, "LIQUID_SURFACE_NORMAL"),
+        ];
+        if !ours.iter().any(|(a, _, _)| layout.0.contains(*a)) {
+            return Ok(());
+        }
+        let mut attrs = Vec::with_capacity(8);
+        for (attr, loc) in [
+            (Mesh::ATTRIBUTE_POSITION, 0),
+            (Mesh::ATTRIBUTE_NORMAL, 1),
+            (Mesh::ATTRIBUTE_UV_0, 2),
+            (Mesh::ATTRIBUTE_UV_1, 3),
+            (Mesh::ATTRIBUTE_TANGENT, 4),
+            (Mesh::ATTRIBUTE_COLOR, 5),
+        ] {
+            if layout.0.contains(attr) {
+                attrs.push(attr.at_shader_location(loc));
+            }
+        }
+        for (attr, loc, def) in ours {
+            if !layout.0.contains(attr) {
+                continue;
+            }
+            attrs.push(attr.at_shader_location(loc));
+            descriptor.vertex.shader_defs.push(def.into());
+            if let Some(f) = descriptor.fragment.as_mut() {
+                f.shader_defs.push(def.into());
+            }
+        }
+        descriptor.vertex.buffers = vec![layout.0.get_layout(&attrs)?];
         Ok(())
     }
 }

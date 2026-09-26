@@ -137,9 +137,11 @@ pub(crate) const MINIMAP_COMPOSITE_LAYER: usize = WARM_ORTHO_LAYER + 1;
 /// The UI model tiles' layer (`crate::ui_models`): every `<Model>` widget's M2 renders into one
 /// atlas through one camera on it.
 pub(crate) const UI_MODELS_LAYER: usize = MINIMAP_COMPOSITE_LAYER + 1;
+/// The pipe_warm warm mirror's layer, next past the UI model tiles'.
+pub(crate) const WARM_MIRROR_LAYER: usize = UI_MODELS_LAYER + 1;
 /// The first perspective model pane layer: a `<Model>` framed by its own camera needs a camera,
 /// and so a layer, of its own. The block tops the ladder so it can widen.
-pub(crate) const UI_MODEL_CAM_LAYER_BASE: usize = UI_MODELS_LAYER + 1;
+pub(crate) const UI_MODEL_CAM_LAYER_BASE: usize = WARM_MIRROR_LAYER + 1;
 /// How many perspective model panes draw at once; a ninth draws nothing.
 pub(crate) const UI_MODEL_CAM_LAYERS: usize = 8;
 
@@ -160,12 +162,20 @@ const _: () = assert!(
         && WARM_ORTHO_LAYER > WARM_BOOTH_LAYER
         && MINIMAP_COMPOSITE_LAYER > WARM_ORTHO_LAYER
         && UI_MODELS_LAYER > MINIMAP_COMPOSITE_LAYER
-        && UI_MODEL_CAM_LAYER_BASE > UI_MODELS_LAYER,
+        && WARM_MIRROR_LAYER > UI_MODELS_LAYER
+        && UI_MODEL_CAM_LAYER_BASE > WARM_MIRROR_LAYER,
     "booth render layers must be distinct — see GLUE_LAYER"
 );
 const _: () = assert!(
     PAPERDOLL_LAYER > PORTRAIT_LAYER_BASE + SLOTS.len() - 1,
     "booth layers must not overlap the per-slot portrait layers"
+);
+// The liquid render layers sit outside this ladder, above its head, and must stay there: a booth
+// on water's layer would draw lakes into a portrait and take water out of the mirror's exclusion.
+const _: () = assert!(
+    UI_MODEL_CAM_LAYER_BASE + UI_MODEL_CAM_LAYERS - 1
+        < benilla_world::liquid::UNMIRRORED_RENDER_LAYER,
+    "the booth ladder must stay clear of the liquid render layers"
 );
 /// The round portraits' bake size, square (the reference bakes 64²); `ui_quad.wgsl`'s `circular`
 /// cuts the circle at draw time.

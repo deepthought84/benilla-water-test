@@ -358,6 +358,8 @@ struct CaptureCtx {
     /// `$WOW_RESIZE` is applied (once, at first settle).
     resized: bool,
     probe_samples: Vec<f32>,
+    /// The `$WOW_GPU_MS=1` meter's GPU milliseconds over the window; empty when it is off.
+    gpu_samples: Vec<f32>,
     /// Process CPU seconds at the first sample, the baseline for the probe line's `cpu_ms`.
     probe_cpu_start: Option<f64>,
     /// Wall-clock start of the run ([`capture_deadline`]). A real [`Instant`]: under the frozen
@@ -664,6 +666,7 @@ impl Plugin for CapturePlugin {
                 frozen_clock: true,
                 resized: false,
                 probe_samples: Vec::new(),
+                gpu_samples: Vec::new(),
                 probe_cpu_start: None,
                 started: Instant::now(),
                 deadline: capture_deadline(),
@@ -780,6 +783,9 @@ fn drive_capture(
     mut time_strategy: ResMut<TimeUpdateStrategy>,
     // `None` on a glue-screen capture, which builds no composite lane.
     backdrop: Option<Res<crate::world_backdrop::WorldBackdrop>>,
+    // `$WOW_GPU_MS=1`'s whole-frame GPU clock — `None` when the meter is off, because nothing
+    // registers then. See [`CaptureCtx::gpu_samples`] for why a vista probe needs it at all.
+    gpu: Option<Res<crate::perf::GpuMsShared>>,
 ) {
     // The wall-clock ceiling covers every phase: a fixture may never attach, a readback may never
     // land ([`capture_deadline`]).
@@ -941,6 +947,13 @@ fn drive_capture(
         Phase::Probing(n) => {
             let ms = time.delta_secs() * 1000.0;
             ctx.probe_samples.push(ms);
+            // The meter reads zero until its first delta lands; a zero is "not yet" and is dropped.
+            if let Some(gpu) = gpu.as_ref() {
+                let ns = gpu.0.load(std::sync::atomic::Ordering::Relaxed);
+                if ns > 0 {
+                    ctx.gpu_samples.push(ns as f32 / 1.0e6);
+                }
+            }
             // `==`, not `>=`: `AppExit` takes a frame or two to drain, and `>=` would print twice.
             if n + 1 == ctx.probe_frames {
                 let mut v = ctx.probe_samples.clone();
@@ -984,9 +997,26 @@ fn drive_capture(
                     .single()
                     .map(|w| format!(" present={:?}", w.present_mode))
                     .unwrap_or_default();
+                // The GPU meter's percentiles over the window (`$WOW_GPU_MS=1`), empty when it is off.
+                let gpu_line = if ctx.gpu_samples.is_empty() {
+                    String::new()
+                } else {
+                    let mut g = ctx.gpu_samples.clone();
+                    g.sort_by(f32::total_cmp);
+                    let gat = |q: f32| g[(((g.len() - 1) as f32) * q).round() as usize];
+                    let gmean = g.iter().sum::<f32>() / g.len() as f32;
+                    format!(
+                        " gpu_n={} gpu_mean={gmean:.2} gpu_p50={:.2} gpu_p95={:.2} gpu_p99={:.2} gpu_max={:.2}",
+                        g.len(),
+                        gat(0.50),
+                        gat(0.95),
+                        gat(0.99),
+                        g[g.len() - 1],
+                    )
+                };
                 // One greppable line on stdout, clear of log filtering.
                 println!(
-                    "FPS_PROBE scenario={} frames={} mean_ms={mean:.2} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} fps={:.1} emitters={emitters} active={active} particles={live} submeshes={submeshes} drawn={drawn} entities={entity_count} px={}x{}{world_px}{cpu}{present}",
+                    "FPS_PROBE scenario={} frames={} mean_ms={mean:.2} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2} fps={:.1} emitters={emitters} active={active} particles={live} submeshes={submeshes} drawn={drawn} entities={entity_count} px={}x{}{world_px}{cpu}{present}{gpu_line}",
                     ctx.name,
                     v.len(),
                     at(0.50),

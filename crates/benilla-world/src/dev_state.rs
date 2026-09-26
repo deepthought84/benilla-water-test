@@ -58,6 +58,33 @@ pub struct DebugState {
     pub lighting: LightingDebug,
     pub sound: SoundDebug,
     pub weather: WeatherDebug,
+    pub water: WaterDebug,
+}
+
+/// Water-instrument state. Both overlays are **off by default**: they answer a question about the
+/// renderer rather than about the world, and a marker floating over a lake is exactly the kind of
+/// thing that quietly ends up in a screenshot.
+///
+/// `$WOW_PROBE_MARKS=1` arms both at boot, which is how a headless capture gets them into frame —
+/// the same reason `$WOW_PANEL` exists. Without it the overlays could only ever be checked by hand
+/// in the director's own window, and an overlay that draws in the wrong place is precisely what a
+/// capture catches for free.
+pub struct WaterDebug {
+    /// Draw the reflection probes on the minimap — green where the water is reading the probe,
+    /// grey where the slot is placed but has no cube yet.
+    pub probe_minimap: bool,
+    /// Draw the same probes in the world, as gizmo rings at the capture points.
+    pub probe_world: bool,
+}
+
+impl Default for WaterDebug {
+    fn default() -> Self {
+        let armed = std::env::var_os("WOW_PROBE_MARKS").is_some();
+        Self {
+            probe_minimap: armed,
+            probe_world: armed,
+        }
+    }
 }
 
 impl Default for DebugState {
@@ -68,6 +95,7 @@ impl Default for DebugState {
             lighting: default(),
             sound: default(),
             weather: default(),
+            water: default(),
         }
     }
 }

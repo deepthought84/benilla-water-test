@@ -27,7 +27,7 @@ use benilla_world::particles::buffer::{
 };
 
 mod menagerie;
-use menagerie::{spawn_menagerie, BoothCamQuery, WarmLanes};
+use menagerie::{spawn_menagerie, spawn_warm_mirror, BoothCamQuery, WarmLanes};
 
 /// The channel between the main and render worlds, aligned to within one frame.
 #[derive(Resource, Clone)]
@@ -381,10 +381,14 @@ fn run_warm_pass(
         // The orthographic twin, the projection class the UI model tile atlas draws through.
         let warm_ortho = crate::ui_models::spawn_warm_tile_cam(&mut commands, &mut lanes.images);
         commands.entity(warm_ortho.0).insert(WarmRig);
+
+        // The warm mirror: the stylised water's mirrored view key, which no other camera has.
+        let warm_mirror = spawn_warm_mirror(&mut commands, &mut lanes.images);
+        commands.entity(warm_mirror.0).insert(WarmRig);
         // The effect lane's stand-in texture, held for the life of the pass.
         warm.effect_tex = Some(lanes.images.add(Image::default()));
         // Every camera the menagerie hangs rigs on, for the census.
-        warm.anchors = vec![cam, warm_booth.0, warm_ortho.0];
+        warm.anchors = vec![cam, warm_booth.0, warm_ortho.0, warm_mirror.0];
         warm.anchors.extend(booth.iter().next().map(|(e, _)| e));
         warm.warmed_views.clear();
         let count = spawn_menagerie(
@@ -393,6 +397,7 @@ fn run_warm_pass(
             booth.iter().next(),
             &warm_booth,
             &warm_ortho,
+            &warm_mirror,
             &mut meshes,
             &mut materials,
             &mut lanes,

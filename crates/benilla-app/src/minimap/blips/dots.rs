@@ -328,6 +328,54 @@ pub(in crate::minimap) fn emit_party_dots(
     }
 }
 
+/// The reflection-probe dot: a little larger than a party dot, because it is a debug marker that
+/// has to be countable at a glance rather than an object competing with the world's own blips.
+const PROBE_DOT_PX: f32 = 7.0;
+
+/// Green where the water is reading the probe, grey where the slot is placed but has no cube yet.
+const PROBE_DOT_LIVE: [f32; 3] = [0.25, 0.95, 0.35];
+const PROBE_DOT_IDLE: [f32; 3] = [0.55, 0.55, 0.58];
+
+/// The water's cubemap reflection probes, as flat dots on the minimap — off unless the debug panel
+/// asks for them.
+///
+/// **What it is for.** The probes sit on a world-anchored lattice and are placed, captured and
+/// retired without anything on screen saying so, which made every question about them
+/// ("is there one near me?", "did walking there re-capture half of them?", "why is the reflection
+/// wrong on this side of the lake?") a matter of reading trace logs. The lattice is a spatial fact
+/// and the minimap is where spatial facts belong.
+///
+/// Flat-shaded quads rather than `ObjectIcons` cells: these are not the reference client's blips and
+/// should not borrow its art, because anything wearing that art reads as part of the game.
+pub(in crate::minimap) fn emit_probe_dots(
+    ctx: &BlipCtx,
+    marks: &benilla_world::liquid::ProbeMarks,
+    quads: &mut UiQuads,
+) {
+    for m in &marks.0 {
+        let w = benilla_assets::coords::bevy_to_wow(m.at);
+        let d = ((w[0] - ctx.wx).powi(2) + (w[1] - ctx.wy).powi(2)).sqrt();
+        if d / ctx.radius_yd > super::BLIP_EDGE_RATIO {
+            continue; // out of range — no rim arrow for these, they are not navigation
+        }
+        // Grey ramps to green with the fade — the dot shows how much the water is taking from this
+        // probe, not a binary the reflection never actually passes through.
+        let c: [f32; 3] = std::array::from_fn(|k| {
+            PROBE_DOT_IDLE[k] + (PROBE_DOT_LIVE[k] - PROBE_DOT_IDLE[k]) * m.fade
+        });
+        quads.overlays.push(UiQuad {
+            rect: Rect::from_center_size(
+                ctx.center + ctx.offset(w),
+                Vec2::splat(ctx.side * (PROBE_DOT_PX / BLIP_BASIS_PX)),
+            ),
+            z_key: ctx.z,
+            texture: None,
+            color: [c[0], c[1], c[2], ctx.alpha],
+            ..default()
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

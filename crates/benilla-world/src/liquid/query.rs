@@ -163,6 +163,9 @@ pub struct WaterChunkInfo {
     source: LiquidSource,
     kind: LiquidKind,
     grid: LiquidGrid,
+    /// How far the wet surface's heights range, in yards: near zero for a lake, several yards for
+    /// a waterfall. See [`Self::height_span`].
+    height_span: f32,
 }
 
 /// A surface's vertex grid in world WoW space and its lattice basis. A MODF placement is affine, so
@@ -280,11 +283,13 @@ impl WaterChunkInfo {
                     inv_det: None,
                     fallback_z: f32::MIN,
                 },
+                height_span: 0.0,
             };
         }
         let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
         let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
         let mut fallback_z = f32::MIN;
+        let (mut z_lo, mut z_hi) = (f32::MAX, f32::MIN);
         for cell in (0..wet.len()).filter(|&c| wet[c]) {
             let (i, j) = (cell % (cols - 1), cell / (cols - 1));
             for (di, dj) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
@@ -294,6 +299,10 @@ impl WaterChunkInfo {
                 min_y = min_y.min(p[1]);
                 max_y = max_y.max(p[1]);
                 fallback_z = fallback_z.max(p[2]);
+                if p[2].abs() < 1.0e8 {
+                    z_lo = z_lo.min(p[2]);
+                    z_hi = z_hi.max(p[2]);
+                }
             }
         }
         // The span-derived basis; a plane on edge has no XY area and leaves `inv_det` `None`.
@@ -325,7 +334,14 @@ impl WaterChunkInfo {
                 inv_det: (det.abs() > 1e-9).then(|| 1.0 / det),
                 fallback_z,
             },
+            height_span: (z_hi - z_lo).max(0.0),
         }
+    }
+
+    /// How far the wet surface's heights range, in yards — what tells a lake or a river reach
+    /// (well under a yard, a couple at most) from a waterfall or a rapid (several).
+    pub(crate) fn height_span(&self) -> f32 {
+        self.height_span
     }
 
     /// The surface height (WoW Z) at a WoW-space XY, `None` where dry: the one wet-or-dry question,

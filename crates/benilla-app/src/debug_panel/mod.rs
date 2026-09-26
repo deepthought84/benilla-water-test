@@ -320,6 +320,7 @@ fn debug_panel_ui(
                         lighting: l,
                         sound: s,
                         weather: w,
+                        water: wa,
                         ..
                     } = &mut *debug;
                     egui::CollapsingHeader::new("World")
@@ -599,6 +600,25 @@ fn debug_panel_ui(
                                         ui.label(egui::RichText::new(line).small().monospace());
                                     }
                                 });
+                        });
+                    // The water tier's own instruments. Both draw the cubemap reflection probes,
+                    // which are otherwise invisible: they are placed on a world-anchored lattice,
+                    // captured one at a time and retired as the player moves, with nothing on screen
+                    // saying so — which made "is there a probe near me?" and "did walking here throw
+                    // half of them away?" questions only a trace log could answer.
+                    egui::CollapsingHeader::new("Water")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "reflection probes — green: the water is reading it; \
+                                     grey: placed, no cube yet",
+                                )
+                                .small()
+                                .color(OVERLAY_TEXT_DIM),
+                            );
+                            ui.checkbox(&mut wa.probe_minimap, "probes on the minimap");
+                            ui.checkbox(&mut wa.probe_world, "probes in the world");
                         });
                 });
 

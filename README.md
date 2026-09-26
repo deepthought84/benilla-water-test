@@ -56,7 +56,7 @@ in a fork, and forks are welcome. GitHub lists
 
 Not planned: other expansions or client versions, Warden (anticheat).
 
-## Running it
+---
 
 benilla builds and runs on macOS, Linux and Windows. You need:
 
@@ -69,7 +69,7 @@ benilla builds and runs on macOS, Linux and Windows. You need:
   Windows the MSVC build tools that the Rust installer sets up.
 
 ```sh
-WOW_DATA=/path/to/WoW/Data cargo run --release -p benilla
+WOW_CAPTURE=water-noon WOW_CAPTURE_OUT=/tmp/shot.png cargo run --release -p benilla
 ```
 
 On Windows, in PowerShell:

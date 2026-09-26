@@ -639,8 +639,9 @@ pub(crate) mod schedule_tests {
     }
 
     /// `PostUpdate`'s undeclared-order pairs on the declared graph; `GlobalTransform` and the
-    /// particle `EffectQuads` are most of it.
-    const POST_UPDATE_CEILING: usize = 371;
+    /// particle `EffectQuads` are most of it. The water cameras and the ripple window against the rig
+    /// and pose writers are `Transform` on disjoint lanes.
+    const POST_UPDATE_CEILING: usize = 386;
     const POST_UPDATE_SLACK: usize = 20;
     /// The actionable pairs in `Update`: conflicting access, no declared order, and nothing
     /// [`Classes`] explains, so the executor orders them however the graph falls. The count may
@@ -669,12 +670,15 @@ pub(crate) mod schedule_tests {
     ///   over the `CastLadder`, the selection and the unit-token resolver: the class
     ///   `drop_item_on_unit` and the world click's legs already carry, as none of those drains
     ///   orders against the target chain. Such a gesture and a script call in one frame take
-    ///   either order.
+    ///   either order;
+    /// - the water's style switch, depth-prepass toggle, layer stamp and probe gizmos against
+    ///   `apply_net_updates` and `finish_colliders` over the world, as `drift::setup_drift`: they
+    ///   touch only water and cameras; the gizmos read `DebugState` a frame late at worst.
     ///
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
     /// that commutes by construction belongs in [`Classes`].
-    const UPDATE_ACTIONABLE_CEILING: usize = 4_956;
+    const UPDATE_ACTIONABLE_CEILING: usize = 4_960;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {

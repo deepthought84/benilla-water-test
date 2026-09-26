@@ -112,6 +112,56 @@ const FLARE_RAYS_PER_FRAME: u32 = 2;
 /// The visible fraction of the body's quad against terrain, a ray grid over its extent; the
 /// reference takes `visiblePixels / projectedArea` of the disc's quad from a GPU occlusion query
 /// (`0x7e5220`), WMOs and doodads included. The tests' oracle for the live drip.
+/// Publish [`super::SunVisibility`]: the sun the world is lit by, with its own [`FlareGate`] (the
+/// gate slews one envelope in a `Local`) and no roof test, since a roof over the camera does not
+/// shade a surface elsewhere.
+pub(super) fn publish_sun_visibility(
+    light: Res<WowLighting>,
+    mut gate: FlareGate,
+    mut vis: ResMut<super::SunVisibility>,
+    cam: Query<&GlobalTransform, With<WorldCamera>>,
+) {
+    let Some(cam_gt) = cam.iter().next() else {
+        return;
+    };
+    let to_light = light.celestial_dir.normalize_or_zero();
+    if to_light == Vec3::ZERO {
+        return;
+    }
+    let occ1 = occ1_sun(gate.clouds.coverage(to_light * GLARE_DIST));
+    let half = (0.5 * SUN_SIZE * light.sun_disc_scale).atan();
+    let env = gate.envelope(
+        cam_gt.translation(),
+        to_light,
+        light.sun_flare_dn,
+        occ1,
+        half,
+        SUN_FLARE_RISE,
+        false,
+    );
+    vis.set_if_neq(super::SunVisibility(env));
+}
+
+/// Publish [`super::MoonVisibility`]: the moon is up and cloud is not over it, slewed like the sun.
+pub(super) fn publish_moon_visibility(
+    time: Res<Time>,
+    light: Res<WowLighting>,
+    clouds: Res<CloudCoverage>,
+    mut vis: ResMut<super::MoonVisibility>,
+    mut env: Local<f32>,
+) {
+    let to_moon = light.moon_dir_white.normalize_or_zero();
+    let target = if to_moon == Vec3::ZERO {
+        0.0
+    } else {
+        horizon_gate(to_moon) * occ1_sun(clouds.coverage(to_moon * GLARE_DIST))
+    };
+    // The sun's own slew rates: this is the same kind of quantity, and a body's light arriving or
+    // leaving should take the same time whichever body it is.
+    *env = flare_slew(*env, target, SUN_FLARE_RISE, FLARE_FALL, time.delta_secs());
+    vis.set_if_neq(super::MoonVisibility(*env));
+}
+
 #[cfg(test)]
 fn flare_visible_fraction(
     height_under: impl Fn(Vec3) -> Option<f32>,
@@ -213,9 +263,13 @@ impl FlareGate<'_, '_> {
         occ1: f32,
         half: f32,
         rise: f32,
+        // Whether a roof over the camera kills it: yes for a lens flare, no for light reaching a
+        // surface elsewhere (see [`super::SunVisibility`]).
+        roofed_by_camera: bool,
     ) -> f32 {
         let base = dn * horizon_gate(dir) * occ1 * submersion_glare_fade(self.submerged.depth);
-        let target = if base > 0.0 && self.camera_interior.0.is_none() {
+        let indoors = roofed_by_camera && self.camera_interior.0.is_some();
+        let target = if base > 0.0 && !indoors {
             // Resident ADT terrain first, the whole-map WDL surface elsewhere.
             let (streamer, adt_tiles, wdl) = (&self.streamer, &self.adt_tiles, &self.wdl);
             let tile = std::cell::RefCell::new(None);
@@ -291,6 +345,7 @@ pub(super) fn follow_sun(
         occ1,
         sun_half,
         SUN_FLARE_RISE,
+        true,
     );
     for (mut tf, mut gt, sprite, mat) in &mut sprites {
         tf.rotation = rot;
@@ -385,6 +440,7 @@ pub(super) fn follow_moons(
             occ1,
             moon_half,
             MOON_FLARE_RISE,
+            true,
         )
     };
     for (mut tf, mut gt, moon, mat) in &mut sprites {

@@ -150,6 +150,7 @@ pub(super) fn cull_cells(
     windows: Res<crate::wmo_portal::ExteriorWindows>,
     claim: Res<crate::wmo_portal::CameraInteriorClaim>,
     instances: Query<&crate::wmo_portal::WmoPortalInstance>,
+    probe_cull: Option<Res<crate::liquid::ProbeCull>>,
 ) {
     let _t = super::gx_perf_guard(1);
     for e in gx.pending_despawn.drain(..) {
@@ -177,6 +178,12 @@ pub(super) fn cull_cells(
     };
     let cam_pos = cam_t.translation();
     let cam_fwd = Vec3::from(cam_t.forward());
+    // The water probe's capture, on the frames it is taking one — see `liquid::probe`'s
+    // `ProbeCull`. Hoisted here because there are THREE admission paths below (doodad cells, WMO
+    // prop regions, WMO building groups) and a cubemap needs all of them: with only the first the
+    // cube holds a forest and no architecture, which looks plausible and reflects a lakeside
+    // cottage as empty bank.
+    let probe = probe_cull.filter(|p| p.active).map(|p| (p.at, p.radius));
     let gate = crate::exterior_cull::ExteriorGate::build(&windows, Some((cam_t, proj)));
     let m = &debug.models;
     let doodads_on =
@@ -324,15 +331,19 @@ pub(super) fn cull_cells(
         for (&cell, draw) in &world.cells {
             let center = draw.origin + Vec3::from(draw.aabb.center);
             let radius = Vec3::from(draw.aabb.half_extents).length();
-            if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
-                continue;
-            }
-            let sphere = bevy::camera::primitives::Sphere {
-                center: center.into(),
-                radius,
-            };
-            if !frustum.intersects_sphere(&sphere, false) {
-                continue;
+            // Near the probe, neither the camera's reach nor its frustum decides what the cube needs.
+            let for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+            if !for_probe {
+                if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
+                    continue;
+                }
+                let sphere = bevy::camera::primitives::Sphere {
+                    center: center.into(),
+                    radius,
+                };
+                if !frustum.intersects_sphere(&sphere, false) {
+                    continue;
+                }
             }
             // ADT doodads are exterior scene: from inside a WMO they draw only through a window.
             if !gate.admits(
@@ -376,15 +387,20 @@ pub(super) fn cull_cells(
                 }
                 let center = draw.origin + Vec3::from(aabb.center);
                 let radius = Vec3::from(aabb.half_extents).length();
-                if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
-                    continue;
-                }
-                let sphere = bevy::camera::primitives::Sphere {
-                    center: center.into(),
-                    radius,
-                };
-                if !frustum.intersects_sphere(&sphere, false) {
-                    continue;
+                // The prop regions are the second of three admission paths the probe needs.
+                let prop_for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+                if !prop_for_probe {
+                    if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius)
+                    {
+                        continue;
+                    }
+                    let sphere = bevy::camera::primitives::Sphere {
+                        center: center.into(),
+                        radius,
+                    };
+                    if !frustum.intersects_sphere(&sphere, false) {
+                        continue;
+                    }
                 }
                 if !rooms.is_empty()
                     && Some(entity) != own
@@ -438,15 +454,23 @@ pub(super) fn cull_cells(
                 }
                 let center = draw.origin + Vec3::from(aabb.center);
                 let radius = Vec3::from(aabb.half_extents).length();
-                if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
-                    continue;
-                }
-                let sphere = bevy::camera::primitives::Sphere {
-                    center: center.into(),
-                    radius,
-                };
-                if !frustum.intersects_sphere(&sphere, false) {
-                    continue;
+                // The BUILDING groups are a third admission path, after the doodad cells and the
+                // prop regions, and the probe needs all three: a cubemap with the forest in it and
+                // no architecture reflects a lakeside cottage as empty bank. This was the last of
+                // the three to be found, because the first two made the cube look plausible.
+                let wmo_for_probe = probe.is_some_and(|(at, r)| center.distance(at) <= r + radius);
+                if !wmo_for_probe {
+                    if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius)
+                    {
+                        continue;
+                    }
+                    let sphere = bevy::camera::primitives::Sphere {
+                        center: center.into(),
+                        radius,
+                    };
+                    if !frustum.intersects_sphere(&sphere, false) {
+                        continue;
+                    }
                 }
                 // Another building is exterior scene; the camera's own is exempt.
                 if Some(entity) != own

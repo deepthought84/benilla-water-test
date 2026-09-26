@@ -759,6 +759,7 @@ fn stream_terrain(
         spawn_liquids(
             &mut commands,
             adt.chunks.iter().flat_map(|c| c.liquids.iter()),
+            &adt.chunks,
             liquid_assets.as_deref(),
             &mut meshes,
             &mut liquid_ents,

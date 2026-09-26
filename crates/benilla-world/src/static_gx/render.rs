@@ -18,6 +18,7 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_graph::{
     NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
 };
+use bevy::render::render_phase::TrackedRenderPass;
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only_sized, texture_2d_array, uniform_buffer, uniform_buffer_sized,
 };
@@ -72,16 +73,30 @@ pub(crate) struct GxCellDraw {
     pub sets: Vec<std::sync::Arc<[u16]>>,
 }
 
-/// Marks the world camera, the one view the pass draws into, so no portrait-booth view gets
-/// world cells.
+/// Marks the views the retained pass draws into: the world camera, the water's mirrors and the
+/// probe's faces, so no portrait-booth view gets world cells. The mirrors and faces draw the world
+/// camera's cull list (the probe cull widens it around the capture point).
 #[derive(Component, Clone, Copy, Default, ExtractComponent)]
 pub(crate) struct StaticGxView;
 
-/// Mark the world camera, again whenever it respawns.
-fn mark_world_camera(
-    mut commands: Commands,
-    cam: Query<Entity, (With<crate::view::WorldCamera>, Without<StaticGxView>)>,
-) {
+/// The views that take the retained pass, before they are marked: the world camera, the water's
+/// mirrors and the probe's faces.
+type UnmarkedPassViews<'w, 's> = Query<
+    'w,
+    's,
+    Entity,
+    (
+        Or<(
+            With<crate::view::WorldCamera>,
+            With<crate::liquid::ReflectionCamera>,
+            With<crate::liquid::ProbeFace>,
+        )>,
+        Without<StaticGxView>,
+    ),
+>;
+
+/// Mark the views that take the pass, again whenever one respawns.
+fn mark_world_camera(mut commands: Commands, cam: UnmarkedPassViews) {
     for e in &cam {
         commands.entity(e).insert(StaticGxView);
     }
@@ -170,6 +185,10 @@ struct GxPipelines {
     sampler_clamp: Sampler,
     /// Keyed `(cutout, two_sided)`, re-specialized if the world view's (samples, format) changes.
     pipelines: HashMap<(bool, bool), CachedRenderPipelineId>,
+    /// The same four, depth-only, for the depth prepass — see [`StaticGxPrepassNode`]. Separate
+    /// rather than a flag on the above because they differ in the two things a pipeline cannot
+    /// branch on: no colour target, and a fragment that only discards.
+    depth_pipelines: HashMap<(bool, bool), CachedRenderPipelineId>,
     specialized_for: Option<(u32, TextureFormat)>,
 }
 
@@ -223,6 +242,7 @@ fn init_pipelines(mut commands: Commands, render_device: Res<RenderDevice>) {
         sampler: make("static_gx_repeat", AddressMode::Repeat),
         sampler_clamp: make("static_gx_clamp", AddressMode::ClampToEdge),
         pipelines: HashMap::default(),
+        depth_pipelines: HashMap::default(),
         specialized_for: None,
     });
 }
@@ -304,12 +324,14 @@ fn prepare_static_gx(
         let shader: Handle<Shader> =
             asset_server.load("embedded://benilla_world/shaders/static_gx.wgsl");
         pipes.pipelines.clear();
+        pipes.depth_pipelines.clear();
         for cutout in [false, true] {
             for two_sided in [false, true] {
                 let mut defs = vec![];
                 if cutout {
                     defs.push(ShaderDefVal::from("GX_CUTOUT"));
                 }
+                let depth_defs = defs.clone();
                 let id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
                     label: Some(
                         format!("static_gx c{} t{}", u8::from(cutout), u8::from(two_sided)).into(),
@@ -349,6 +371,49 @@ fn prepare_static_gx(
                     ..default()
                 });
                 pipes.pipelines.insert((cutout, two_sided), id);
+                // The depth-only twin: same vertex stage, same buffers, same layout, so it
+                // writes exactly the depth the colour pass above will test `GreaterEqual`
+                // against. Only the fragment and the (absent) target differ.
+                let depth_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some(
+                        format!(
+                            "static_gx_prepass c{} t{}",
+                            u8::from(cutout),
+                            u8::from(two_sided)
+                        )
+                        .into(),
+                    ),
+                    layout: vec![pipes.view_layout.clone(), pipes.cell_layout.clone()],
+                    vertex: VertexState {
+                        shader: shader.clone(),
+                        shader_defs: depth_defs.clone(),
+                        entry_point: Some("vertex".into()),
+                        buffers: vec![vertex_layout()],
+                    },
+                    fragment: Some(FragmentState {
+                        shader: shader.clone(),
+                        shader_defs: depth_defs,
+                        entry_point: Some("fragment_prepass".into()),
+                        targets: vec![],
+                    }),
+                    primitive: PrimitiveState {
+                        cull_mode: (!two_sided).then_some(Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(DepthStencilState {
+                        format: CORE_3D_DEPTH_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: CompareFunction::GreaterEqual,
+                        stencil: StencilState::default(),
+                        bias: DepthBiasState::default(),
+                    }),
+                    multisample: MultisampleState {
+                        count: msaa.samples(),
+                        ..Default::default()
+                    },
+                    ..default()
+                });
+                pipes.depth_pipelines.insert((cutout, two_sided), depth_id);
             }
         }
         pipes.specialized_for = Some(key);
@@ -647,6 +712,187 @@ fn prepare_view_bind(
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct StaticGxLabel;
 
+/// The frame's draw list: WMO regions first, then the doodad phase — the real client's own drain
+/// order (1429), and the buildings are the frame's best early-z occluders for the doodads behind
+/// them. Shared by the colour pass and the depth prepass so both draw the same set.
+fn resolve_static_gx<'w>(
+    gx: &'w GxWorld,
+    cache: &'w GxGpuCache,
+) -> Vec<(&'w GxCellGpu, &'w GxCellDraw, Option<&'w GxSel>)> {
+    let mut resolved: Vec<(&GxCellGpu, &GxCellDraw, Option<&GxSel>)> = Vec::new();
+    for (entity, sel) in &gx.visible_wmos {
+        if let (Some(gpu), Some(draw)) = (cache.wmos.get(entity), gx.wmos.get(entity)) {
+            resolved.push((gpu, draw, Some(sel)));
+        }
+    }
+    for vis in &gx.visible {
+        match vis {
+            GxDoodadVis::Cell(cell) => {
+                if let (Some(gpu), Some(draw)) = (cache.cells.get(cell), gx.cells.get(cell)) {
+                    resolved.push((gpu, draw, None));
+                }
+            }
+            GxDoodadVis::Prop(entity, sel) => {
+                if let (Some(gpu), Some(draw)) = (cache.props.get(entity), gx.props.get(entity)) {
+                    resolved.push((gpu, draw, Some(sel)));
+                }
+            }
+        }
+    }
+    resolved
+}
+
+/// Issue the retained draws into an already-open pass.
+///
+/// Shared by the colour pass and the depth prepass so the two cannot drift: same resolution, same
+/// order, same runs, same vertex stage — only the pipeline map differs. The prepass must write the
+/// depth the colour pass then tests `GreaterEqual` against, and the surest way to guarantee that is
+/// for there to be one description of what gets drawn.
+fn record_static_gx<'w>(
+    pass: &mut TrackedRenderPass<'w>,
+    resolved: &[(&'w GxCellGpu, &'w GxCellDraw, Option<&'w GxSel>)],
+    meshes: &'w RenderAssets<RenderMesh>,
+    allocator: &'w MeshAllocator,
+    view_bind: &'w GxViewBind,
+    view_offset: &ViewUniformOffset,
+    ready: &HashMap<(bool, bool), &'w RenderPipeline>,
+) {
+    pass.set_bind_group(0, &view_bind.0, &[view_offset.offset]);
+    for (gpu, draw, sel) in resolved {
+        let Some(mesh) = meshes.get(draw.mesh.id()) else {
+            continue;
+        };
+        let (Some(vslice), Some(islice)) = (
+            allocator.mesh_vertex_slice(&draw.mesh.id()),
+            allocator.mesh_index_slice(&draw.mesh.id()),
+        ) else {
+            continue;
+        };
+        let index_format = match &mesh.buffer_info {
+            bevy::render::mesh::RenderMeshBufferInfo::Indexed { index_format, .. } => *index_format,
+            bevy::render::mesh::RenderMeshBufferInfo::NonIndexed => continue,
+        };
+        pass.set_vertex_buffer(0, vslice.buffer.slice(..));
+        pass.set_index_buffer(islice.buffer.slice(..), index_format);
+        for run in &gpu.runs {
+            // The PVS range selection (1429's collapse): a WMO run draws iff its group's
+            // admission bit is set this frame; a cell run always draws.
+            if let (Some(sel), Some(group)) = (sel, run.group) {
+                if !sel.drawn.get(usize::from(group)).copied().unwrap_or(false) {
+                    continue;
+                }
+            }
+            pass.set_render_pipeline(ready[&(run.cutout, run.two_sided)]);
+            pass.set_bind_group(1, &gpu.bind_groups[run.slot].1, &[]);
+            pass.draw_indexed(
+                (islice.range.start + run.index_range.start)
+                    ..(islice.range.start + run.index_range.end),
+                i32::try_from(vslice.range.start).unwrap_or(0),
+                0..1,
+            );
+        }
+    }
+}
+
+/// `$WOW_GX_PREPASS=0` — skip the static world's depth prepass.
+///
+/// The A/B lever for a pass that costs a second traversal of every visible static region and buys
+/// the screen-space march every tree and building in the world. Read once, at startup; the pass is
+/// already inert whenever no depth prepass is attached, which is the whole reference lane.
+fn gx_prepass_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WOW_GX_PREPASS").as_deref() != Ok("0"))
+}
+
+/// The static world's **depth prepass** — the same geometry as [`StaticGxNode`], depth only.
+///
+/// This lane draws from retained buffers in a custom node rather than through bevy_pbr (decision
+/// 1429), which means it was in no depth prepass at all: opting a *material* into the prepass, as
+/// `WowModelExt` now does, reaches the entity path and not this one. Everything that reads the
+/// opaque scene's depth was therefore missing the static world — the trees and buildings — and the
+/// one that noticed was the stylised water's screen-space reflection march, which could not reflect
+/// a tree because no tree was in the depth it traces.
+///
+/// It writes into the same `ViewDepthTexture` Bevy's own prepass writes and the main pass then
+/// tests against, so the ordering is the whole contract: after the prepass, before the main pass.
+/// The depth it writes is the depth [`StaticGxNode`] would write, because both go through
+/// [`record_static_gx`] over the same vertex stage — the colour pass's `GreaterEqual` then sees
+/// equality rather than a disagreement.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct StaticGxPrepassLabel;
+
+#[derive(Default)]
+struct StaticGxPrepassNode;
+
+impl ViewNode for StaticGxPrepassNode {
+    type ViewQuery = (
+        &'static ViewDepthTexture,
+        &'static ViewUniformOffset,
+        &'static StaticGxView,
+        // Only when a depth prepass is actually attached — `liquid::depth` attaches and detaches it
+        // with the stylised look, and drawing depth nobody asked for is a pass for nothing.
+        &'static bevy::core_pipeline::prepass::ViewPrepassTextures,
+    );
+
+    fn run<'w>(
+        &self,
+        _graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext<'w>,
+        (depth, view_offset, _marker, prepass): QueryItem<'w, '_, Self::ViewQuery>,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        if prepass.depth.is_none() || !gx_prepass_on() {
+            return Ok(());
+        }
+        let gx = world.resource::<GxWorld>();
+        if gx.visible.is_empty() && gx.visible_wmos.is_empty() {
+            return Ok(());
+        }
+        let cache = world.resource::<GxGpuCache>();
+        let pipes = world.resource::<GxPipelines>();
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let Some(view_bind) = world.get_resource::<GxViewBind>() else {
+            return Ok(());
+        };
+        let meshes = world.resource::<RenderAssets<RenderMesh>>();
+        let allocator = world.resource::<MeshAllocator>();
+        let resolved = resolve_static_gx(gx, cache);
+        if resolved.is_empty() {
+            return Ok(());
+        }
+        // All-or-none, exactly as the colour pass requires it: a half-compiled set would write a
+        // partial silhouette into the depth every other consumer trusts.
+        let mut ready: HashMap<(bool, bool), &RenderPipeline> = HashMap::default();
+        for (k, id) in &pipes.depth_pipelines {
+            match pipeline_cache.get_render_pipeline(*id) {
+                Some(p) => {
+                    ready.insert(*k, p);
+                }
+                None => return Ok(()),
+            }
+        }
+        // Load, never clear: Bevy's prepass has already written the entity path's depth into this
+        // texture and this adds to it.
+        let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("static_gx_prepass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        record_static_gx(
+            &mut pass,
+            &resolved,
+            meshes,
+            allocator,
+            view_bind,
+            view_offset,
+            &ready,
+        );
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct StaticGxNode;
 
@@ -680,27 +926,7 @@ impl ViewNode for StaticGxNode {
         let allocator = world.resource::<MeshAllocator>();
         // WMO regions first, then the doodad phase near-first, the 1.12 client's WMO-then-doodad
         // drain order. Cells draw whole; a region draws only its admitted runs.
-        let mut resolved: Vec<(&GxCellGpu, &GxCellDraw, Option<&GxSel>)> = Vec::new();
-        for (entity, sel) in &gx.visible_wmos {
-            if let (Some(gpu), Some(draw)) = (cache.wmos.get(entity), gx.wmos.get(entity)) {
-                resolved.push((gpu, draw, Some(sel)));
-            }
-        }
-        for vis in &gx.visible {
-            match vis {
-                GxDoodadVis::Cell(cell) => {
-                    if let (Some(gpu), Some(draw)) = (cache.cells.get(cell), gx.cells.get(cell)) {
-                        resolved.push((gpu, draw, None));
-                    }
-                }
-                GxDoodadVis::Prop(entity, sel) => {
-                    if let (Some(gpu), Some(draw)) = (cache.props.get(entity), gx.props.get(entity))
-                    {
-                        resolved.push((gpu, draw, Some(sel)));
-                    }
-                }
-            }
-        }
+        let resolved = resolve_static_gx(gx, cache);
         if resolved.is_empty() {
             return Ok(());
         }
@@ -727,42 +953,15 @@ impl ViewNode for StaticGxNode {
             occlusion_query_set: None,
         });
         let span = diagnostics.pass_span(&mut pass, "static_gx");
-        pass.set_bind_group(0, &view_bind.0, &[view_offset.offset]);
-        for (gpu, draw, sel) in &resolved {
-            let Some(mesh) = meshes.get(draw.mesh.id()) else {
-                continue;
-            };
-            let (Some(vslice), Some(islice)) = (
-                allocator.mesh_vertex_slice(&draw.mesh.id()),
-                allocator.mesh_index_slice(&draw.mesh.id()),
-            ) else {
-                continue;
-            };
-            let index_format = match &mesh.buffer_info {
-                bevy::render::mesh::RenderMeshBufferInfo::Indexed { index_format, .. } => {
-                    *index_format
-                }
-                bevy::render::mesh::RenderMeshBufferInfo::NonIndexed => continue,
-            };
-            pass.set_vertex_buffer(0, vslice.buffer.slice(..));
-            pass.set_index_buffer(islice.buffer.slice(..), index_format);
-            for run in &gpu.runs {
-                // A region's run draws only if its selection key is admitted; a cell run always.
-                if let (Some(sel), Some(group)) = (sel, run.group) {
-                    if !sel.drawn.get(usize::from(group)).copied().unwrap_or(false) {
-                        continue;
-                    }
-                }
-                pass.set_render_pipeline(ready[&(run.cutout, run.two_sided)]);
-                pass.set_bind_group(1, &gpu.bind_groups[run.slot].1, &[]);
-                pass.draw_indexed(
-                    (islice.range.start + run.index_range.start)
-                        ..(islice.range.start + run.index_range.end),
-                    i32::try_from(vslice.range.start).unwrap_or(0),
-                    0..1,
-                );
-            }
-        }
+        record_static_gx(
+            &mut pass,
+            &resolved,
+            meshes,
+            allocator,
+            view_bind,
+            view_offset,
+            &ready,
+        );
         span.end(&mut pass);
         Ok(())
     }
@@ -792,6 +991,7 @@ pub(super) fn build(app: &mut App) {
                 prepare_view_bind.in_set(RenderSystems::PrepareBindGroups),
             ),
         )
+        .add_render_graph_node::<ViewNodeRunner<StaticGxPrepassNode>>(Core3d, StaticGxPrepassLabel)
         .add_render_graph_node::<ViewNodeRunner<StaticGxNode>>(Core3d, StaticGxLabel)
         // Before bevy's opaque pass, as early-z occluders for terrain. This pass takes the depth
         // and colour clear (attachments clear on first use); with nothing visible it returns
@@ -799,6 +999,17 @@ pub(super) fn build(app: &mut App) {
         .add_render_graph_edges(
             Core3d,
             (Node3d::StartMainPass, StaticGxLabel, Node3d::MainOpaquePass),
+        )
+        .add_render_graph_edges(
+            Core3d,
+            // **Before** Bevy's prepass, not after, and the reason is a copy. That node writes
+            // depth into the view's depth texture and then, as its last act, copies it into the
+            // separate texture `prepass_depth` samples. Anything drawn after it lands in the view
+            // depth — correctly, for the main pass — and is invisible to every shader reading the
+            // prepass, which is the entire point of this node. Running first puts the static world
+            // in before the copy is taken; the depth attachment clears on its first use of the
+            // frame and loads thereafter, so Bevy's prepass adds to this rather than wiping it.
+            (StaticGxPrepassLabel, Node3d::EarlyPrepass),
         );
 }
 

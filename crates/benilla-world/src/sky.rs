@@ -241,22 +241,11 @@ fn apply_sky_visibility(
     }
 }
 
-/// Push the time-of-day sky stops and fog colour (`WowLighting`) into the dome material.
-fn update_sky_colors(
-    light: Res<WowLighting>,
-    dome: Query<&MeshMaterial3d<SkyMaterial>, With<Sky>>,
-    mut materials: ResMut<Assets<SkyMaterial>>,
-) {
-    let Ok(handle) = dome.single() else {
-        return;
-    };
-    // Quantized to bytes (Light.dbc stops are byte colours) and write-gated, since a `get_mut`
-    // alone re-uploads the material.
-    let sky: Vec<Vec4> = light
-        .sky
-        .iter()
-        .map(|c| col(benilla_assets::quant255(*c)))
-        .collect();
+/// The dome's seven uniform rows (`sky0..sky4`, `fog`, `warp`): the dome material's, and the water
+/// march's for its sky hits, which agree with the dome only on the same bytes.
+pub(crate) fn dome_uniforms(light: &WowLighting) -> [Vec4; 7] {
+    // Quantized to bytes: Light.dbc stops are byte colours.
+    let sky = light.sky.map(|c| col(benilla_assets::quant255(c)));
     let f = benilla_assets::quant255(light.fog_color);
     // `fog.w` is unused by the shader.
     let fog = Vec4::new(f[0], f[1], f[2], 0.0);
@@ -270,6 +259,21 @@ fn update_sky_colors(
         0.0,
         0.0,
     );
+    [sky[0], sky[1], sky[2], sky[3], sky[4], fog, warp]
+}
+
+/// Push the time-of-day sky stops and fog colour (`WowLighting`) into the dome material.
+fn update_sky_colors(
+    light: Res<WowLighting>,
+    dome: Query<&MeshMaterial3d<SkyMaterial>, With<Sky>>,
+    mut materials: ResMut<Assets<SkyMaterial>>,
+) {
+    let Ok(handle) = dome.single() else {
+        return;
+    };
+    // Write-gated, since a `get_mut` alone re-uploads the material.
+    let [sky0, sky1, sky2, sky3, sky4, fog, warp] = dome_uniforms(&light);
+    let sky = [sky0, sky1, sky2, sky3, sky4];
     benilla_assets::write_gated(
         &mut materials,
         &handle.0,
@@ -292,4 +296,37 @@ fn update_sky_colors(
             m.extension.warp = warp;
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    /// The text between the dome-law markers of one shader.
+    fn dome_law(wgsl: &str) -> &str {
+        let begin = wgsl
+            .find("// ---- dome law: begin")
+            .expect("the dome-law begin marker");
+        let end = wgsl[begin..]
+            .find("// ---- dome law: end")
+            .map(|e| begin + e)
+            .expect("the dome-law end marker");
+        &wgsl[begin..end]
+    }
+
+    /// **The water's sky hits and the dome must be one law.** The march asks `dome_color` for the
+    /// sky along a reflected ray instead of reading the colour buffer, and that is only the sky on
+    /// screen if both shaders run the same function on the same bytes (`dome_uniforms`). The
+    /// function is duplicated rather than imported — no WGSL in this tree shares code across crates,
+    /// and the one attempt to (the model prepass twin) broke the model lane — so this is what keeps
+    /// the copies from drifting: edit one, and this fails until the other matches.
+    #[test]
+    fn the_dome_law_is_shared_verbatim() {
+        let sky = include_str!("shaders/sky.wgsl");
+        let liquid = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
+        assert_eq!(
+            dome_law(sky),
+            dome_law(liquid),
+            "sky.wgsl and liquid.wgsl carry different dome laws — copy the edited one across"
+        );
+        assert!(dome_law(sky).contains("fn dome_color(c: DomeColors, dir: vec3<f32>)"));
+    }
 }

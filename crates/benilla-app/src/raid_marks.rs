@@ -15,6 +15,7 @@
 //! because blended sorting looks the same.
 //! The reference's third gate (`0x605f30() == 0`) is untraced and not applied.
 
+use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 
 use crate::entities::{overhead_anchor, BoneAttach, OverheadFallback};
@@ -194,6 +195,9 @@ fn drive_raid_marks(
                 MeshMaterial3d(material.clone()),
                 place.unwrap_or_default(),
                 RaidMarkBillboard,
+                // The overhead names' layer, for the same reason: a mark over a head is a label on
+                // the viewer's screen, and the water's mirror was drawing it into the lake.
+                RenderLayers::layer(benilla_world::liquid::UNMIRRORED_RENDER_LAYER),
             ))
             .id();
         marks.live[slot] = Some(LiveMark { marker, unit });

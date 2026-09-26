@@ -31,7 +31,9 @@
 
 mod dots;
 
-pub(super) use dots::{emit_party_dots, emit_quest_dots, emit_tracking_dots, SelfTracking};
+pub(super) use dots::{
+    emit_party_dots, emit_probe_dots, emit_quest_dots, emit_tracking_dots, SelfTracking,
+};
 
 use bevy::ecs::system::NonSendMut;
 use bevy::math::Rect;
@@ -170,7 +172,13 @@ pub(super) type BlipInputs<'w, 's> = (
     Res<'w, crate::poi_marker::PoiMarker>,
     Option<Res<'w, crate::area_poi::AreaPoiRes>>,
     ResMut<'w, super::MinimapPing>,
-    Option<NonSendMut<'w, UiScript>>,
+    // Nested because the tuple is at Bevy's sixteen-parameter ceiling and this pair is one
+    // concern: the debug-panel toggle and the probe list the water overlay draws.
+    (
+        Option<NonSendMut<'w, UiScript>>,
+        Res<'w, benilla_world::dev_state::DebugState>,
+        Res<'w, benilla_world::liquid::ProbeMarks>,
+    ),
 );
 
 /// Every streamed object the classifier considers; our own avatar is the arrow, never a dot.

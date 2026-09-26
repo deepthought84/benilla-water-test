@@ -163,6 +163,7 @@ pub(crate) fn on_cvar(
     mut tex_filter: ResMut<benilla_assets::TexFilterSetting>,
     mut clutter: ResMut<benilla_world::clutter::ClutterConfig>,
     mut weather: ResMut<benilla_world::weather::WeatherState>,
+    mut water_style: ResMut<benilla_world::liquid::WaterStyle>,
     mut cvars: ResMut<crate::cvars::Cvars>,
 ) {
     use benilla_world::view::{FARCLIP_RANGE, MSAA_RANGE};
@@ -177,6 +178,7 @@ pub(crate) fn on_cvar(
         // The reference's polarity: `1` is windowed (the row is "Windowed Mode").
         "gxwindow" => cfg.display = display_from_flag(v),
         "farclip" => view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
+        "waterstyle" => *water_style = benilla_world::liquid::WaterStyle::from_cvar(v),
         // Clamped, where the reference refuses an out-of-range write and keeps the value
         // (`0x688d90` echoes "NearClip must be in range 0.01 - 0.33" and returns 0).
         "nearclip" => view.set_nearclip(v),

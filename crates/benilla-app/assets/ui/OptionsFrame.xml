@@ -408,6 +408,34 @@
             .. "Sounds keep running while they are silenced, so a long one may have finished by "
             .. "the time you return."
 
+        -- Water Style. benilla's own row, and the only one on this window that offers a LOOK
+        -- rather than a fidelity or performance setting -- so the tooltip has to say plainly which
+        -- of the two is the client's own water, or the row reads as "which of these is broken".
+        BENILLA_TOOLTIP_WATER_STYLE =
+            "Reference draws water the way the 1.12 client does.\n\n"
+            .. "Stylised is benilla's own look: a rippling surface with a moving glint, a sky "
+            .. "sheen at glancing angles, reflections of the world around it, and foam along the "
+            .. "shoreline. It keeps each zone's own water colours and follows the time of day "
+            .. "like the reference does.\n\n"
+            .. "The reflection draws the world a second time and costs a little frame rate; it "
+            .. "only runs near water.\n\n"
+            .. "Stylised (SSR) is the same look without that second drawing: reflections are "
+            .. "traced from what is already on your screen, which is faster, but things that are "
+            .. "off the edge of the screen or behind you cannot be reflected and fade to sky "
+            .. "instead.\n\n"
+            .. "Stylised (Probe) adds back what that one misses, without drawing the world again: "
+            .. "a snapshot of the surroundings is taken from the water itself every few seconds, "
+            .. "so the bank behind you reflects even when it is off screen. That snapshot is "
+            .. "deliberately soft -- it is taken from a handful of fixed points, so the further "
+            .. "you stand from one the less it can say about exactly where things are, and it is "
+            .. "blurred by that much rather than shown sharp and wrong.\n\n"
+            .. "Stylised (SSR + Probe) runs both together, with the traced reflections in front "
+            .. "and the snapshot filling whatever they cannot reach. Nothing is missing from it, "
+            .. "and it costs the most of the four -- rather more than the plain stylised row, not "
+            .. "less. It earns that on water the single mirrored surface cannot serve: streams "
+            .. "that run downhill, pools at different heights, anything that is not one flat "
+            .. "sheet."
+
         -- 1.12's WINDOWED_MODE text describes a checkbox and exclusive-mode gamma.
         BENILLA_TOOLTIP_DISPLAY_MODE =
             "Windowed (Fullscreen) fills the screen with a borderless window; Windowed runs in "
@@ -441,7 +469,7 @@
             Graphics = {
                 "RowUiScale", "RowFarclip", "RowWorldDetail", "RowBrightness",
                 "RowWeatherDensity",
-                "RowDisplayMode", "RowVerticalSync", "RowRenderScale",
+                "RowDisplayMode", "RowVerticalSync", "RowRenderScale", "RowWaterStyle",
             },
             -- Guild Names is a child of Player Names (UIOptionsFrame.lua:703-709).
             Nameplates = {
@@ -1941,6 +1969,67 @@
                                                     "BENILLA_TOOLTIP_RENDER_SCALE")
                                                 OptionsSliderRow_Setup(self, 0.5, 2.0, 0.05)
                                                 self.deferred = 1
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowWaterStyle" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowRenderScale" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- Water Style -- benilla's own row, with no 1.12
+                                                -- counterpart: the reference has exactly one water
+                                                -- and no dial for it. A DROPDOWN rather than a
+                                                -- checkbox for the same reason Display Mode is
+                                                -- one: a box can only name one of the two states,
+                                                -- and "Stylised water [x]" leaves the unchecked
+                                                -- state unnamed when the unchecked state is the
+                                                -- thing this whole client is about.
+                                                --
+                                                -- Reference FIRST, and the CVar's "0": the client
+                                                -- boots into the water it reproduces, and the row
+                                                -- offers the alternative rather than presenting
+                                                -- the two as equals.
+                                                --
+                                                -- NOT deferred. The look is one uniform lane on a
+                                                -- handful of shared materials
+                                                -- (`liquid::surface::apply_water_style`), so it
+                                                -- lands on the click with nothing to rebuild --
+                                                -- which is also what makes it worth A/B-ing from
+                                                -- the shore of a lake with the window open.
+                                                OptionsRow_OnLoad(self, "waterStyle", "Water Style",
+                                                    "BENILLA_TOOLTIP_WATER_STYLE")
+                                                --
+                                                -- FOUR entries, not two, because the rest are
+                                                -- performance choices and a dropdown is where a
+                                                -- player looks for one. "Stylised (SSR)" is the
+                                                -- same water with the second camera stood down:
+                                                -- see WaterStyle::StylisedSsr for what that
+                                                -- trades. It sits AFTER the full stylised entry
+                                                -- so the list reads as increasing cheapness
+                                                -- downward, which is the order every other
+                                                -- quality dropdown on this page uses.
+                                                --
+                                                -- The LAST entry breaks that ordering and the
+                                                -- comment says so rather than leaving the next
+                                                -- reader to infer a rule that no longer holds.
+                                                -- "Stylised (SSR + Probe)" is the most expensive
+                                                -- row on this list, not the cheapest: measured at
+                                                -- the Mirror Lake vista it costs 6.95 ms of GPU
+                                                -- against the plain stylised row's 5.98, because
+                                                -- the probe's cube captures cost more than the
+                                                -- second camera they were meant to replace. It is
+                                                -- last because it is the most COMPLETE -- it is
+                                                -- the only row with no structural blind spot --
+                                                -- and a player reading downward for "the one that
+                                                -- misses nothing" should land on it.
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = "Reference (1.12)", value = "0" },
+                                                    { text = "Stylised", value = "1" },
+                                                    { text = "Stylised (SSR)", value = "2" },
+                                                    { text = "Stylised (Probe)", value = "3" },
+                                                    { text = "Stylised (SSR + Probe)", value = "4" },
+                                                })
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

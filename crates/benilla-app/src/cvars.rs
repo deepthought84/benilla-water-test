@@ -608,6 +608,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "benilla's own — the reference has no off-screen buffer to hang a resolution dial \
          on; its nearest equivalent, `gxResolution`, drops the interface with the world",
     ),
+    // benilla's own: which water look draws, `0` the reference's. The knob is
+    // [`benilla_world::liquid::WaterStyle`]. `$WOW_WATER_STYLE` overrides it for the session.
+    ours(
+        "waterStyle",
+        "0",
+        "benilla's own — the reference has one water and no dial for it",
+    ),
     // benilla's own: `/console fpsJournal 1` appends a per-second row of position, frame cost and
     // per-pass GPU time to `benilla-config/Diagnostics/fps-journal.csv`. The knob is
     // [`crate::perf::FpsJournalSetting`].
@@ -1162,6 +1169,10 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
         let v = world.get_resource::<crate::world_backdrop::RenderScale>();
         out.push(("renderScale", v.map(|r| r.0.to_string())));
     }
+    if set("WOW_WATER_STYLE") {
+        let v = world.get_resource::<benilla_world::liquid::WaterStyle>();
+        out.push(("waterStyle", v.map(|w| w.cvar().to_string())));
+    }
     // `$WOW_HOST` is the session's realmlist, which a test run must never write into the file.
     if set("WOW_HOST") {
         let v = world.get_resource::<crate::realmlist::Realmlist>();
@@ -1685,6 +1696,11 @@ mod tests {
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Every visual golden assumes a 1:1 backdrop.
         assert_eq!(d["renderScale"], 1.0);
+        // The reference's water.
+        assert_eq!(
+            benilla_world::liquid::WaterStyle::from_cvar(d["waterStyle"]),
+            benilla_world::liquid::WaterStyle::Reference
+        );
     }
 
     #[test]
@@ -1775,6 +1791,20 @@ mod tests {
         assert!(!res::<crate::perf::FpsJournalSetting>(&app).0);
         apply(&mut app, "fpsJournal", "1");
         assert!(res::<crate::perf::FpsJournalSetting>(&app).0);
+        {
+            use benilla_world::liquid::WaterStyle;
+            for (value, want) in [
+                ("1", WaterStyle::Stylised),
+                ("2", WaterStyle::StylisedSsr),
+                ("3", WaterStyle::StylisedProbe),
+                ("4", WaterStyle::StylisedSsrProbe),
+                ("0", WaterStyle::Reference),
+            ] {
+                apply(&mut app, "waterStyle", value);
+                assert_eq!(*res::<WaterStyle>(&app), want);
+                assert_eq!(res::<WaterStyle>(&app).cvar(), value);
+            }
+        }
         apply(&mut app, "fpsjournal", "0");
         assert!(!res::<crate::perf::FpsJournalSetting>(&app).0);
         // Enable flags: any nonzero is on, zero is off (the client's int-parse + != 0).
@@ -2086,6 +2116,8 @@ mod tests {
             .init_resource::<crate::combat_text::DamageTextGates>()
             .init_resource::<crate::ui_chat::combat::LogPeriodicSpells>()
             .init_resource::<benilla_world::weather::WeatherState>()
+            // Literal: `WaterStyle::default()` reads `$WOW_WATER_STYLE`.
+            .insert_resource(benilla_world::liquid::WaterStyle::Reference)
             .init_resource::<crate::ui_gamma::DisplayGamma>()
             .init_resource::<ClickConfig>()
             .init_resource::<crate::target::AssistAttack>()
