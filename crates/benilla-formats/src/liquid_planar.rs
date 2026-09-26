@@ -1,10 +1,11 @@
-//! Which water a planar mirror may serve, per 4.17-yd liquid cell: the flat sections large enough
-//! to be worth a mirror plane. Falls, descending rivers and small pools are probe water; the mirror
-//! stands down over them and the cube probe under it shows through.
+//! Which water a planar mirror may serve, per 4.17-yd liquid cell: every flat body of water at its
+//! own height. Falls and the slivers of flat water among them are probe water; the mirror stands
+//! down over them and the cube probe under it shows through.
 //!
-//! An ADT tile is judged over itself and its eight neighbours, so a stream crossing a tile border
-//! is measured whole and the answer does not depend on which tiles are streamed in. A WMO
-//! placement holds its whole pool and is judged alone.
+//! An ADT tile is judged over itself and its eight neighbours. That is the whole map's answer: a
+//! section leaving that block crosses at least one tile, 128 cells, far above [`MIN_AREA_YD2`], so
+//! a section is only ever called small when all of it is in view. A WMO placement holds its whole
+//! pool and is judged alone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,10 +17,10 @@ const FLAT_YD: f32 = 0.5;
 /// A section is the connected cells within this of its seed height — the mirror's own bucket.
 const SECTION_YD: f32 = 0.5;
 
-/// The least area a flat section needs to earn a mirror plane, in square yards: about nine MCLQ
-/// chunks, or a pool 100 yd across. Measured over both continents, it leaves at most two planes
-/// within 200 yd of all but 22 of 59,000 water patches.
-const MIN_AREA_YD2: f32 = 10_000.0;
+/// The least area a flat section needs to earn a mirror plane, in square yards: just under one MCLQ
+/// chunk. At the Elwynn falls it keeps the 1,579-yd² pond and drops the 156-yd² sliver on the
+/// fall.
+const MIN_AREA_YD2: f32 = 1_000.0;
 
 /// How many cells the mirror's weight takes to rise from a probe cell to full, so the two tiers
 /// meet in a ramp and not at a cell edge.
@@ -35,6 +36,8 @@ type Key = (i32, i32);
 pub struct PlanarMap {
     cell: f32,
     weight: HashMap<Key, f32>,
+    /// Each planar cell's mirror plane: its section's mean height, one value for a whole body.
+    plane: HashMap<Key, f32>,
     /// Probe cells in the middle of their water — see [`ANCHOR_CELLS`] — where the probe may stand.
     anchors: HashSet<Key>,
 }
@@ -87,12 +90,13 @@ impl PlanarMap {
         self.per_cell(lq, |k| self.anchors.contains(&k))
     }
 
-    /// Per cell of `lq`, whether it may vote for a mirror plane: any weight above 0.
-    pub fn votes(&self, lq: &LiquidMesh) -> Vec<bool> {
-        self.per_cell(lq, |k| self.weight.get(&k).is_none_or(|w| *w > 0.0))
+    /// Per cell of `lq`, the mirror plane it votes for — its section's height, so a body votes one
+    /// plane wherever the camera is — or NaN on probe water, which does not vote.
+    pub fn planes(&self, lq: &LiquidMesh) -> Vec<f32> {
+        self.per_cell(lq, |k| self.plane.get(&k).copied().unwrap_or(f32::NAN))
     }
 
-    fn per_cell(&self, lq: &LiquidMesh, f: impl Fn(Key) -> bool) -> Vec<bool> {
+    fn per_cell<T>(&self, lq: &LiquidMesh, f: impl Fn(Key) -> T) -> Vec<T> {
         let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
         if cols < 2 || rows < 2 || lq.positions.len() != cols * rows {
             return Vec::new();
@@ -179,7 +183,8 @@ fn classify(
     index: &HashMap<Key, usize>,
     keep: &HashSet<Key>,
 ) -> PlanarMap {
-    let planar = sections(cells, index, cell);
+    let plane = sections(cells, index, cell);
+    let planar: Vec<bool> = plane.iter().map(Option::is_some).collect();
     let weight = ramp(cells, index, &planar)
         .filter(|(k, _)| keep.contains(k))
         .collect();
@@ -202,9 +207,15 @@ fn classify(
         })
         .map(|(_, c)| c.key)
         .collect();
+    let plane = cells
+        .iter()
+        .zip(plane)
+        .filter_map(|(c, z)| z.filter(|_| keep.contains(&c.key)).map(|z| (c.key, z)))
+        .collect();
     PlanarMap {
         cell,
         weight,
+        plane,
         anchors,
     }
 }
@@ -232,11 +243,11 @@ fn shore_distance(cells: &[Cell], index: &HashMap<Key, usize>) -> Vec<u32> {
     dist
 }
 
-/// Mark each cell planar or not. Sections are seeded at the most common remaining height and take
+/// Each cell's mirror plane, its section's mean height, or `None` on probe water. Sections are seeded at the most common remaining height and take
 /// the connected cells within [`SECTION_YD`] of it, so no section drifts: a descending river breaks
 /// into short steps and each is judged on its own size.
-fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<bool> {
-    let mut planar = vec![false; cells.len()];
+fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<Option<f32>> {
+    let mut planar = vec![None; cells.len()];
     let mut left: Vec<bool> = cells.iter().map(|c| c.flat).collect();
     let bin = |h: f32| (h / 0.25).round() as i64;
     loop {
@@ -270,8 +281,9 @@ fn sections(cells: &[Cell], index: &HashMap<Key, usize>, cell: f32) -> Vec<bool>
                 }
             }
             let keep = comp.len() as f32 * cell * cell >= MIN_AREA_YD2;
+            let mean = comp.iter().map(|&k| cells[k].h).sum::<f32>() / comp.len() as f32;
             for &k in &comp {
-                planar[k] = keep;
+                planar[k] = keep.then_some(mean);
             }
         }
         for k in group {
@@ -364,12 +376,16 @@ mod tests {
         let lq = sheet(30, 30, |_, _| 48.64);
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
         assert!(map.weight.values().all(|w| *w == 1.0));
+        assert!(map.planes(&lq).iter().all(|z| (*z - 48.64).abs() < 1e-3));
     }
 
-    /// A pond of 10 × 10 cells (1,736 yd²) is probe water.
+    /// A pond of 6 × 6 cells (625 yd²) is probe water; 10 × 10 (1,736 yd²) keeps a mirror.
     #[test]
     fn a_small_pond_is_probe_water() {
-        let lq = sheet(10, 10, |_, _| 55.91);
+        let pond = sheet(10, 10, |_, _| 55.91);
+        let map = PlanarMap::build([&pond].into_iter()).expect("a grid");
+        assert!(map.weight.values().all(|w| *w == 1.0));
+        let lq = sheet(6, 6, |_, _| 55.91);
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
         assert!(map.weight.values().all(|w| *w == 0.0));
     }
@@ -396,20 +412,34 @@ mod tests {
         );
     }
 
-    /// The probe may stand only on the middle of probe water: a 9-cell-wide pool's centre
-    /// column, never a cell beside the bank.
+    /// The probe may stand only on the middle of probe water: a 7-cell-wide pool's centre, never
+    /// a cell beside the bank.
     #[test]
     fn the_probe_anchors_on_the_middle_of_the_water() {
-        let lq = sheet(9, 9, |_, _| 55.91);
+        let lq = sheet(7, 7, |_, _| 55.91);
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
         let anchors = map.anchors(&lq);
-        assert!(anchors[4 * 9 + 4], "the pool's centre");
-        assert!(!anchors[4 * 9], "a cell on the bank");
+        assert!(anchors[3 * 7 + 3], "the pool's centre");
+        assert!(!anchors[3 * 7], "a cell on the bank");
         assert_eq!(
             anchors.iter().filter(|a| **a).count(),
             1,
             "one middle in a square pool"
         );
+    }
+
+    /// A stream rising 0.4 yd towards the foot of a fall is one section and votes one plane
+    /// everywhere, so the mirror does not move with the camera along it.
+    #[test]
+    fn a_section_votes_one_plane() {
+        let lq = sheet(8, 40, |_, j| 33.30 + 0.01 * j as f32);
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        let planes = map.planes(&lq);
+        assert!(
+            planes.iter().all(|z| (*z - planes[0]).abs() < 1e-4),
+            "{planes:?}"
+        );
+        assert!((planes[0] - 33.5).abs() < 0.01, "the section's mean");
     }
 
     /// A 375-yd river descending 0.2 yd per cell breaks into short steps, none big enough for a
@@ -425,9 +455,9 @@ mod tests {
     /// keeps only its own cells and their ring.
     #[test]
     fn a_tile_measures_its_sections_across_its_neighbours() {
-        let own = sheet(10, 10, |_, _| 20.0);
+        let own = sheet(5, 5, |_, _| 20.0);
         // The rest of the lake, starting where `own` ends.
-        let next = sheet_at(-8545.0 - 10.0 * U, 300.0, 10, 60, |_, _| 20.0);
+        let next = sheet_at(-8545.0 - 5.0 * U, 300.0, 5, 10, |_, _| 20.0);
         let alone = PlanarMap::build_tile([&own].into_iter(), std::iter::empty()).expect("a grid");
         assert!(
             alone.weight.values().all(|w| *w == 0.0),
@@ -440,8 +470,8 @@ mod tests {
         );
         assert_eq!(
             map.weight.len(),
-            10 * 11,
-            "its own 100 cells and the neighbour's first row"
+            5 * 6,
+            "its own 25 cells and the neighbour's first row"
         );
     }
 }

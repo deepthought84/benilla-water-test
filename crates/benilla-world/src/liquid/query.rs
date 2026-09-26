@@ -163,8 +163,9 @@ pub struct WaterChunkInfo {
     source: LiquidSource,
     kind: LiquidKind,
     grid: LiquidGrid,
-    /// Per cell, whether it may vote for a mirror plane (`liquid::planar`); empty when all may.
-    votes: Vec<bool>,
+    /// Per cell, the mirror plane it votes for, its section's height (`liquid::planar`), NaN on
+    /// probe water; empty when every cell votes its own surface.
+    planes: Vec<f32>,
     /// Per cell, whether it is the middle of probe water, where the probe may stand; empty: none.
     anchors: Vec<bool>,
 }
@@ -284,7 +285,7 @@ impl WaterChunkInfo {
                     inv_det: None,
                     fallback_z: f32::MIN,
                 },
-                votes: Vec::new(),
+                planes: Vec::new(),
                 anchors: Vec::new(),
             };
         }
@@ -331,15 +332,16 @@ impl WaterChunkInfo {
                 inv_det: (det.abs() > 1e-9).then(|| 1.0 / det),
                 fallback_z,
             },
-            votes: Vec::new(),
+            planes: Vec::new(),
             anchors: Vec::new(),
         }
     }
 
-    /// Which cells may vote for a mirror plane, one flag per cell; `None` lets every cell vote.
-    pub(crate) fn with_votes(mut self, votes: Option<Vec<bool>>) -> Self {
-        if let Some(v) = votes.filter(|v| v.len() == self.grid.wet.len()) {
-            self.votes = v;
+    /// The mirror plane each cell votes for, NaN where it does not; `None` lets every cell vote
+    /// its own surface.
+    pub(crate) fn with_planes(mut self, planes: Option<Vec<f32>>) -> Self {
+        if let Some(p) = planes.filter(|p| p.len() == self.grid.wet.len()) {
+            self.planes = p;
         }
         self
     }
@@ -383,26 +385,32 @@ impl WaterChunkInfo {
 
     /// Does any wet cell of this surface vote for a mirror plane?
     pub(crate) fn votes_any(&self) -> bool {
-        self.votes.is_empty() || self.votes.iter().zip(&self.grid.wet).any(|(v, w)| *v && *w)
+        self.planes.is_empty()
+            || self
+                .planes
+                .iter()
+                .zip(&self.grid.wet)
+                .any(|(p, w)| !p.is_nan() && *w)
     }
 
     /// Do some wet cells vote for a mirror plane and others not?
     pub(crate) fn votes_partly(&self) -> bool {
-        let mut wet = self.votes.iter().zip(&self.grid.wet).filter(|(_, w)| **w);
-        wet.clone().any(|(v, _)| *v) && wet.any(|(v, _)| !*v)
+        let mut wet = self.planes.iter().zip(&self.grid.wet).filter(|(_, w)| **w);
+        wet.clone().any(|(p, _)| !p.is_nan()) && wet.any(|(p, _)| p.is_nan())
     }
 
-    /// [`Self::surface_z_at`], answered only over cells that vote for a mirror plane.
+    /// The mirror plane the cell under WoW `(x, y)` votes for — its section's height — or `None`
+    /// over probe water or dry ground; the surface itself where no planes were given.
     pub(crate) fn planar_z_at(&self, x: f32, y: f32) -> Option<f32> {
-        if self.votes.is_empty() {
+        if self.planes.is_empty() {
             return self.surface_z_at(x, y);
         }
         if !self.contains(x, y) {
             return None;
         }
-        let (i, j, fx, fy) = self.grid.wet_cell_at(x, y)?;
-        let cells_x = self.grid.cols - 1;
-        self.votes[j * cells_x + i].then(|| self.grid.height_in_cell(i, j, fx, fy))
+        let (i, j, _, _) = self.grid.wet_cell_at(x, y)?;
+        let z = self.planes[j * (self.grid.cols - 1) + i];
+        (!z.is_nan()).then_some(z)
     }
 
     /// The surface height (WoW Z) at a WoW-space XY, `None` where dry: the one wet-or-dry question,
