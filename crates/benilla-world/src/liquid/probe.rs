@@ -1684,8 +1684,8 @@ fn place_probes(
     };
     let eye = eye.translation();
     let body = viewer.at.unwrap_or(eye);
-    // On the planar lane the probe serves probe water only, so it stands on it: at the point of
-    // it nearest the player, and asleep while none is near.
+    // On the planar lane the probe serves probe water only, so it stands in the middle of it: on
+    // the centre line nearest the player, never on the bank, and asleep while none is near.
     let bound = *style == WaterStyle::Stylised;
     let seat = bound.then(|| nearest_probe_water(&chunks, body)).flatten();
     probe.awake = !bound || seat.is_some_and(|(_, d)| d <= wake_reach(probe.awake));
@@ -1932,13 +1932,13 @@ fn wake_reach(awake: bool) -> f32 {
     }
 }
 
-/// The point of probe water (`liquid::planar`: falls, descending rivers, small pools) nearest
+/// The middle of the probe water (`liquid::planar`: falls, descending rivers, small pools) nearest
 /// `body` within [`PROBE_SLEEP_YD`], on its surface in Bevy space, and its horizontal distance.
 fn nearest_probe_water(chunks: &Query<&super::WaterChunkInfo>, body: Vec3) -> Option<(Vec3, f32)> {
     let (x, y) = wow_xy(Vec2::new(body.x, body.z));
     let far = PROBE_SLEEP_YD * PROBE_SLEEP_YD;
     let mut best: Option<([f32; 3], f32)> = None;
-    for c in chunks.iter().filter(|c| c.has_probe_water()) {
+    for c in chunks.iter().filter(|c| c.has_probe_anchor()) {
         let Some([[x0, y0], [x1, y1]]) = c.xy_bounds() else {
             continue;
         };
@@ -1947,7 +1947,7 @@ fn nearest_probe_water(chunks: &Query<&super::WaterChunkInfo>, body: Vec3) -> Op
         if box_d2 > far || best.is_some_and(|(_, bd)| bd <= box_d2) {
             continue;
         }
-        if let Some((p, d2)) = c.nearest_probe_water(x, y) {
+        if let Some((p, d2)) = c.nearest_probe_anchor(x, y) {
             if d2 <= far && best.is_none_or(|(_, bd)| d2 < bd) {
                 best = Some((p, d2));
             }

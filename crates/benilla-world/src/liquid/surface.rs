@@ -172,7 +172,8 @@ pub(crate) fn spawn_liquids<'a>(
             continue; // this kind's frames failed to load (warned at setup)
         };
         let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk)
-            .with_votes(planar.map(|p| p.votes(lq)));
+            .with_votes(planar.map(|p| p.votes(lq)))
+            .with_anchors(planar.map(|p| p.anchors(lq)));
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
         entities.push(
             commands
@@ -863,7 +864,8 @@ pub(crate) fn spawn_wmo_liquids<'a>(
         // Every kind carries the swim grid, so lava and slime swim; their damage is not modelled.
         commands.entity(surface).insert(
             wet_footprint(lq, &transform, LiquidSource::WmoGroup(pool))
-                .with_votes(planar.map(|p| p.votes(lq))),
+                .with_votes(planar.map(|p| p.votes(lq)))
+                .with_anchors(planar.map(|p| p.anchors(lq))),
         );
         if !lq.kind.is_fullbright() {
             commands.entity(surface).insert(FoamPatch);

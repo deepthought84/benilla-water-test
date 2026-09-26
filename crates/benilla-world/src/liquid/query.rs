@@ -165,6 +165,8 @@ pub struct WaterChunkInfo {
     grid: LiquidGrid,
     /// Per cell, whether it may vote for a mirror plane (`liquid::planar`); empty when all may.
     votes: Vec<bool>,
+    /// Per cell, whether it is the middle of probe water, where the probe may stand; empty: none.
+    anchors: Vec<bool>,
 }
 
 /// A surface's vertex grid in world WoW space and its lattice basis. A MODF placement is affine, so
@@ -283,6 +285,7 @@ impl WaterChunkInfo {
                     fallback_z: f32::MIN,
                 },
                 votes: Vec::new(),
+                anchors: Vec::new(),
             };
         }
         let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
@@ -329,6 +332,7 @@ impl WaterChunkInfo {
                 fallback_z,
             },
             votes: Vec::new(),
+            anchors: Vec::new(),
         }
     }
 
@@ -340,38 +344,39 @@ impl WaterChunkInfo {
         self
     }
 
-    /// Does any wet cell of this surface NOT vote for a mirror plane — water only the probe serves?
-    pub(crate) fn has_probe_water(&self) -> bool {
-        self.votes
+    /// Does this surface hold a cell the probe may stand on?
+    pub(crate) fn has_probe_anchor(&self) -> bool {
+        self.anchors
             .iter()
             .zip(&self.grid.wet)
-            .any(|(v, w)| !*v && *w)
+            .any(|(a, w)| *a && *w)
     }
 
-    /// The point of this surface's probe water nearest WoW `(x, y)`, with the water's height there
-    /// (WoW XYZ), and its squared horizontal distance; `None` without probe water.
-    pub(crate) fn nearest_probe_water(&self, x: f32, y: f32) -> Option<([f32; 3], f32)> {
+    /// Which cells are the middle of probe water, where the probe may stand (`liquid::planar`).
+    pub(crate) fn with_anchors(mut self, anchors: Option<Vec<bool>>) -> Self {
+        if let Some(a) = anchors.filter(|a| a.len() == self.grid.wet.len()) {
+            self.anchors = a;
+        }
+        self
+    }
+
+    /// The centre of this surface's probe-anchor cell nearest WoW `(x, y)`, on the water (WoW XYZ),
+    /// and its squared horizontal distance; `None` without one.
+    pub(crate) fn nearest_probe_anchor(&self, x: f32, y: f32) -> Option<([f32; 3], f32)> {
         let cells_x = self.grid.cols.checked_sub(1)?;
         let mut best: Option<([f32; 3], f32)> = None;
-        for cell in (0..self.votes.len()).filter(|&c| !self.votes[c] && self.grid.wet[c]) {
+        for cell in (0..self.anchors.len()).filter(|&c| self.anchors[c] && self.grid.wet[c]) {
             let (i, j) = (cell % cells_x, cell / cells_x);
             let corners = [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)]
                 .map(|(a, b)| self.grid.positions[b * self.grid.cols + a]);
-            let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-                (lo.min(p[0]), hi.max(p[0]))
-            });
-            let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-                (lo.min(p[1]), hi.max(p[1]))
-            });
-            let (px, py) = (x.clamp(x0, x1), y.clamp(y0, y1));
-            let d2 = (px - x) * (px - x) + (py - y) * (py - y);
+            let cx = corners.iter().map(|p| p[0]).sum::<f32>() / 4.0;
+            let cy = corners.iter().map(|p| p[1]).sum::<f32>() / 4.0;
+            let d2 = (cx - x) * (cx - x) + (cy - y) * (cy - y);
             if best.is_some_and(|(_, bd)| bd <= d2) {
                 continue;
             }
-            let z = self
-                .surface_z_at(px, py)
-                .unwrap_or_else(|| corners.iter().map(|p| p[2]).sum::<f32>() / 4.0);
-            best = Some(([px, py, z], d2));
+            let z = self.grid.height_in_cell(i, j, 0.5, 0.5);
+            best = Some(([cx, cy, z], d2));
         }
         best
     }

@@ -25,12 +25,18 @@ const MIN_AREA_YD2: f32 = 10_000.0;
 /// meet in a ramp and not at a cell edge.
 const RAMP_CELLS: u32 = 3;
 
+/// A probe cell is the middle of its water when no cell within this many is further from land:
+/// a pool's centre, a stream's centre line.
+const ANCHOR_CELLS: i32 = 6;
+
 type Key = (i32, i32);
 
 /// The mirror's weight per liquid cell, keyed by the cell's centre on the lattice.
 pub struct PlanarMap {
     cell: f32,
     weight: HashMap<Key, f32>,
+    /// Probe cells in the middle of their water — see [`ANCHOR_CELLS`] — where the probe may stand.
+    anchors: HashSet<Key>,
 }
 
 struct Cell {
@@ -76,20 +82,24 @@ impl PlanarMap {
             .fold(1.0, f32::min)
     }
 
+    /// Per cell of `lq`, whether the probe may stand there: probe water on its centre line.
+    pub fn anchors(&self, lq: &LiquidMesh) -> Vec<bool> {
+        self.per_cell(lq, |k| self.anchors.contains(&k))
+    }
+
     /// Per cell of `lq`, whether it may vote for a mirror plane: any weight above 0.
     pub fn votes(&self, lq: &LiquidMesh) -> Vec<bool> {
+        self.per_cell(lq, |k| self.weight.get(&k).is_none_or(|w| *w > 0.0))
+    }
+
+    fn per_cell(&self, lq: &LiquidMesh, f: impl Fn(Key) -> bool) -> Vec<bool> {
         let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
         if cols < 2 || rows < 2 || lq.positions.len() != cols * rows {
             return Vec::new();
         }
         let xt = cols - 1;
         (0..xt * (rows - 1))
-            .map(|c| {
-                let centre = cell_centre(lq, c % xt, c / xt);
-                self.weight
-                    .get(&key_of(centre, self.cell))
-                    .is_none_or(|w| *w > 0.0)
-            })
+            .map(|c| f(key_of(cell_centre(lq, c % xt, c / xt), self.cell)))
             .collect()
     }
 }
@@ -173,7 +183,53 @@ fn classify(
     let weight = ramp(cells, index, &planar)
         .filter(|(k, _)| keep.contains(k))
         .collect();
-    PlanarMap { cell, weight }
+    let shore = shore_distance(cells, index);
+    let anchors = cells
+        .iter()
+        .enumerate()
+        .filter(|&(k, c)| {
+            let (a, b) = c.key;
+            let r = ANCHOR_CELLS;
+            !planar[k]
+                && keep.contains(&c.key)
+                && (-r..=r).all(|da| {
+                    (-r..=r).all(|db| {
+                        index
+                            .get(&(a + da, b + db))
+                            .is_none_or(|&m| shore[m] <= shore[k])
+                    })
+                })
+        })
+        .map(|(_, c)| c.key)
+        .collect();
+    PlanarMap {
+        cell,
+        weight,
+        anchors,
+    }
+}
+
+/// Each cell's distance from dry land in cells: 1 beside a dry cell, rising towards the middle.
+fn shore_distance(cells: &[Cell], index: &HashMap<Key, usize>) -> Vec<u32> {
+    let mut dist = vec![u32::MAX; cells.len()];
+    let mut queue = VecDeque::new();
+    for (k, c) in cells.iter().enumerate() {
+        if neighbours(c.key).iter().any(|n| !index.contains_key(n)) {
+            dist[k] = 1;
+            queue.push_back(k);
+        }
+    }
+    while let Some(k) = queue.pop_front() {
+        for n in neighbours(cells[k].key) {
+            if let Some(&m) = index.get(&n) {
+                if dist[m] == u32::MAX {
+                    dist[m] = dist[k] + 1;
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+    dist
 }
 
 /// Mark each cell planar or not. Sections are seeded at the most common remaining height and take
@@ -337,6 +393,22 @@ mod tests {
             map.corner(edge[0], edge[1]),
             0.0,
             "the corner the fall touches"
+        );
+    }
+
+    /// The probe may stand only on the middle of probe water: a 9-cell-wide pool's centre
+    /// column, never a cell beside the bank.
+    #[test]
+    fn the_probe_anchors_on_the_middle_of_the_water() {
+        let lq = sheet(9, 9, |_, _| 55.91);
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        let anchors = map.anchors(&lq);
+        assert!(anchors[4 * 9 + 4], "the pool's centre");
+        assert!(!anchors[4 * 9], "a cell on the bank");
+        assert_eq!(
+            anchors.iter().filter(|a| **a).count(),
+            1,
+            "one middle in a square pool"
         );
     }
 
