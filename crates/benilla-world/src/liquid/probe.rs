@@ -1132,6 +1132,9 @@ pub(crate) struct WaterProbe {
     ever: bool,
     /// Whether the tier is live at all — the stylised looks only, like everything else here.
     armed: bool,
+    /// Whether the tier is needed here: always on the probe lanes, and on the planar lane only
+    /// while probe water is within [`PROBE_WAKE_YD`] — see [`probe_wanted_near`].
+    awake: bool,
     /// The live probes, one per six layers of [`cube`](Self::cube). Length is [`probe_slots`].
     pub(crate) slots: Vec<ProbeSlot>,
     /// Which slot the six capture cameras are currently pointed at, if a burst is running.
@@ -1680,11 +1683,15 @@ fn place_probes(
         return;
     };
     let eye = eye.translation();
+    let body = viewer.at.unwrap_or(eye);
+    probe.awake = *style != WaterStyle::Stylised || probe_wanted_near(&chunks, body, probe.awake);
+    if !probe.awake {
+        return;
+    }
     if probe_live() {
         // Over the player (the camera where there is no player), on land as on water: at the
         // higher of the feet and the water surface nearby, so it is never under the ground on a
         // bank nor under the surface when wading.
-        let body = viewer.at.unwrap_or(eye);
         let wet = |p: Vec2| {
             let (wx, wy) = wow_xy(p);
             chunks.iter().find_map(|c| c.surface_z_at(wx, wy))
@@ -1889,6 +1896,43 @@ fn drive_live(
 /// pipelines of everything around it.
 const LIVE_WARM_CYCLES: u32 = 3;
 
+/// On the planar lane the probe wakes when probe water comes this near the player, in yards:
+/// past [`PROBE_FADE_YD`], where its weight on the water reaches zero, by the ground a flying
+/// mount covers while the probe warms up, so a cube is ready before any water can show it.
+const PROBE_WAKE_YD: f32 = 200.0;
+
+/// …and sleeps again only past this, so standing at the edge does not toggle it.
+const PROBE_SLEEP_YD: f32 = 250.0;
+
+/// Whether probe water (`liquid::planar`: falls, descending rivers, small pools) lies within
+/// [`PROBE_WAKE_YD`] of `body`, or within [`PROBE_SLEEP_YD`] while the probe is `awake`.
+fn probe_wanted_near(chunks: &Query<&super::WaterChunkInfo>, body: Vec3, awake: bool) -> bool {
+    let reach = if awake { PROBE_SLEEP_YD } else { PROBE_WAKE_YD };
+    let (x, y) = wow_xy(Vec2::new(body.x, body.z));
+    chunks.iter().filter(|c| c.has_probe_water()).any(|c| {
+        c.xy_bounds().is_some_and(|[[x0, y0], [x1, y1]]| {
+            let (dx, dy) = (x - x.clamp(x0, x1), y - y.clamp(y0, y1));
+            dx * dx + dy * dy <= reach * reach
+        })
+    })
+}
+
+/// Drop every cube and the live cycle, so a probe woken elsewhere warms up afresh instead of
+/// showing the last place it slept.
+fn sleep_probe(probe: &mut WaterProbe) {
+    for slot in &mut probe.slots {
+        *slot = ProbeSlot::default();
+    }
+    probe.live_cycle = None;
+    probe.live_face = 0;
+    probe.live_back = 0;
+    probe.live_front = None;
+    probe.live_old = None;
+    probe.live_cycles = 0;
+    probe.copy_face = None;
+    probe.ever = false;
+}
+
 pub(super) fn drive_probe(
     style: Res<WaterStyle>,
     time: Res<Time>,
@@ -1911,7 +1955,10 @@ pub(super) fn drive_probe(
     cull.hold = cull.hold.saturating_sub(1);
     cull.active = cull.hold > 0;
     // `wants_probe`, not `is_stylised`: the march-only lane has no probe.
-    let want = style.wants_probe() && probe_enabled();
+    let want = style.wants_probe() && probe_enabled() && probe.awake;
+    if !want && probe.armed {
+        sleep_probe(&mut probe);
+    }
     probe.armed = want;
     probe.ever = probe.slots.iter().any(|s| s.captured);
     if !want {
@@ -2752,6 +2799,7 @@ pub(super) fn register(app: &mut App) {
         refresh_in: PROBE_FIRST_S,
         ever: false,
         armed: false,
+        awake: false,
         slots: vec![ProbeSlot::default(); probe_slots()],
         capturing: None,
         anchor: None,

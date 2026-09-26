@@ -340,6 +340,14 @@ impl WaterChunkInfo {
         self
     }
 
+    /// Does any wet cell of this surface NOT vote for a mirror plane — water only the probe serves?
+    pub(crate) fn has_probe_water(&self) -> bool {
+        self.votes
+            .iter()
+            .zip(&self.grid.wet)
+            .any(|(v, w)| !*v && *w)
+    }
+
     /// Does any wet cell of this surface vote for a mirror plane?
     pub(crate) fn votes_any(&self) -> bool {
         self.votes.is_empty() || self.votes.iter().zip(&self.grid.wet).any(|(v, w)| *v && *w)
