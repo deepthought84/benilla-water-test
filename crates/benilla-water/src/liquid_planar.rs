@@ -13,8 +13,9 @@
 //!   big water ([`BIG_AREA_YD2`]). In a group the largest body keeps a mirror, then the largest at
 //!   least [`GAP_YD`] from it; a body within that of either shares it, the rest give way.
 //! - Each connected **probe region** gets fixed probe spots: one per [`PART_CELLS`] of its length,
-//!   on its centre line, halfway down that part's drop. A cell reads the probe of its region's
-//!   nearest spot, blending towards the second nearest where two parts meet.
+//!   on its centre line, halfway down that part's drop; a part whose spot would stand within
+//!   [`SAME_SPOT_CELLS`] of one already placed reads that one. A cell reads the probe of its
+//!   region's nearest spot, blending towards the second nearest where two parts meet.
 //! - Mirror water within [`RAMP_CELLS`] of probe water ramps its mirror weight from 0 to 1 and
 //!   reads the nearest probe region's spots, so the two tiers meet without an edge.
 //!
@@ -66,8 +67,12 @@ const PART_CELLS: u32 = 24;
 /// A part with fewer cells than this gets no spot of its own; its cells read the nearest.
 const PART_MIN_CELLS: usize = 8;
 
+/// Two spots nearer than this many cells, neighbouring cells of the lattice, stand at one place:
+/// the later part reads the spot already there, so one cube serves both.
+pub(crate) const SAME_SPOT_CELLS: f32 = 1.5;
+
 /// Bumped whenever the classification changes, so a cached map is rebuilt.
-pub const PLANAR_VERSION: u32 = 2;
+pub const PLANAR_VERSION: u32 = 3;
 
 type Key = (i32, i32);
 
@@ -396,12 +401,23 @@ impl PlanarMap {
         for cells in &regions {
             let mut ids: Vec<u16> = Vec::new();
             for k in place_spots(&g, cells, &region, &shore) {
+                let [x, y] = g.centre(k);
+                let at = [x, y, g.h[k]];
+                let near = |s: &ProbeSpot| {
+                    let d = [s.at[0] - at[0], s.at[1] - at[1], s.at[2] - at[2]];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() < SAME_SPOT_CELLS * cell
+                };
+                if let Some(id) = spots.iter().position(near) {
+                    if !ids.contains(&(id as u16)) {
+                        ids.push(id as u16);
+                    }
+                    continue;
+                }
                 if spots.len() >= NO_SPOT as usize {
                     break;
                 }
-                let [x, y] = g.centre(k);
                 ids.push(spots.len() as u16);
-                spots.push(ProbeSpot { at: [x, y, g.h[k]] });
+                spots.push(ProbeSpot { at });
             }
             for &k in cells {
                 answer[k] = CellWater {

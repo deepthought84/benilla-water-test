@@ -88,3 +88,31 @@ fn build(chain: &Chain, map: &str) -> Option<Arc<PlanarMap>> {
     }
     Some(Arc::new(m))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No two of the Eastern Kingdoms' probe spots stand on neighbouring cells: Loch Modan's dam
+    /// basin placed two 4 yd apart, one cube's worth of water taking two of the live slots.
+    #[test]
+    fn no_two_probe_spots_stand_on_neighbouring_cells() {
+        let data = benilla_formats::wow_data_or_skip!();
+        let chain = benilla_formats::open_chain(&data).expect("the install's patch chain");
+        let map = water_map(&chain, "Azeroth").expect("Azeroth's water");
+        let apart = crate::liquid_planar::SAME_SPOT_CELLS * 100.0 / 3.0 / 8.0;
+        let spots = map.spots();
+        for (i, a) in spots.iter().enumerate() {
+            for b in &spots[i + 1..] {
+                let d = [a.at[0] - b.at[0], a.at[1] - b.at[1], a.at[2] - b.at[2]];
+                let d = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                assert!(
+                    d >= apart,
+                    "spots at {:?} and {:?} are {d:.1} yd apart",
+                    a.at,
+                    b.at
+                );
+            }
+        }
+    }
+}
