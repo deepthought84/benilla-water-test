@@ -477,6 +477,18 @@ pub const ATTRIBUTE_WOW_PLANAR: bevy::mesh::MeshVertexAttribute =
         bevy::render::render_resource::VertexFormat::Float32x4,
     );
 
+/// Per vertex, the water's **current**, mesh-local XZ yards a second: downstream, zero on still
+/// water (`benilla_formats::WaterClasses::flow`). The stylised lane carries its ripple along it; zero
+/// on a mesh without it.
+///
+/// Own attribute id and shader location 13, beside [`ATTRIBUTE_WOW_PLANAR`].
+pub const ATTRIBUTE_WOW_FLOW: bevy::mesh::MeshVertexAttribute =
+    bevy::mesh::MeshVertexAttribute::new(
+        "Wow_Flow",
+        988_540_924,
+        bevy::render::render_resource::VertexFormat::Float32x2,
+    );
+
 impl MaterialExtension for LiquidExt {
     fn vertex_shader() -> ShaderRef {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
@@ -485,9 +497,9 @@ impl MaterialExtension for LiquidExt {
         "embedded://benilla_assets/shaders/liquid.wgsl".into()
     }
 
-    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`], [`ATTRIBUTE_WOW_SURFACE_NORMAL`] and
-    /// [`ATTRIBUTE_WOW_PLANAR`] into the vertex
-    /// layout, each behind its shader def, since Bevy builds the layout from its own attributes only.
+    /// Admits [`ATTRIBUTE_WOW_SHORE_OFFSET`], [`ATTRIBUTE_WOW_SURFACE_NORMAL`],
+    /// [`ATTRIBUTE_WOW_PLANAR`] and [`ATTRIBUTE_WOW_FLOW`] into the vertex layout, each behind its
+    /// shader def, since Bevy builds the layout from its own attributes only.
     ///
     /// `sky_order::WATER_BIAS` (−2e4) is a sort rung, kept out of the rasterizer: as a depth-bias
     /// constant it would move the waterline, by an amount that doubles at every float exponent
@@ -508,6 +520,7 @@ impl MaterialExtension for LiquidExt {
             (ATTRIBUTE_WOW_SHORE_OFFSET, 10, "LIQUID_SHORE_OFFSET"),
             (ATTRIBUTE_WOW_SURFACE_NORMAL, 11, "LIQUID_SURFACE_NORMAL"),
             (ATTRIBUTE_WOW_PLANAR, 12, "LIQUID_PLANAR"),
+            (ATTRIBUTE_WOW_FLOW, 13, "LIQUID_FLOW"),
         ];
         if !ours.iter().any(|(a, _, _)| layout.0.contains(*a)) {
             return Ok(());

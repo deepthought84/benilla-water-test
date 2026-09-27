@@ -3,7 +3,8 @@
 //! mirror), mirror weight (little-endian f32 × 6), then both probe spot ids (u16 × 2); a second
 //! file lists the spots (f32 × 3 each), a third each MCNK's north-west corner X, Y (f32) and top
 //! zone id (u32) then its 8 × 8 terrain heights at the cell centres (f32 × 64, NaN without MCVT),
-//! and a text file the zone names. Prints the timings and the cache size. Output is
+//! and a text file the zone names, and a fourth the current per wet cell: centre X, Y, then
+//! the flow's X, Y in yards a second (f32 × 4). Prints the timings and the cache size. Output is
 //! Blizzard data: never commit it.
 //! `cargo run --release -p benilla-water --example liquid_planar_map -- <map> <out-prefix>`
 
@@ -60,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     let cache = pm.to_bytes(0).len();
 
     let mut file = std::io::BufWriter::new(std::fs::File::create(format!("{out}.bin"))?);
+    let mut flows = std::io::BufWriter::new(std::fs::File::create(format!("{out}-flow.bin"))?);
     let mut cells = 0usize;
     for lq in &water {
         let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
@@ -89,10 +91,14 @@ fn main() -> anyhow::Result<()> {
             }
             file.write_all(&w.spots[0].to_le_bytes())?;
             file.write_all(&w.spots[1].to_le_bytes())?;
+            for v in [x, y, w.flow[0], w.flow[1]] {
+                flows.write_all(&v.to_le_bytes())?;
+            }
             cells += 1;
         }
     }
     file.flush()?;
+    flows.flush()?;
     let mut zones = std::io::BufWriter::new(std::fs::File::create(format!("{out}-zones.bin"))?);
     for ([x, y], z, ground) in &chunk_zones {
         zones.write_all(&x.to_le_bytes())?;

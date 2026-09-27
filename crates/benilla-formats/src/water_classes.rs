@@ -1,6 +1,7 @@
-//! Which water the planar mirrors serve and which the cube probes do, per 4.17-yd liquid cell: the
-//! shape the improved water's classification hands the base liquid code, which bakes it into the
-//! surface meshes and the mirror election without knowing how it was decided.
+//! Which water the planar mirrors serve, which the cube probes do and which way it runs, per
+//! 4.17-yd liquid cell: the shape the improved water's classification hands the base liquid code,
+//! which bakes it into the surface meshes and the mirror election without knowing how it was
+//! decided.
 
 use crate::LiquidMesh;
 
@@ -18,6 +19,8 @@ pub struct CellWater {
     pub spots: [u16; 2],
     /// The second spot's share, 0 to 1.
     pub mix: f32,
+    /// The current, WoW X and Y in yards a second: downstream, zero on still water.
+    pub flow: [f32; 2],
 }
 
 impl CellWater {
@@ -27,6 +30,7 @@ impl CellWater {
         weight: 1.0,
         spots: [NO_SPOT, NO_SPOT],
         mix: 0.0,
+        flow: [0.0, 0.0],
     };
 }
 
@@ -47,6 +51,12 @@ pub trait WaterClasses: Send + Sync + 'static {
 
     /// The probe spots, indexed by the ids cells carry.
     fn spots(&self) -> &[ProbeSpot];
+
+    /// The current at WoW `(x, y)`, yards a second, blended between the cells around it; zero
+    /// with no water there.
+    fn flow(&self, _x: f32, _y: f32) -> [f32; 2] {
+        [0.0, 0.0]
+    }
 
     /// Per cell of `lq`, the mirror plane it votes, NaN where none.
     fn planes(&self, lq: &LiquidMesh) -> Vec<f32> {

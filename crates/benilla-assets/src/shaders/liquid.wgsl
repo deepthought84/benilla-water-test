@@ -309,6 +309,8 @@ struct LiquidVsOut {
     // The two reflection tiers' split (`ATTRIBUTE_WOW_PLANAR`): x the mirrors' weight, y z the two
     // probe spots read, w the second's share.
     @location(10) planar: vec4<f32>,
+    // The current (`ATTRIBUTE_WOW_FLOW`), world XZ yards a second; zero on still water.
+    @location(11) flow: vec2<f32>,
 }
 
 // Sun sheen (`secondary`): the Blinn highlight `light_spec.rgb · (N·H)^shininess`.
@@ -1664,6 +1666,41 @@ fn planar_read(
     }
 }
 
+/// **The current**, Valve's two-phase flow map (Vlachos, "Water Flow in Portal 2", 2010): the ripple
+/// is carried along the current for one period and restarted, twice, half a period apart, each
+/// weighted by a triangle that is zero at its own restart, so neither reset is ever seen. The
+/// current is the map's (`ATTRIBUTE_WOW_FLOW`); on still water both phases read the same point and
+/// this is the unflowed layer exactly.
+const FLOW_PERIOD_S: f32 = 1.6;
+
+/// [`ripple_layer`], carried along `flow` (world XZ yards a second).
+fn ripple_flowing(
+    world_xz: vec2<f32>,
+    drift: vec2<f32>,
+    inv_wavelength: f32,
+    weight: f32,
+    t: f32,
+    rot: vec2<f32>,
+    flow: vec2<f32>,
+) -> vec2<f32> {
+    let ph0 = fract(t / FLOW_PERIOD_S);
+    let ph1 = fract(ph0 + 0.5);
+    let w0 = 1.0 - abs(2.0 * ph0 - 1.0);
+    // The second phase reads another stretch of the map, or the two restarts would show one
+    // pattern pulsing; scaled by the current, so still water keeps its one pattern.
+    let apart = vec2<f32>(0.37, 0.61) * saturate(length(flow)) / inv_wavelength;
+    let a = ripple_layer(world_xz - flow * ph0 * FLOW_PERIOD_S, drift, inv_wavelength, weight, t, rot);
+    let b = ripple_layer(
+        world_xz - flow * ph1 * FLOW_PERIOD_S + apart,
+        drift,
+        inv_wavelength,
+        weight,
+        t,
+        rot,
+    );
+    return a * w0 + b * (1.0 - w0);
+}
+
 fn stylised_water(
     world_pos: vec3<f32>,
     frag_coord: vec2<f32>,
@@ -1683,6 +1720,8 @@ fn stylised_water(
     /// The mirrors' weight, then the two probe spots and the second's share — see
     /// `ATTRIBUTE_WOW_PLANAR`.
     planar: vec4<f32>,
+    /// The current, world XZ yards a second — see `ATTRIBUTE_WOW_FLOW`.
+    flow: vec2<f32>,
     shallow: vec4<f32>,
     deep: vec4<f32>,
     lit: vec3<f32>,
@@ -1729,31 +1768,34 @@ fn stylised_water(
         // The two middle layers are what the broken highlight is MADE of: at twelve and at
         // three-and-a-half yards their features are the size of the bright patches in the
         // reference's sun column, so lifting them is what turns a smooth sheet into a mottle.
-        + ripple_layer(
+        + ripple_flowing(
             xz,
             vec2<f32>(-0.021, 0.010),
             inv_tile,
             1.00,
             t,
             vec2<f32>(0.4540, 0.8910),
+            flow,
         )
-        + ripple_layer(
+        + ripple_flowing(
             xz,
             vec2<f32>(0.014, -0.026),
             inv_tile / 0.30,
             0.70,
             t,
             vec2<f32>(-0.2924, 0.9563),
+            flow,
         )
         // Dialled back from 0.30 with the specular: the finest layer is the crinkle, and a fine
         // crinkle under a tight highlight is the texture of oil on water.
-        + ripple_layer(
+        + ripple_flowing(
             xz,
             vec2<f32>(0.041, 0.033),
             inv_tile / 0.12,
             0.20,
             t,
             vec2<f32>(-0.8572, 0.5150),
+            flow,
         );
     // ---- the live wave field ----------------------------------------------------------------
     //
@@ -2405,6 +2447,10 @@ struct LiquidVertex {
 #ifdef LIQUID_PLANAR
     @location(12) planar: vec4<f32>,
 #endif
+#ifdef LIQUID_FLOW
+    // The current, mesh-local XZ yards a second.
+    @location(13) flow: vec2<f32>,
+#endif
 }
 
 @vertex
@@ -2448,6 +2494,16 @@ fn vertex(in: LiquidVertex) -> LiquidVsOut {
     out.shore_offset = off_world.xz;
 #else
     out.shore_offset = vec2<f32>(in.uv_b.y, 0.0);
+#endif
+#ifdef LIQUID_FLOW
+    // The current, a direction like the offset: the placement's rotation and scale only.
+    out.flow = (mat3x3<f32>(
+        world_from_local[0].xyz,
+        world_from_local[1].xyz,
+        world_from_local[2].xyz,
+    ) * vec3<f32>(in.flow.x, 0.0, in.flow.y)).xz;
+#else
+    out.flow = vec2<f32>(0.0);
 #endif
     out.secondary_vtx = sun_sheen(out.world_normal, out.world_position.xyz);
     // ADT surfaces carry no `MeshTag`, so they take the scene fog.
@@ -2626,6 +2682,7 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
             in.shore_offset,
             in.surface_normal,
             in.planar,
+            in.flow,
             body_shallow,
             body_deep,
             lit,

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use bevy::prelude::*;
 
 mod depth;
+mod flow;
 mod hiz;
 mod liquid_planar;
 mod probe;

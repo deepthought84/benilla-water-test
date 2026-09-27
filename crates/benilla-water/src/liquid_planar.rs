@@ -1,6 +1,6 @@
-//! Which water a planar mirror serves and which the cube probe does, per 4.17-yd liquid cell,
-//! decided once over a whole map (or one WMO placement) so the answer never depends on what is
-//! streamed in.
+//! Which water a planar mirror serves, which the cube probe does and which way it runs, per 4.17-yd
+//! liquid cell, decided once over a whole map (or one WMO placement) so the answer never depends on
+//! what is streamed in.
 //!
 //! - A **body** is connected flat water between real slopes: a cell whose corners drop more than
 //!   [`SLOPE_YD`], two neighbours stepping more than that, or water climbing more than
@@ -18,14 +18,16 @@
 //!   region's nearest spot, blending towards the second nearest where two parts meet.
 //! - Mirror water within [`RAMP_CELLS`] of probe water ramps its mirror weight from 0 to 1 and
 //!   reads the nearest probe region's spots, so the two tiers meet without an edge.
+//! - Every water cell carries the **current** that runs through it (`flow`): downstream towards
+//!   the sea or its basin's lowest water, fast in a narrow channel and still on a lake.
 //!
-//! Magma and slime are neither: they vote no plane and take no probe.
+//! Magma and slime are neither: they vote no plane, take no probe and do not run.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use std::sync::Arc;
 
-use benilla_formats::{CellWater, LiquidMesh, ProbeSpot, WaterClasses, NO_SPOT};
+use benilla_formats::{CellWater, LiquidKind, LiquidMesh, ProbeSpot, WaterClasses, NO_SPOT};
 
 /// A cell whose corners differ by more than this, or two flat neighbours stepping more than this,
 /// is a real slope (a fall, rapids, a step at a chunk edge).
@@ -72,7 +74,7 @@ const PART_MIN_CELLS: usize = 8;
 pub(crate) const SAME_SPOT_CELLS: f32 = 1.5;
 
 /// Bumped whenever the classification changes, so a cached map is rebuilt.
-pub const PLANAR_VERSION: u32 = 3;
+pub const PLANAR_VERSION: u32 = 4;
 
 type Key = (i32, i32);
 
@@ -113,13 +115,17 @@ fn cell_centre(lq: &LiquidMesh, i: usize, j: usize) -> [f32; 2] {
 }
 
 /// The batch's wet cells, packed per chunk so a neighbour lookup costs one chunk hash.
-struct Grid {
-    cell: f32,
+pub(crate) struct Grid {
+    pub(crate) cell: f32,
     chunk: HashMap<Key, u32>,
     keys: Vec<Key>,
-    h: Vec<f32>,
+    /// Per cell, its mean height; NaN on a dry slot.
+    pub(crate) h: Vec<f32>,
     flat: Vec<bool>,
-    water: Vec<bool>,
+    /// Water, not magma or slime.
+    pub(crate) water: Vec<bool>,
+    /// Ocean water.
+    pub(crate) ocean: Vec<bool>,
 }
 
 impl Grid {
@@ -131,6 +137,7 @@ impl Grid {
             h: Vec::new(),
             flat: Vec::new(),
             water: Vec::new(),
+            ocean: Vec::new(),
         };
         for lq in meshes {
             let (cols, rows) = (lq.grid[0] as usize, lq.grid[1] as usize);
@@ -145,6 +152,7 @@ impl Grid {
                 }
             }
             let water = !lq.kind.is_fullbright();
+            let ocean = lq.kind == LiquidKind::Ocean;
             let xt = cols - 1;
             for (c, _) in lq.wet.iter().enumerate().filter(|(_, w)| **w) {
                 let (i, j) = (c % xt, c / xt);
@@ -164,6 +172,7 @@ impl Grid {
                     g.h.extend([f32::NAN; 64]);
                     g.flat.extend([false; 64]);
                     g.water.extend([false; 64]);
+                    g.ocean.extend([false; 64]);
                     g.keys
                         .extend((0..64).map(|s| (ck.0 * 8 + s / 8, ck.1 * 8 + s % 8)));
                 }
@@ -176,6 +185,7 @@ impl Grid {
                 g.h[k] = real.iter().sum::<f32>() / real.len() as f32;
                 g.flat[k] = hi - lo <= SLOPE_YD;
                 g.water[k] = water;
+                g.ocean[k] = ocean;
             }
         }
         (!g.h.is_empty()).then_some(g)
@@ -189,7 +199,7 @@ impl Grid {
 
     /// Per chunk (cell index / 64), the base of the chunk beside it along +a, -a, +b and -b;
     /// `u32::MAX` where there is none.
-    fn links(&self) -> Vec<[u32; 4]> {
+    pub(crate) fn links(&self) -> Vec<[u32; 4]> {
         (0..self.h.len() / 64)
             .map(|c| {
                 let (a, b) = self.keys[c * 64];
@@ -206,7 +216,7 @@ impl Grid {
 
     /// The wet cell `d` cells from `k` along one axis, `d` under a chunk's width, found through
     /// `links` without hashing.
-    fn step(&self, links: &[[u32; 4]], k: usize, (da, db): (i32, i32)) -> Option<usize> {
+    pub(crate) fn step(&self, links: &[[u32; 4]], k: usize, (da, db): (i32, i32)) -> Option<usize> {
         let slot = (k % 64) as i32;
         let (a, b) = (slot / 8 + da, slot % 8 + db);
         let base = match (a, b) {
@@ -230,7 +240,7 @@ impl Grid {
             .filter_map(|n| self.at(n))
     }
 
-    fn cells(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn cells(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.h.len()).filter(|&k| !self.h[k].is_nan())
     }
 
@@ -371,6 +381,16 @@ fn components(
 impl PlanarMap {
     /// Classify every cell of a map's MCLQ water, or one WMO placement's. `None` without a grid.
     pub fn build<'a>(meshes: impl Iterator<Item = &'a LiquidMesh>) -> Option<Self> {
+        Self::build_with(meshes, true)
+    }
+
+    /// [`Self::build`], with the current only where `currents` asks for it: a WMO placement's
+    /// pools sit on their own model-local lattice, off the one [`Self::flow`] samples, and are
+    /// still.
+    fn build_with<'a>(
+        meshes: impl Iterator<Item = &'a LiquidMesh>,
+        currents: bool,
+    ) -> Option<Self> {
         let g = Grid::build(meshes)?;
         let cell = g.cell;
 
@@ -456,6 +476,11 @@ impl PlanarMap {
                 answer[k].weight = dist[k].min(RAMP_CELLS) as f32 / RAMP_CELLS as f32;
             }
         }
+        if currents {
+            for (a, f) in answer.iter_mut().zip(crate::flow::currents(&g, &shore)) {
+                a.flow = f;
+            }
+        }
 
         let mut chunks = HashMap::with_capacity(g.chunk.len());
         for (&ck, &base) in &g.chunk {
@@ -463,7 +488,12 @@ impl PlanarMap {
             let slots: [CellWater; 64] = std::array::from_fn(|s| answer[base + s]);
             let wet = |s: usize| !g.h[base + s].is_nan();
             let first = (0..64).find(|&s| wet(s)).map(|s| slots[s]);
-            let uniform = first.filter(|f| (0..64).all(|s| !wet(s) || same(&slots[s], f)));
+            // A dry slot reads its chunk's uniform record, so a running chunk with dry slots keeps
+            // them, still, for the current to slow into the bank.
+            let uniform = first.filter(|f| {
+                (0..64).all(|s| !wet(s) || same(&slots[s], f))
+                    && (f.flow == [0.0, 0.0] || (0..64).all(wet))
+            });
             chunks.insert(
                 ck,
                 match uniform {
@@ -514,6 +544,28 @@ impl PlanarMap {
             .collect()
     }
 
+    /// The current at WoW `(x, y)`: the four cell centres around it blended bilinearly, a dry cell
+    /// counting as still water so the current slows into the bank.
+    pub fn flow(&self, x: f32, y: f32) -> [f32; 2] {
+        let (fx, fy) = (x / self.cell - 0.5, y / self.cell - 0.5);
+        let (a, b) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - a, fy - b);
+        let mut out = [0.0; 2];
+        for (da, db, w) in [
+            (0.0, 0.0, (1.0 - tx) * (1.0 - ty)),
+            (1.0, 0.0, tx * (1.0 - ty)),
+            (0.0, 1.0, (1.0 - tx) * ty),
+            (1.0, 1.0, tx * ty),
+        ] {
+            let at = ((a + da + 0.5) * self.cell, (b + db + 0.5) * self.cell);
+            if let Some(c) = self.cell(at.0, at.1) {
+                out[0] += c.flow[0] * w;
+                out[1] += c.flow[1] * w;
+            }
+        }
+        out
+    }
+
     /// Per cell of `lq`, the mirror plane it votes, NaN where none.
     pub fn planes(&self, lq: &LiquidMesh) -> Vec<f32> {
         self.cells(lq).iter().map(|c| c.plane).collect()
@@ -544,6 +596,8 @@ impl PlanarMap {
             out.extend_from_slice(&c.spots[0].to_le_bytes());
             out.extend_from_slice(&c.spots[1].to_le_bytes());
             out.extend_from_slice(&c.mix.to_le_bytes());
+            out.extend_from_slice(&c.flow[0].to_le_bytes());
+            out.extend_from_slice(&c.flow[1].to_le_bytes());
         };
         let mut order: Vec<&Key> = self.chunks.keys().collect();
         order.sort_unstable();
@@ -636,6 +690,7 @@ impl Bytes<'_> {
             weight: self.f32()?,
             spots: [self.u16()?, self.u16()?],
             mix: self.f32()?,
+            flow: [self.f32()?, self.f32()?],
         })
     }
 }
@@ -646,6 +701,7 @@ fn same(a: &CellWater, b: &CellWater) -> bool {
         && a.weight == b.weight
         && a.spots == b.spots
         && a.mix == b.mix
+        && a.flow == b.flow
 }
 
 /// Which large bodies give way: see the module doc's groups. Built from which bodies meet (water
@@ -739,7 +795,7 @@ fn stacked(
 }
 
 /// Each cell's distance from dry land in cells: 1 beside a dry cell, rising towards the middle.
-fn shore_distance(g: &Grid) -> Vec<u32> {
+pub(crate) fn shore_distance(g: &Grid) -> Vec<u32> {
     let mut dist = vec![u32::MAX; g.h.len()];
     let mut queue = VecDeque::new();
     for k in g.cells() {
@@ -855,17 +911,21 @@ impl WaterClasses for PlanarMap {
     fn spots(&self) -> &[ProbeSpot] {
         PlanarMap::spots(self)
     }
+
+    fn flow(&self, x: f32, y: f32) -> [f32; 2] {
+        PlanarMap::flow(self, x, y)
+    }
 }
 
 /// One batch of liquid classified on its own: a WMO placement's pools.
 pub(crate) fn classify_batch(liquids: &[&LiquidMesh]) -> Option<Arc<dyn WaterClasses>> {
-    PlanarMap::build(liquids.iter().copied()).map(|m| Arc::new(m) as Arc<dyn WaterClasses>)
+    PlanarMap::build_with(liquids.iter().copied(), false)
+        .map(|m| Arc::new(m) as Arc<dyn WaterClasses>)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use benilla_formats::LiquidKind;
 
     const U: f32 = 100.0 / 3.0 / 8.0;
     /// A lattice-aligned origin inside one ADT tile, as MCLQ grids are.
@@ -1117,6 +1177,135 @@ mod tests {
             .iter()
             .all(|c| c.plane.is_nan() && c.weight == 1.0 && c.spots == [NO_SPOT; 2]));
         assert!(map.spots().is_empty());
+    }
+
+    /// The current at a cell's centre.
+    fn current(map: &PlanarMap, lq: &LiquidMesh, i: usize, j: usize) -> [f32; 2] {
+        let [x, y] = cell_centre(lq, i, j);
+        map.flow(x, y)
+    }
+
+    /// A river falling along its length runs downhill, lengthwise, fastest mid-channel. Down the
+    /// rows is WoW −X in these sheets.
+    #[test]
+    fn a_falling_river_runs_downhill_along_its_channel() {
+        let lq = sheet(6, 80, |_, j| 40.0 - 0.05 * j as f32);
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        for j in [5, 40, 70] {
+            let [fx, fy] = current(&map, &lq, 3, j);
+            // Within 20° of the channel: the head of a river draws in towards its middle.
+            assert!(fx < -1.0 && fy.abs() < 0.36 * -fx, "row {j}: {fx}, {fy}");
+        }
+        let bank = current(&map, &lq, 0, 40)[0];
+        let mid = current(&map, &lq, 3, 40)[0];
+        assert!(bank > mid, "the bank runs slower: {bank} against {mid}");
+    }
+
+    /// A flat river runs to the sea it meets, and the sea itself does not run.
+    #[test]
+    fn a_flat_river_runs_to_the_sea() {
+        let river = sheet(6, 60, |_, _| 45.0);
+        let mut sea = sheet_at(X0 - 60.0 * U, Y0 + 20.0 * U, 46, 20, |_, _| 45.0);
+        sea.kind = LiquidKind::Ocean;
+        let map = PlanarMap::build([&river, &sea].into_iter()).expect("a grid");
+        for j in [5, 30, 55] {
+            let [fx, fy] = current(&map, &river, 3, j);
+            assert!(fx < -0.5 && fy.abs() < 0.3 * -fx, "row {j}: {fx}, {fy}");
+        }
+        assert_eq!(current(&map, &sea, 23, 10), [0.0, 0.0]);
+    }
+
+    /// A lake with nowhere to run is still, and so is magma.
+    #[test]
+    fn a_lake_and_magma_are_still() {
+        let lake = sheet(40, 40, |i, j| 12.0 + 0.025 * ((i * 7 + j * 13) % 5) as f32);
+        let map = PlanarMap::build([&lake].into_iter()).expect("a grid");
+        assert!(map.cells(&lake).iter().all(|c| c.flow == [0.0, 0.0]));
+        let mut magma = sheet(6, 80, |_, j| 40.0 - 0.05 * j as f32);
+        magma.kind = LiquidKind::Magma;
+        let map = PlanarMap::build([&magma].into_iter()).expect("a grid");
+        assert!(map.cells(&magma).iter().all(|c| c.flow == [0.0, 0.0]));
+    }
+
+    /// A dip in a river, as a step authored low, does not turn the water below it back upstream.
+    #[test]
+    fn a_dip_in_a_river_does_not_turn_it() {
+        let lq = sheet(6, 80, |_, j| {
+            40.0 - 0.05 * j as f32 - if (30..36).contains(&j) { 0.4 } else { 0.0 }
+        });
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        for j in [10, 32, 45, 70] {
+            let [fx, _] = current(&map, &lq, 3, j);
+            assert!(fx < -0.5, "row {j}: {fx}");
+        }
+    }
+
+    /// A lake on a river is fed at one end and drained at the other: the channels run through it,
+    /// and its middle is still.
+    #[test]
+    fn a_lake_on_a_river_runs_through_and_is_still_in_the_middle() {
+        let inflow = sheet(6, 40, |_, j| 50.0 - 0.05 * j as f32);
+        let lake = sheet_at(X0 - 40.0 * U, Y0 + 30.0 * U, 66, 60, |_, _| 47.0);
+        let outflow = sheet_at(X0 - 100.0 * U, Y0, 6, 40, |_, j| 46.9 - 0.05 * j as f32);
+        let map = PlanarMap::build([&inflow, &lake, &outflow].into_iter()).expect("a grid");
+        assert!(current(&map, &inflow, 3, 20)[0] < -0.5);
+        assert!(current(&map, &outflow, 3, 20)[0] < -0.5);
+        for (i, j) in [(33, 30), (0, 30), (1, 30), (3, 30), (65, 30), (20, 5)] {
+            assert_eq!(current(&map, &lake, i, j), [0.0, 0.0], "lake cell {i}, {j}");
+        }
+    }
+
+    /// A ramp falling off a lake that drains elsewhere, ending at dry land, runs down to its end
+    /// and not back up into the lake.
+    #[test]
+    fn a_ramp_running_off_its_water_runs_down_to_its_end() {
+        let lake = sheet(20, 20, |_, _| 50.0);
+        let river = sheet_at(X0 - 20.0 * U, Y0 - 8.0 * U, 4, 40, |_, j| {
+            49.9 - 0.05 * j as f32
+        });
+        let mut sea = sheet_at(X0 - 60.0 * U, Y0 + 10.0 * U, 30, 20, |_, _| 47.5);
+        sea.kind = LiquidKind::Ocean;
+        // Rows run towards the lake: row 7 meets it 1.5 yd down, row 0 is the dead end at 44 yd.
+        let ramp = sheet_at(X0 + 8.0 * U, Y0 - 8.0 * U, 4, 8, |_, j| {
+            44.0 + 0.6 * j as f32
+        });
+        let map = PlanarMap::build([&lake, &river, &sea, &ramp].into_iter()).expect("a grid");
+        for j in 0..8 {
+            let [fx, _] = current(&map, &ramp, 1, j);
+            assert!(fx > 0.3, "ramp row {j}: {fx}");
+        }
+        assert!(current(&map, &river, 2, 20)[0] < -0.3);
+    }
+
+    /// A basin tilted across both lattice axes, below a ridge between it and the sea, ends in
+    /// itself: its diagonals falling past the stretch step are not a way out.
+    #[test]
+    fn a_basin_tilted_on_the_diagonal_runs_to_its_own_low_end() {
+        let mut sea = sheet(10, 10, |_, _| 40.0);
+        sea.kind = LiquidKind::Ocean;
+        let ridge = sheet_at(X0 - 10.0 * U, Y0 - 3.0 * U, 4, 30, |_, j| {
+            40.2 + 0.2 * j as f32
+        });
+        let basin = sheet_at(X0 - 40.0 * U, Y0, 20, 35, |i, j| {
+            45.5 - 0.06 * j as f32 - 0.06 * i as f32
+        });
+        let map = PlanarMap::build([&sea, &ridge, &basin].into_iter()).expect("a grid");
+        let [fx, fy] = current(&map, &basin, 10, 17);
+        assert!(fx < 0.0 && fy < 0.0, "downhill is -X, -Y: {fx}, {fy}");
+    }
+
+    /// A chunk with one wet cell that runs still reads its dry slots as still.
+    #[test]
+    fn a_dry_slot_beside_running_water_is_still() {
+        let lq = sheet(6, 80, |_, j| 40.0 - 0.05 * j as f32);
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        let [x, y] = cell_centre(&lq, 0, 40);
+        assert_ne!(map.flow(x, y), [0.0, 0.0]);
+        assert_eq!(
+            map.flow(x, y + U),
+            [0.0, 0.0],
+            "the dry cell beside the bank"
+        );
     }
 
     #[test]

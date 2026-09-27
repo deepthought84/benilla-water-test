@@ -713,6 +713,7 @@ fn liquid_bevy_mesh(
     let mut shore_offsets: Vec<[f32; 2]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut planar_w: Vec<[f32; 4]> = Vec::new();
+    let mut flows: Vec<[f32; 2]> = Vec::new();
     let cell_water = planar.map(|p| p.cells(lq));
     let mut indices: Vec<u32> = Vec::new();
     let corner_n = corner_normals(lq, level);
@@ -759,6 +760,10 @@ fn liquid_bevy_mesh(
                     // Bevy world XZ.
                     let off = wow_to_bevy([shore_off[0], shore_off[1], 0.0]);
                     shore_offsets.push([off.x, off.z]);
+                    // The current, a direction and speed like the offset.
+                    let flow = planar.map_or([0.0, 0.0], |m| m.flow(p[0], p[1]));
+                    let flow = wow_to_bevy([flow[0], flow[1], 0.0]);
+                    flows.push([flow.x, flow.z]);
                     // The smooth normal: the four corners' normals, blended like the position.
                     let cn = |k: usize| corner_n[corner[k]];
                     let blend = Vec3::from(cn(0))
@@ -813,6 +818,8 @@ fn liquid_bevy_mesh(
     );
     // The mirrors' weight, 0 on probe water, and the probe spots read; see `ATTRIBUTE_WOW_PLANAR`.
     mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_PLANAR, planar_w);
+    // The current the ripple is carried along; see `ATTRIBUTE_WOW_FLOW`.
+    mesh.insert_attribute(benilla_assets::materials::ATTRIBUTE_WOW_FLOW, flows);
     // An interior pool's `MOMT.diffColor` rides the vertex colour, where the reference's interior
     // vertex carries it, keeping one material per lane; other lanes take the shader's white.
     if let Some([red, green, blue]) = body_color {
