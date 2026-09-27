@@ -3,8 +3,10 @@
 //! streamed in.
 //!
 //! - A **body** is connected flat water between real slopes: a cell whose corners drop more than
-//!   [`SLOPE_YD`], or two neighbours stepping more than that, ends it. A body votes one mirror
-//!   plane, halfway between its highest and lowest water, however gently it eases along the way.
+//!   [`SLOPE_YD`], two neighbours stepping more than that, or water climbing more than
+//!   [`SLOPE_GRADE`] across [`GRADE_CELLS`] cells either way (a river's ramp) ends it. A body
+//!   spanning more than [`BODY_SPAN_YD`] is cut into height bands, and each votes one mirror
+//!   plane halfway between its highest and lowest water.
 //! - **Probe water** is the slopes themselves, bodies under [`MIN_AREA_YD2`], and the bodies a
 //!   group of meeting waters cannot mirror: bodies meet when one's water lies within
 //!   [`BOX_MARGIN_YD`] of the other's bounding box, and groups link through basins but not through
@@ -27,6 +29,18 @@ use benilla_formats::{CellWater, LiquidMesh, ProbeSpot, WaterClasses, NO_SPOT};
 /// A cell whose corners differ by more than this, or two flat neighbours stepping more than this,
 /// is a real slope (a fall, rapids, a step at a chunk edge).
 const SLOPE_YD: f32 = 0.5;
+
+/// Water whose level changes by more than this per yard, end to end over [`GRADE_CELLS`] either
+/// side, is a slope too: the ramps between a river's flat reaches, which rise 1.5 to 12% while
+/// their flat water stays under 0.2%.
+const SLOPE_GRADE: f32 = 0.015;
+
+/// How many cells each way the grade is measured over: 25 yd end to end.
+const GRADE_CELLS: i32 = 3;
+
+/// The most one plane's water may span in height, in yards: no water is more than half this off
+/// its mirror.
+const BODY_SPAN_YD: f32 = 1.0;
 
 /// The least area a body needs to earn a mirror plane, in square yards: just under one MCLQ
 /// chunk. It keeps Elwynn's 1,579-yd² pond and drops slivers of flat water caught in a fall.
@@ -53,7 +67,7 @@ const PART_CELLS: u32 = 24;
 const PART_MIN_CELLS: usize = 8;
 
 /// Bumped whenever the classification changes, so a cached map is rebuilt.
-pub const PLANAR_VERSION: u32 = 1;
+pub const PLANAR_VERSION: u32 = 2;
 
 type Key = (i32, i32);
 
@@ -168,6 +182,42 @@ impl Grid {
         (!self.h[k].is_nan()).then_some(k)
     }
 
+    /// Per chunk (cell index / 64), the base of the chunk beside it along +a, -a, +b and -b;
+    /// `u32::MAX` where there is none.
+    fn links(&self) -> Vec<[u32; 4]> {
+        (0..self.h.len() / 64)
+            .map(|c| {
+                let (a, b) = self.keys[c * 64];
+                let (ca, cb) = (a.div_euclid(8), b.div_euclid(8));
+                [(1, 0), (-1, 0), (0, 1), (0, -1)].map(|(da, db)| {
+                    self.chunk
+                        .get(&(ca + da, cb + db))
+                        .copied()
+                        .unwrap_or(u32::MAX)
+                })
+            })
+            .collect()
+    }
+
+    /// The wet cell `d` cells from `k` along one axis, `d` under a chunk's width, found through
+    /// `links` without hashing.
+    fn step(&self, links: &[[u32; 4]], k: usize, (da, db): (i32, i32)) -> Option<usize> {
+        let slot = (k % 64) as i32;
+        let (a, b) = (slot / 8 + da, slot % 8 + db);
+        let base = match (a, b) {
+            (0..8, 0..8) => k - k % 64,
+            (8.., _) => links[k / 64][0] as usize,
+            (..0, _) => links[k / 64][1] as usize,
+            (_, 8..) => links[k / 64][2] as usize,
+            _ => links[k / 64][3] as usize,
+        };
+        if base == u32::MAX as usize {
+            return None;
+        }
+        let n = base + (a.rem_euclid(8) * 8 + b.rem_euclid(8)) as usize;
+        (!self.h[n].is_nan()).then_some(n)
+    }
+
     fn neighbours(&self, k: usize) -> impl Iterator<Item = usize> + '_ {
         let (a, b) = self.keys[k];
         [(a + 1, b), (a - 1, b), (a, b + 1), (a, b - 1)]
@@ -187,11 +237,98 @@ impl Grid {
     }
 }
 
-/// A body's mirror plane: halfway between its highest and lowest water, so neither end of a long
-/// river is further off it than half its drop.
+/// A body's mirror plane: halfway between its highest and lowest water, so none of it is further
+/// off than half [`BODY_SPAN_YD`].
 fn body_level(heights: impl Iterator<Item = f32>) -> f32 {
     let (lo, hi) = heights.fold((f32::MAX, f32::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
     (lo + hi) * 0.5
+}
+
+/// Per cell, whether its water climbs more than [`SLOPE_GRADE`] along either axis, end to end
+/// over the widest run of up to [`GRADE_CELLS`] cells each side that stays on flat water stepping
+/// at most [`SLOPE_YD`].
+fn graded(g: &Grid) -> Vec<bool> {
+    let links = g.links();
+    let flat = |k: usize| g.water[k] && g.flat[k];
+    let mut out = vec![false; g.h.len()];
+    for k in g.cells().filter(|&k| flat(k)) {
+        out[k] = [(1, 0), (0, 1)].into_iter().any(|(da, db)| {
+            let walk = |s: i32| {
+                let mut end = [k; GRADE_CELLS as usize];
+                let mut len = 0;
+                while len < GRADE_CELLS as usize {
+                    let prev = if len == 0 { k } else { end[len - 1] };
+                    match g.step(&links, prev, (s * da, s * db)) {
+                        Some(n) if flat(n) && (g.h[n] - g.h[prev]).abs() <= SLOPE_YD => {
+                            end[len] = n;
+                            len += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                (end, len)
+            };
+            let ((up, a), (down, b)) = (walk(1), walk(-1));
+            let reach = a.min(b);
+            reach > 0
+                && (g.h[up[reach - 1]] - g.h[down[reach - 1]]).abs()
+                    > SLOPE_GRADE * (2 * reach) as f32 * g.cell
+        });
+    }
+    out
+}
+
+/// Cut every body spanning more than [`BODY_SPAN_YD`] into the fewest equal height bands that
+/// keep each within it; each band's connected water is a body of its own, the first keeping the
+/// body's index.
+fn cut_tall(g: &Grid, body: &mut [u32], bodies: &mut Vec<Vec<usize>>) {
+    const PENDING: u32 = u32::MAX - 1;
+    for b in 0..bodies.len() {
+        let cells = &bodies[b];
+        let (lo, hi) = cells.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &k| {
+            (lo.min(g.h[k]), hi.max(g.h[k]))
+        });
+        let n = ((hi - lo) / BODY_SPAN_YD).ceil() as u32;
+        if n <= 1 {
+            continue;
+        }
+        let band = |k: usize| (((g.h[k] - lo) / ((hi - lo) / n as f32)) as u32).min(n - 1);
+        let cells = std::mem::take(&mut bodies[b]);
+        for &k in &cells {
+            body[k] = PENDING;
+        }
+        for &start in &cells {
+            if body[start] != PENDING {
+                continue;
+            }
+            let id = if bodies[b].is_empty() {
+                b
+            } else {
+                bodies.len()
+            };
+            let mut piece = vec![start];
+            body[start] = id as u32;
+            let mut q = 0;
+            while q < piece.len() {
+                let k = piece[q];
+                q += 1;
+                for m in g.neighbours(k) {
+                    if body[m] == PENDING
+                        && band(m) == band(start)
+                        && (g.h[k] - g.h[m]).abs() <= SLOPE_YD
+                    {
+                        body[m] = id as u32;
+                        piece.push(m);
+                    }
+                }
+            }
+            if id == b {
+                bodies[b] = piece;
+            } else {
+                bodies.push(piece);
+            }
+        }
+    }
 }
 
 /// Connected components of the cells `member` admits, joined where `link` allows; `u32::MAX`
@@ -232,12 +369,14 @@ impl PlanarMap {
         let g = Grid::build(meshes)?;
         let cell = g.cell;
 
-        // Bodies: flat water, split by real slopes.
-        let (body, bodies) = components(
+        // Bodies: flat water, split by real slopes, then cut into bands where one spans too far.
+        let graded = graded(&g);
+        let (mut body, mut bodies) = components(
             &g,
-            |k| g.water[k] && g.flat[k],
+            |k| g.water[k] && g.flat[k] && !graded[k],
             |a, b| (g.h[a] - g.h[b]).abs() <= SLOPE_YD,
         );
+        cut_tall(&g, &mut body, &mut bodies);
         let level: Vec<f32> = bodies
             .iter()
             .map(|c| body_level(c.iter().map(|&k| g.h[k])))
@@ -806,21 +945,48 @@ mod tests {
         assert_eq!(map.corner(edge[0], edge[1]), 0.0);
     }
 
-    /// A long river easing down 6 yd with no real slope is one body and one plane, halfway down:
-    /// neither end is more than 3 yd off it, and it never switches.
+    /// A river's ramp between two flat reaches, 6 yd down at 4.8% with no cell or step over
+    /// `SLOPE_YD`, is a slope: each reach keeps its own plane, and the ramp is probe water.
     #[test]
-    fn a_gently_descending_river_is_one_plane() {
-        let lq = sheet(8, 60, |_, j| {
-            if j < 30 {
-                40.0
-            } else {
-                40.0 - 0.2 * (j - 30) as f32
-            }
+    fn a_rivers_ramp_is_a_slope_between_two_planes() {
+        let lq = sheet(8, 90, |_, j| {
+            40.0 - 0.2 * j.clamp(30, 60).saturating_sub(30) as f32
         });
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        assert!((at(&map, &lq, 4, 10).plane - 40.0).abs() < 1e-3);
+        assert!((at(&map, &lq, 4, 80).plane - 34.0).abs() < 1e-3);
+        let ramp = at(&map, &lq, 4, 45);
+        assert!(ramp.plane.is_nan() && ramp.weight == 0.0, "{ramp:?}");
+    }
+
+    /// A river rising 1.5 yd over 1,250 yd, nowhere steep, is cut into planes a yard tall or
+    /// less: no water is more than half a yard off its mirror.
+    #[test]
+    fn a_gradual_rise_is_cut_into_planes_no_more_than_a_yard_tall() {
+        let lq = sheet(8, 300, |_, j| 40.0 + 0.005 * j as f32);
+        let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
+        let (cells, planes) = (map.cells(&lq), map.planes(&lq));
+        let mut off = 0.0f32;
+        for j in 0..300 {
+            for i in 0..8 {
+                let (c, z) = (cells[j * 8 + i], planes[j * 8 + i]);
+                if c.weight == 1.0 {
+                    off = off.max((z - (40.0 + 0.005 * (j as f32 + 0.5))).abs());
+                }
+            }
+        }
+        assert!(off <= 0.5 + 1e-3, "{off}");
+        assert!(at(&map, &lq, 4, 10).plane < at(&map, &lq, 4, 290).plane);
+    }
+
+    /// A flat lake's water stays one plane: the grade rule does not cut water that does not climb.
+    #[test]
+    fn the_grade_leaves_a_level_lake_whole() {
+        let lq = sheet(40, 40, |i, j| 12.0 + 0.025 * ((i * 7 + j * 13) % 5) as f32);
         let map = PlanarMap::build([&lq].into_iter()).expect("a grid");
         let planes = map.planes(&lq);
         assert!(
-            planes.iter().all(|z| (*z - 37.1).abs() < 0.05),
+            planes.iter().all(|z| (*z - planes[0]).abs() < 1e-6),
             "{planes:?}"
         );
     }
