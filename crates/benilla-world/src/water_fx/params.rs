@@ -37,7 +37,7 @@ pub(super) struct FoamParams {
 /// The reference's depth gate and its attenuation: `gate = max(2 × collisionHeight, 1.0)`, full
 /// strength to half of it, ramping toward ×0.5 past that; `None` out of the water or dived past the
 /// gate. Shared by the decals and the stylised water's wave simulation.
-pub(crate) fn depth_strength(height: f32, depth: f32) -> Option<f32> {
+pub fn depth_strength(height: f32, depth: f32) -> Option<f32> {
     let gate = (2.0 * height).max(1.0);
     if depth <= 0.0 || depth >= gate {
         return None;

@@ -10,8 +10,10 @@ workspace = true
 
 [features]
 # The dev/player seam: `cargo build -p benilla --no-default-features` is the player build.
-default = ["dev"]
+default = ["dev", "improved-water"]
 dev = ["benilla-app/dev"]
+# The Improved Water option's plugin (`benilla-water`); the player build keeps it.
+improved-water = ["benilla-app/improved-water"]
 # Profiling switches, forwarded so `cargo run -p benilla --features tracy` works.
 tracy = ["benilla-app/tracy"]
 trace_chrome = ["benilla-app/trace_chrome"]

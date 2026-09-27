@@ -211,7 +211,7 @@ fn init_hiz_pipelines(
     pipeline_cache: Res<PipelineCache>,
 ) {
     let shader: Handle<Shader> =
-        asset_server.load("embedded://benilla_world/shaders/hiz_reduce.wgsl");
+        asset_server.load("embedded://benilla_water/shaders/hiz_reduce.wgsl");
     // **Each entry point gets only the binding it uses, at its own index.** The two live in one
     // file, so both globals exist in the module; a layout built from a running count would hand
     // `fs_seed` a sampler where its shader declares a texture and wgpu rejects the pipeline. No

@@ -32,7 +32,7 @@ pub struct WowLighting {
     pub spec: [f32; 3],
     pub sun_dir: Vec3,
     /// The visible sun, camera to sun in Bevy space; unlike the lighting sun it rises and sets.
-    pub(crate) celestial_dir: Vec3,
+    pub celestial_dir: Vec3,
     /// Distance fog colour, `Light.dbc` IntBand row 7 raw, applied `GL_LINEAR` in-shader in gamma
     /// space; Bevy's `DistanceFog` blends in linear and would break the gamma invariant.
     pub fog_color: [f32; 3],
@@ -48,7 +48,7 @@ pub struct WowLighting {
     pub(crate) wmo_fog_start: f32,
     pub(crate) wmo_fog_end: f32,
     /// The five sky-dome stops, zenith to horizon (`Atmosphere.sky`, IntBand rows 2-6).
-    pub(crate) sky: [[f32; 3]; 5],
+    pub sky: [[f32; 3]; 5],
     /// Per-kind water tint `[shallow, deep]`: IntBand rows 16/17 (river, lake) and 14/15 (ocean),
     /// raw and area-blended like every band (`0x6d30e0` merges all 18 colour rows per light).
     pub(crate) water_river: [[f32; 3]; 2],
@@ -66,7 +66,7 @@ pub struct WowLighting {
     /// The sun lens-flare day envelope (`0xce9818`): 1 from 07:30 to 19:30, 0 at night.
     pub(crate) sun_flare_dn: f32,
     /// The white moon, camera to moon in Bevy space: up at night, below the horizon by day.
-    pub(crate) moon_dir_white: Vec3,
+    pub moon_dir_white: Vec3,
     /// The moon disc size multiplier (`0xce8c8c`): 1 overhead, 1.5 at moonrise and moonset.
     pub(crate) moon_disc_scale: f32,
     /// The moon lens-flare night envelope (`0xce9768`): 0 from 03:15 to 22:45, full after midnight.

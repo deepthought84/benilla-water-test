@@ -20,7 +20,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::LiquidMesh;
+use std::sync::Arc;
+
+use benilla_formats::{CellWater, LiquidMesh, ProbeSpot, WaterClasses, NO_SPOT};
 
 /// A cell whose corners differ by more than this, or two flat neighbours stepping more than this,
 /// is a real slope (a fall, rapids, a step at a chunk edge).
@@ -53,40 +55,7 @@ const PART_MIN_CELLS: usize = 8;
 /// Bumped whenever the classification changes, so a cached map is rebuilt.
 pub const PLANAR_VERSION: u32 = 1;
 
-/// No probe spot.
-pub const NO_SPOT: u16 = u16::MAX;
-
 type Key = (i32, i32);
-
-/// One cell's answer.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CellWater {
-    /// The mirror plane it votes, NaN where it votes none (probe water, magma).
-    pub plane: f32,
-    /// How far the mirrors serve it, 0 (probe water) to 1.
-    pub weight: f32,
-    /// The probe spots it reads, lower id first, [`NO_SPOT`] where none.
-    pub spots: [u16; 2],
-    /// The second spot's share, 0 to 1.
-    pub mix: f32,
-}
-
-impl CellWater {
-    /// No water here, or none the classification touches.
-    pub const DRY: CellWater = CellWater {
-        plane: f32::NAN,
-        weight: 1.0,
-        spots: [NO_SPOT, NO_SPOT],
-        mix: 0.0,
-    };
-}
-
-/// A fixed probe spot: where a probe stands for its region.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ProbeSpot {
-    /// Position on the water, in the batch's coordinates (absolute WoW yards for a map).
-    pub at: [f32; 3],
-}
 
 /// One MCNK's 8 × 8 cells: most are alike (open sea, a lake's interior) and share one record.
 #[derive(Clone, Debug, PartialEq)]
@@ -719,10 +688,29 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+impl WaterClasses for PlanarMap {
+    fn cells(&self, lq: &LiquidMesh) -> Vec<CellWater> {
+        PlanarMap::cells(self, lq)
+    }
+
+    fn corner(&self, x: f32, y: f32) -> f32 {
+        PlanarMap::corner(self, x, y)
+    }
+
+    fn spots(&self) -> &[ProbeSpot] {
+        PlanarMap::spots(self)
+    }
+}
+
+/// One batch of liquid classified on its own: a WMO placement's pools.
+pub(crate) fn classify_batch(liquids: &[&LiquidMesh]) -> Option<Arc<dyn WaterClasses>> {
+    PlanarMap::build(liquids.iter().copied()).map(|m| Arc::new(m) as Arc<dyn WaterClasses>)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LiquidKind;
+    use benilla_formats::LiquidKind;
 
     const U: f32 = 100.0 / 3.0 / 8.0;
     /// A lattice-aligned origin inside one ADT tile, as MCLQ grids are.

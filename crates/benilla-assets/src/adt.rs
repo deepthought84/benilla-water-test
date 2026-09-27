@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use benilla_formats::{
-    adt_to_tile_mesh, blp_bytes_to_native_chain, ChunkMesh, Doodad, PlanarMap, WmoInstance,
+    adt_to_tile_mesh, blp_bytes_to_native_chain, ChunkMesh, Doodad, WaterClasses, WmoInstance,
     ALPHA_MAP_SIZE, SHADOW_MAP_SIZE,
 };
 use bevy::asset::io::Reader;
@@ -43,7 +43,7 @@ pub struct AdtTile {
     pub chunks: Vec<ChunkMesh>,
     /// The map's whole water classification — which water the planar mirrors serve and where the
     /// probes stand — shared by all its tiles; `None` on a dry tile.
-    pub planar: Option<Arc<PlanarMap>>,
+    pub planar: Option<Arc<dyn WaterClasses>>,
 }
 
 /// One drawn chunk's array indices, uniform over its vertices.
@@ -271,14 +271,14 @@ async fn read_layer(ctx: &mut LoadContext<'_>, key: &str) -> Option<RawLayer> {
 
 /// An internal path as an `mpq://` URL.
 /// The map's water classification for a tile that has water: built at the map's first such tile
-/// and shared from then on — see [`crate::water_map`].
-fn tile_water_map(ctx: &LoadContext<'_>, chunks: &[ChunkMesh]) -> Option<Arc<PlanarMap>> {
+/// and shared from then on — see [`crate::water_hook`].
+fn tile_water_map(ctx: &LoadContext<'_>, chunks: &[ChunkMesh]) -> Option<Arc<dyn WaterClasses>> {
     if chunks.iter().all(|c| c.liquids.is_empty()) {
         return None;
     }
     let path = ctx.path().path().to_string_lossy().replace('\\', "/");
     let map = path.rsplit('/').nth(1)?;
-    crate::water_map::water_map(map)
+    crate::water_hook::water_classes(map)
 }
 
 fn mpq_url(key: &str) -> String {

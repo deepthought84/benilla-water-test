@@ -30,20 +30,19 @@ use bevy::prelude::*;
 use benilla_assets::materials::LiquidMaterial;
 use benilla_assets::AssetSet;
 
-mod depth;
 mod drift;
-mod hiz;
-mod probe;
+mod hooks;
 mod query;
 #[cfg(test)]
 mod real_data;
-mod reflect;
-mod scene_color;
-pub use probe::{ProbeMark, ProbeMarks};
 mod ripple;
-mod ripple_sim;
 mod spatial;
 mod surface;
+pub use hooks::{
+    mirror_view_shape, ProbeCull, ProbeFace, ProbeMark, ProbeMarks, ReflectionCamera,
+    WaterPassImages, WaterPassSet, DOME_LANES, MARCH_LANES, MIRROR2_LANES, PROBE_LANES,
+    PROBE_SLOT_MAX, REFLECT_FLOATS, UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER,
+};
 
 // The submodules are private: this list is everything the rest of the client may name.
 /// **Which water look the client draws** — the `waterStyle` CVar's knob, and the only setting in
@@ -64,7 +63,7 @@ pub enum WaterStyle {
     /// The 1.12 client's water, which is what the rest of this subsystem implements.
     Reference,
     /// benilla's Improved Water: the stylised surface, planar mirrors over flat water and fixed
-    /// cube probes over falls and small pools (`benilla_formats::PlanarMap`), with the
+    /// cube probes over falls and small pools (the `benilla-water` plugin), with the
     /// screen-space march a debug option.
     Stylised,
 }
@@ -97,12 +96,12 @@ impl WaterStyle {
     }
 
     /// Does this look drive the planar reflection cameras?
-    pub(crate) fn wants_mirror(self) -> bool {
+    pub fn wants_mirror(self) -> bool {
         self.is_stylised()
     }
 
     /// Does this look drive the cube probes?
-    pub(crate) fn wants_probe(self) -> bool {
+    pub fn wants_probe(self) -> bool {
         self.is_stylised()
     }
 
@@ -115,24 +114,32 @@ impl WaterStyle {
     }
 
     /// The shader lane (`LiquidParams.path.y`).
-    pub(crate) fn shader_flag(self) -> f32 {
+    pub fn shader_flag(self) -> f32 {
         f32::from(self.is_stylised())
     }
 }
 
-pub(crate) use probe::{ProbeCull, ProbeFace};
 pub use query::{
     camera_claim, describe_at, liquid_at, player_claim, surfaces_at, unit_claim, water_surface_at,
     EyeLiquid, FoamPatch, LiquidClaim, LiquidHit, LiquidSource, RoomPlacements, SubmergedEye,
     Underwater, WaterChunkInfo, WmoPool,
 };
-pub(crate) use reflect::ReflectionCamera;
-pub use reflect::{mirror_view_shape, UNMIRRORED_RENDER_LAYER, WATER_RENDER_LAYER};
-pub(crate) use spatial::{maintain_water_index, WaterIndex};
+pub(crate) use spatial::maintain_water_index;
+pub use spatial::WaterIndex;
+pub use surface::WaterMapRef;
 pub(crate) use surface::{
-    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WaterMapRef,
-    WetLattice,
+    spawn_liquids, spawn_wmo_liquids, LiquidAssets, LiquidSoundSource, LiquidSurface, WetLattice,
 };
+
+/// Present when a plugin draws Improved Water (`benilla-water`); without it that option draws the
+/// reference, since the stylised lane alone has no reflection tiers to read.
+#[derive(Resource)]
+pub struct ImprovedWaterPresent;
+
+/// Hold [`WaterStyle::Reference`] while no plugin draws Improved Water.
+fn hold_reference_without_plugin(mut style: ResMut<WaterStyle>) {
+    style.set_if_neq(WaterStyle::Reference);
+}
 
 /// `WOW_FORCE_SUB=<frames>`: hold the camera-eye verdict submerged for the first `<frames>` frames,
 /// then release it, so the wet-to-dry crossing lands on a known frame with no water or server.
@@ -174,9 +181,28 @@ impl Plugin for LiquidPlugin {
             .init_resource::<SubmergedEye>()
             .init_resource::<WaterIndex>()
             .init_resource::<WaterStyle>()
+            .init_resource::<ProbeMarks>()
             // PreUpdate: a surface streamed by last frame's commands is indexed before anyone asks.
             .add_systems(PreUpdate, maintain_water_index)
-            .add_systems(Startup, surface::setup_liquid.after(AssetSet::Open))
+            .add_systems(
+                PreUpdate,
+                hold_reference_without_plugin.run_if(
+                    not(resource_exists::<ImprovedWaterPresent>)
+                        .and(resource_changed::<WaterStyle>),
+                ),
+            )
+            // The pass images: a water plugin's, published in `WaterPassSet`, or placeholders.
+            .add_systems(
+                Startup,
+                (
+                    hooks::placeholder_pass_images.run_if(not(resource_exists::<WaterPassImages>)),
+                    surface::setup_liquid,
+                )
+                    .chain()
+                    .after(AssetSet::Open)
+                    .after(WaterPassSet),
+            )
+            .add_systems(Update, hooks::stamp_world_camera_layers)
             .add_systems(
                 Update,
                 (
@@ -211,19 +237,5 @@ impl Plugin for LiquidPlugin {
             );
         }
         drift::register(app);
-        // The stylised look's planar reflection — a whole subsystem of its own, and inert unless
-        // that look is selected.
-        reflect::register(app);
-        // ...and its wave simulation, which is the same story: a second subsystem, inert on the
-        // reference lane, where the client's own painted splash decals are the wake instead.
-        ripple_sim::register(app);
-        // ...and the scene depth it reads to know what is behind it, on the same terms: a second
-        // geometry pass, attached only while the stylised look is selected.
-        hiz::register(app);
-        scene_color::register(app);
-        depth::register(app);
-        // ...and the cubemap probe, the fourth tier: one capture of one lake's surroundings, which
-        // is the only tier that can answer for what is off the screen AND at the right orientation.
-        probe::register(app);
     }
 }

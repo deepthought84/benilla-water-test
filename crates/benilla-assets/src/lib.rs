@@ -35,8 +35,8 @@ pub use model::{
     ATTRIBUTE_WOW_JOINT_WEIGHT, ATTRIBUTE_WOW_MERGED_SLOT,
 };
 mod adt;
-mod water_map;
-pub use water_map::set_state_dir;
+mod water_hook;
+pub use water_hook::{classify_liquids, set_water_classifier, WaterClassifier};
 mod terrain;
 mod wdt;
 pub use adt::{chunk_to_mesh, chunks_to_mesh, AdtLoader, AdtTile, ChunkShading};
@@ -194,7 +194,7 @@ fn strip_sampler_marker(path: &str) -> Option<String> {
 /// `AssetPlugin` builds (before `DefaultPlugins`), which reads the sources.
 pub fn register_mpq_source(app: &mut App, data_dir: &Path) -> Result<()> {
     let reader = MpqAssetReader::open(data_dir)?;
-    water_map::set_chain(reader.chain.clone());
+    water_hook::set_chain(reader.chain.clone());
     app.register_asset_source(
         MPQ_SOURCE,
         AssetSourceBuilder::new(move || -> Box<dyn ErasedAssetReader> { Box::new(reader.clone()) }),

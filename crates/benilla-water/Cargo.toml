@@ -1,0 +1,26 @@
+[package]
+name = "benilla-water"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Improved Water: planar mirrors, fixed cube probes, the screen-space march and the wave simulation, plugged into the engine's liquid seam; the reference water needs none of it"
+
+[lints]
+workspace = true
+
+[features]
+# The dev/player seam, forwarded as the engine crates do.
+default = ["dev"]
+dev = ["benilla-formats/dev", "benilla-assets/dev", "benilla-world/dev"]
+
+[dependencies]
+benilla-assets = { path = "../benilla-assets", default-features = false }
+benilla-formats = { path = "../benilla-formats", default-features = false }
+benilla-world = { path = "../benilla-world", default-features = false }
+bevy.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The whole-map dump example: zones and terrain heights beside the classification.
+anyhow.workspace = true
+benilla-adt = { path = "../benilla-adt" }

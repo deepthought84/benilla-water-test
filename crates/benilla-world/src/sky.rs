@@ -243,7 +243,7 @@ fn apply_sky_visibility(
 
 /// The dome's seven uniform rows (`sky0..sky4`, `fog`, `warp`): the dome material's, and the water
 /// march's for its sky hits, which agree with the dome only on the same bytes.
-pub(crate) fn dome_uniforms(light: &WowLighting) -> [Vec4; 7] {
+pub fn dome_uniforms(light: &WowLighting) -> [Vec4; 7] {
     // Quantized to bytes: Light.dbc stops are byte colours.
     let sky = light.sky.map(|c| col(benilla_assets::quant255(c)));
     let f = benilla_assets::quant255(light.fog_color);

@@ -46,13 +46,16 @@ use bevy::render::render_resource::{
     TextureUsages,
 };
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use bevy::render::view::Hdr;
 use bevy::render::{Render, RenderApp, RenderSystems};
 
-use super::query::WaterChunkInfo;
+use super::WaterChunkInfo;
 use super::WaterStyle;
 use crate::view::WorldCamera;
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
+use benilla_world::liquid::{
+    mirror_view_shape, ReflectionCamera, DOME_LANES, MARCH_LANES, MIRROR2_LANES, PROBE_LANES,
+    REFLECT_FLOATS,
+};
 
 /// How far from the eye a water surface may be and still be the **fallback** plane — the "water
 /// beside me" answer used when the view ray hits nothing, in yards. Finite, because the pass is a
@@ -189,28 +192,6 @@ const WATERLINE_CLIP_BIAS: f32 = 0.25;
 /// and this is the second half.
 const REFLECT_DISTORT: f32 = 0.055;
 
-/// The render layer liquid surfaces ride, and the one the reflection camera does not render.
-///
-/// Public because the app's booth-layer ladder (`portrait`) must stay clear of it, and asserts that
-/// it does — a silent layer collision there is exactly the class of bug that ladder was created to
-/// stop, and this is the engine's one claim on a layer index outside it.
-pub const WATER_RENDER_LAYER: usize = 31;
-
-/// The render layer for **world geometry that must never appear in the mirror** — the overhead unit
-/// names and the raid target marks.
-///
-/// They are not UI. The 1.12 client draws overhead names inside the world pass, depth-tested, as
-/// real camera-facing billboard meshes (`benilla_app::nameplates`), which is why walls occlude
-/// them — and it is also why the mirrored camera drew them, floating under the surface of every
-/// lake, back to front. A name is a label attached to the viewer's own eye; it has no reflection,
-/// any more than a cursor does.
-///
-/// Distinct from [`WATER_RENDER_LAYER`] even though both mean "the world camera draws it, the
-/// mirror does not", because the two say different things and only one of them is also a statement
-/// about the water: liquid is excluded so it cannot wash the image teal from in front of the
-/// mirrored lens, and merging them would make that reason cover labels too.
-pub const UNMIRRORED_RENDER_LAYER: usize = 30;
-
 /// The reflection target and the buffer the water samples it through.
 #[derive(Resource)]
 pub(crate) struct WaterReflect {
@@ -256,21 +237,6 @@ pub(crate) struct WaterReflect {
 /// fixed at compile time and the unused tail simply carries a zero validity flag.
 pub(crate) struct WaterReflectData(pub(crate) [f32; REFLECT_FLOATS]);
 
-/// Where the probe slots sit in [`WaterReflectData`].
-const PROBE_LANES: std::ops::Range<usize> = 48..48 + super::probe::PROBE_SLOT_MAX * 16;
-/// Where the dome's seven rows sit in [`WaterReflectData`] — `sky0..sky4`, `fog`, `warp`, as
-/// [`crate::sky::dome_uniforms`] hands them to the dome itself. The shader's `WaterReflect::dome`.
-const DOME_LANES: std::ops::Range<usize> = PROBE_LANES.end..PROBE_LANES.end + 28;
-/// The march's own switches — the shader's `WaterReflect::march`: `x` rays may pass behind tiles,
-/// `y` the ripple's origin shift, `z` the probe's softening, `w` probes bound to fixed spots.
-const MARCH_LANES: std::ops::Range<usize> = DOME_LANES.end..DOME_LANES.end + 4;
-/// The whole block's length in floats.
-/// The second mirror's row: plane, strength, distortion, tolerance — the same four as the first
-/// mirror's `params`, zero while it is off. See [`SECOND_SHARE_MIN`].
-const MIRROR2_LANES: std::ops::Range<usize> = MARCH_LANES.end..MARCH_LANES.end + 4;
-/// The whole block's length in floats.
-const REFLECT_FLOATS: usize = MIRROR2_LANES.end;
-
 /// How far the ripple shifts the reflected ray's origin, in yards.
 fn ripple_origin() -> f32 {
     3.0
@@ -308,14 +274,6 @@ impl Default for WaterReflectData {
 #[derive(Resource, Clone, ExtractResource)]
 pub(crate) struct WaterReflectBuffer(pub(crate) Buffer);
 
-/// Marks the mirrored camera.
-///
-/// `pub(crate)` because the retained static pass has to know this view exists: it draws into
-/// exactly the views it is told to, and the water's mirror is the second one (see
-/// `static_gx::render`'s marker).
-#[derive(Component)]
-pub(crate) struct ReflectionCamera(pub(crate) usize);
-
 /// The mirrored camera as [`drive_reflection`] writes it: its pose, its gate, its lens and its
 /// target, all four of which move together when the plane or the main view does.
 type MirrorCamera<'w, 's> = Query<
@@ -341,9 +299,8 @@ pub(super) fn register(app: &mut App) {
             Startup,
             setup_reflection
                 .after(benilla_assets::AssetSet::Open)
-                .before(super::surface::setup_liquid),
+                .before(super::WaterPassSet),
         )
-        .add_systems(Update, stamp_world_camera_layers)
         .add_systems(
             PostUpdate,
             (
@@ -365,50 +322,6 @@ pub(super) fn register(app: &mut App) {
         Render,
         upload_reflect.in_set(RenderSystems::PrepareResources),
     );
-}
-
-/// The world camera renders the world, the water, and the labels over it; the reflection camera
-/// renders only the world. One system rather than a component at the spawn, because there are three
-/// spawn sites for the same camera (the client's, its no-data fallback, and the world viewer's) and
-/// none of them should have to know that water is layered.
-fn stamp_world_camera_layers(
-    mut commands: Commands,
-    cameras: Query<Entity, (With<WorldCamera>, Added<WorldCamera>)>,
-) {
-    for entity in &cameras {
-        commands
-            .entity(entity)
-            .insert(bevy::camera::visibility::RenderLayers::from_layers(&[
-                0,
-                UNMIRRORED_RENDER_LAYER,
-                WATER_RENDER_LAYER,
-            ]));
-    }
-}
-
-/// The mirror's **view-key shape** — the components that decide which pipelines its draws need,
-/// kept in one place because a second camera has to reproduce them exactly.
-///
-/// A pipeline is specialized against the VIEW as well as the material, so this bundle is the whole
-/// reason the mirror does not share the world camera's pipelines: no multisampling and no glow pass
-/// (this image is sampled through a rippling normal at half resolution, where neither is
-/// recoverable), and — the axis that actually bites — **no `DepthPrepass`**. `liquid::depth` puts
-/// one on the `WorldCamera` alone, so every material this camera draws needs a second pipeline
-/// compiled without `DEPTH_PREPASS`. Measured at the Elwynn golden: the mirrored pass adds ten
-/// pipelines over `$WOW_NO_REFLECT=1`, and all ten differ from their main-view twin by that one
-/// def and nothing else.
-///
-/// Extracted so `pipe_warm`'s warm mirror can be built from the SAME bundle. Warming a view key by
-/// hand-copying four components is how a warm pass silently stops covering the thing it was written
-/// for: the copy keeps compiling, the keys quietly diverge, and the only symptom is the tripwire
-/// firing months later with no obvious connection to whatever changed here.
-pub fn mirror_view_shape() -> impl Bundle {
-    (
-        Camera3d::default(),
-        bevy::render::view::Msaa::Off,
-        Hdr,
-        bevy::core_pipeline::tonemapping::Tonemapping::None,
-    )
 }
 
 fn setup_reflection(
@@ -1454,9 +1367,9 @@ fn upload_reflect(
 
 #[cfg(test)]
 mod tests {
-    use super::super::query::LiquidSource;
     use super::*;
     use benilla_formats::LiquidKind;
+    use benilla_world::liquid::LiquidSource;
 
     /// The block's layout is the shader's `WaterReflect`: twelve shared rows, the probe slot array,
     /// then the dome's seven rows. A lane written past the probe block, or a probe block that grew
@@ -1470,7 +1383,7 @@ mod tests {
         assert_eq!(MARCH_LANES.start, DOME_LANES.end);
         assert_eq!(MARCH_LANES.len(), 4);
         assert_eq!(std::mem::size_of::<WaterReflectData>(), REFLECT_FLOATS * 4);
-        let wgsl = include_str!("../../../benilla-assets/src/shaders/liquid.wgsl");
+        let wgsl = include_str!("../../benilla-assets/src/shaders/liquid.wgsl");
         let body = &wgsl[wgsl.find("struct WaterReflect {").unwrap()..];
         let body = &body[..body.find("};").unwrap()];
         let probes = body

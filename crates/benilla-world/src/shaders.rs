@@ -17,9 +17,6 @@ pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/ffx_glow.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/wow_effect.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/static_gx.wgsl");
-    bevy::asset::embedded_asset!(app, "shaders/probe_face.wgsl");
-    bevy::asset::embedded_asset!(app, "shaders/probe_filter.wgsl");
-    bevy::asset::embedded_asset!(app, "shaders/hiz_reduce.wgsl");
 }
 
 #[cfg(test)]
@@ -56,6 +53,6 @@ mod tests {
             );
         }
         // One per `embedded_asset!` line in `plugin`.
-        assert_eq!(found, 11, "the engine's shader set changed size");
+        assert_eq!(found, 8, "the engine's shader set changed size");
     }
 }

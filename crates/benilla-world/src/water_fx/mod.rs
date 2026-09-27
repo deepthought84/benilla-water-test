@@ -14,7 +14,7 @@
 //! reference also lays foam at the MCLQ height, with only a depth bias (`0x68fd0f`):
 //! `0.125 × [0x810390]`, D3D `DEPTHBIAS` −1/8192.
 
-pub(crate) mod params;
+pub mod params;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::ecs::entity::EntityHashMap;

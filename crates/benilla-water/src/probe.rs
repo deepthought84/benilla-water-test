@@ -73,6 +73,7 @@ use bevy::render::renderer::{RenderContext, RenderDevice};
 use bevy::render::texture::GpuImage;
 
 use super::WaterStyle;
+use benilla_world::liquid::{ProbeCull, ProbeFace, ProbeMark, ProbeMarks};
 
 /// Where the one probe stands, in **Bevy world yards**.
 ///
@@ -152,7 +153,7 @@ const PROBE_BOX_OUT: f32 = 30.0;
 /// happened: at 110 yards and again at 45, the probe returned a soft blue wash and the lane looked
 /// identical to the one without it.
 ///
-/// The walls come from the water body itself ([`super::query::WaterChunkInfo`]'s footprint), so
+/// The walls come from the water body itself ([`super::WaterChunkInfo`]'s footprint), so
 /// they sit on the shoreline by construction rather than by tuning. Only the ceiling is authored,
 /// because no liquid footprint knows how tall the trees are.
 const PROBE_BOX_UP: f32 = 55.0;
@@ -274,8 +275,7 @@ fn probe_slots() -> usize {
     3
 }
 
-/// The shader's array is fixed-size, so this is the ceiling the uniform is built for.
-pub(crate) const PROBE_SLOT_MAX: usize = 16;
+pub(crate) use benilla_world::liquid::PROBE_SLOT_MAX;
 
 /// One live probe: the lattice cell it answers for, the point its cube was taken from, and its own
 /// proxy box.
@@ -317,7 +317,7 @@ pub(crate) struct ProbeSlot {
     /// **The shape of this is DISTANCE, not time.** A probe does not switch on when the lattice
     /// admits it; it grows as the player walks toward it, weak at the edge of its reach and full
     /// once they are properly inside it, so a new probe joins the picture a little at a time
-    /// instead of arriving. See [`fade_target`](Self::fade_target) for the ramp.
+    /// instead of arriving. See [`reach_target`](Self::reach_target) for the ramp.
     ///
     /// Time enters only as a rate limit on top of that shape, and it earns its place twice: it
     /// keeps a teleport from snapping every probe on at once, and it covers the one transition
@@ -389,7 +389,7 @@ impl ProbeSlot {
 }
 
 /// A **rate limit** on the distance ramp, in fractions of full strength per second — not the fade
-/// itself, which is [`ProbeSlot::fade_target`]'s business.
+/// itself, which is [`ProbeSlot::reach_target`]'s business.
 ///
 /// Half a second from nothing to full at the most. Walking never hits this limit; a teleport does,
 /// and so does the cube-content swap when a slot changes cell, which are the two cases where
@@ -604,13 +604,6 @@ fn probe_cube_show() -> bool {
     *ON.get_or_init(|| std::env::var_os("WOW_PROBE_CUBE").is_some())
 }
 
-/// Which cube face a capture camera owns, in wgpu's layer order: +X, -X, +Y, -Y, +Z, -Z.
-///
-/// Extracted to the render world so `WaterProbeNode` can pair each face's colour target with that
-/// view's `ViewDepthTexture` — the depth is what becomes the cube's alpha.
-#[derive(Component, Clone, Copy, bevy::render::extract_component::ExtractComponent)]
-pub(crate) struct ProbeFace(pub(crate) usize);
-
 /// The look and up vectors for each face, in wgpu's layer order.
 ///
 /// **World up, and it is the OPENGL convention negated — which is correct here, for a reason.**
@@ -684,31 +677,6 @@ pub(crate) struct WaterProbe {
     /// `slots * refresh` seconds at a cost of one burst per window.
     cursor: usize,
 }
-
-/// One probe as the debug overlays see it: where it stands, and whether the water can actually read
-/// it this frame.
-///
-/// A flat published view rather than access to the slots themselves, because the overlays want
-/// exactly two facts and the slot carries eight — including the resident/target split, which is an
-/// invariant of the capture scheduler and nobody else's business.
-#[derive(Clone, Copy, Debug)]
-pub struct ProbeMark {
-    /// The capture point, in **Bevy** world yards.
-    pub at: Vec3,
-    /// Whether this probe holds a cube the water is reading. False while a slot is waiting for its
-    /// first capture, and false for a slot the lattice has not given a cell to.
-    pub live: bool,
-    /// **This probe's share of the blend at the player's position**, 0 to 1 — normalised across the
-    /// taps, so the lit markers are the probes the water is actually reading and the rest are dark.
-    ///
-    /// Not the same as "available": since availability stopped falling off with distance, every
-    /// captured probe is available, and a marker showing that lit every probe on the map at once.
-    pub fade: f32,
-}
-
-/// The live probes, republished each frame for the minimap and world overlays.
-#[derive(Resource, Default)]
-pub struct ProbeMarks(pub Vec<ProbeMark>);
 
 /// Copy the slot list into [`ProbeMarks`]. Its own system rather than a tail on `drive_probe`,
 /// which returns early on several paths and would leave the overlay showing the frame before.
@@ -980,39 +948,6 @@ fn draw_probe_gizmos(
     }
 }
 
-/// What the probe needs the static cull to admit while it is capturing.
-///
-/// **A cubemap needs every direction and the cull list only has one.** `static_gx` builds a single
-/// visible set from the WORLD camera's frustum and every view draws it, so a probe face aimed
-/// anywhere the player is not looking receives terrain and sky and none of the trees, doodads or
-/// buildings that make a reflection worth having. The mirror accepts that knowingly — it is aimed
-/// roughly where the camera is — but for a cube it is not an approximation, it is the whole failure.
-///
-/// So during a capture the cull additionally admits everything within [`radius`](Self::radius) of
-/// the probe, frustum and farclip ignored. It is a sphere test per cell, it runs on six frames out
-/// of every three hundred and sixty, and the extra cells it admits are real world geometry that the
-/// main view simply clips — so the only cost is a little draw time on those frames. A second full
-/// cull walk was rejected for the mirror on cost grounds and would be the wrong answer here too.
-#[derive(Resource, Clone, Copy, Default)]
-pub(crate) struct ProbeCull {
-    /// Set for the whole capture and a few frames either side of it.
-    ///
-    /// **Held rather than pulsed, because system order is not guaranteed.** `cull_cells` and
-    /// `drive_probe` both run in `Update` with no ordering between them, so a flag raised as a face
-    /// is activated can easily be read by a cull that already ran — and that face captures a world
-    /// with no trees in it while its neighbours capture one with. It showed as two of the six faces
-    /// coming back as flat sky panels in the unwrapped cube while the other four held the forest.
-    /// A countdown that spans the whole six-frame capture cannot be raced.
-    pub(crate) active: bool,
-    /// The capture point, in Bevy world yards.
-    pub(crate) at: Vec3,
-    /// How far around it to admit, in yards — the box's reach plus its ceiling, so anything the
-    /// projection can land on has been drawn.
-    pub(crate) radius: f32,
-    /// Frames remaining on the hold. Counted down by `drive_probe`, read as `active` by the cull.
-    hold: u32,
-}
-
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct WaterProbeLabel;
 
@@ -1083,7 +1018,7 @@ fn setup_probe(mut commands: Commands, mut images: ResMut<Assets<Image>>, probe:
         commands
             .spawn((
                 Name::new(format!("water probe face {i}")),
-                super::reflect::mirror_view_shape(),
+                benilla_world::liquid::mirror_view_shape(),
                 ProbeFace(i),
                 Projection::Perspective(PerspectiveProjection {
                     // A cube face is a 90-degree square, and it has to be exact: anything else leaves a
@@ -1483,7 +1418,7 @@ fn init_probe_blit(
     pipeline_cache: Res<PipelineCache>,
 ) {
     let shader: Handle<Shader> =
-        asset_server.load("embedded://benilla_world/shaders/probe_face.wgsl");
+        asset_server.load("embedded://benilla_water/shaders/probe_face.wgsl");
     let layout = BindGroupLayoutDescriptor::new(
         "probe_face_layout",
         &BindGroupLayoutEntries::sequential(
@@ -1544,7 +1479,7 @@ fn init_probe_filter(
     pipeline_cache: Res<PipelineCache>,
 ) {
     let shader: Handle<Shader> =
-        asset_server.load("embedded://benilla_world/shaders/probe_filter.wgsl");
+        asset_server.load("embedded://benilla_water/shaders/probe_filter.wgsl");
     let layout = BindGroupLayoutDescriptor::new(
         "probe_filter_layout",
         &BindGroupLayoutEntries::sequential(

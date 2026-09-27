@@ -13,7 +13,7 @@ const CELL: f32 = 100.0 / 3.0;
 
 /// The XY grid hash over every loaded liquid surface.
 #[derive(Resource, Default)]
-pub(crate) struct WaterIndex {
+pub struct WaterIndex {
     cells: HashMap<[i32; 2], Vec<Entity>>,
 }
 
@@ -24,7 +24,7 @@ impl WaterIndex {
     }
 
     /// The surfaces whose box overlaps this WoW XY's cell: a superset the caller's tests narrow.
-    pub(crate) fn over(&self, x: f32, y: f32) -> &[Entity] {
+    pub fn over(&self, x: f32, y: f32) -> &[Entity] {
         self.cells
             .get(&Self::cell_of(x, y))
             .map_or(&[], Vec::as_slice)
@@ -32,7 +32,7 @@ impl WaterIndex {
 
     /// The surfaces in any cell the WoW box `[lo, hi]` touches, deduplicated: a superset, as
     /// [`Self::over`].
-    pub(crate) fn over_box(&self, lo: [f32; 2], hi: [f32; 2]) -> Vec<Entity> {
+    pub fn over_box(&self, lo: [f32; 2], hi: [f32; 2]) -> Vec<Entity> {
         let [x0, y0] = Self::cell_of(lo[0], lo[1]);
         let [x1, y1] = Self::cell_of(hi[0], hi[1]);
         let mut out = Vec::new();

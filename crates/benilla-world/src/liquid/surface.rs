@@ -23,7 +23,7 @@ use benilla_assets::LockRecover;
 use benilla_assets::{liquid_frame_array, RenderConfig, WorldAssets};
 use benilla_formats::{
     read_texture_mip_chain, terrain_height_at, BlpMipChain, ChunkMesh, LiquidKind, LiquidMesh,
-    PlanarMap, NO_SPOT,
+    WaterClasses, NO_SPOT,
 };
 
 /// The shared liquid materials by [`LiquidKey`]; absent without client data.
@@ -124,7 +124,7 @@ impl LiquidAssets {
 /// The map's water classification on an ADT surface: where the probe placement finds the fixed
 /// probe spots.
 #[derive(Component)]
-pub(crate) struct WaterMapRef(pub(crate) std::sync::Arc<PlanarMap>);
+pub struct WaterMapRef(pub std::sync::Arc<dyn WaterClasses>);
 
 /// Marks a spawned liquid surface: one per MCNK liquid layer or WMO group pool.
 #[derive(Component)]
@@ -158,7 +158,7 @@ pub(crate) fn spawn_liquids<'a>(
     // ([`shore_distances`]).
     chunks: &[ChunkMesh],
     // The map's water classification: which water the mirrors serve, where the probes stand.
-    planar: Option<&std::sync::Arc<PlanarMap>>,
+    planar: Option<&std::sync::Arc<dyn WaterClasses>>,
     liquid_assets: Option<&LiquidAssets>,
     meshes: &mut Assets<Mesh>,
     entities: &mut Vec<Entity>,
@@ -670,7 +670,7 @@ fn liquid_bevy_mesh(
     lq: &LiquidMesh,
     body_color: Option<[f32; 3]>,
     lattice: Option<&WetLattice>,
-    planar: Option<&PlanarMap>,
+    planar: Option<&dyn WaterClasses>,
     // Whether the spot ids are this batch's map's (ADT) and not a WMO placement's own.
     bind_spots: bool,
     shoreline: Option<&Shoreline>,
@@ -841,7 +841,7 @@ pub(crate) fn spawn_wmo_liquids<'a>(
     // find; it needs the WHOLE model's because a WMO's liquid is not one grid.
     lattice: Option<&WetLattice>,
     // The whole placement's mirror classes, for the same reason as the lattice.
-    planar: Option<&PlanarMap>,
+    planar: Option<&dyn WaterClasses>,
     entities: &mut Vec<Entity>,
 ) {
     let Some(liquid) = liquid_assets else {
@@ -926,16 +926,11 @@ pub(super) fn setup_liquid(
     config: Option<Res<RenderConfig>>,
     world_assets: Option<ResMut<WorldAssets>>,
     style: Res<WaterStyle>,
-    reflect: Res<super::reflect::WaterReflect>,
-    reflect_buf: Res<super::reflect::WaterReflectBuffer>,
-    scene_color: Res<super::scene_color::WaterSceneColor>,
-    probe: Res<super::probe::WaterProbe>,
-    hiz: Res<super::hiz::WaterHiz>,
-    sim: Res<super::ripple_sim::RippleSim>,
+    pass: Option<Res<super::WaterPassImages>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
 ) {
-    let (Some(_config), Some(mut world_assets)) = (config, world_assets) else {
+    let (Some(_config), Some(mut world_assets), Some(pass)) = (config, world_assets, pass) else {
         return; // no client data → no terrain, so no water either
     };
     // Light, fog and the water swatches come off the shared global-light buffer, as for terrain.
@@ -948,7 +943,7 @@ pub(super) fn setup_liquid(
     // The wave simulation's live field — one shared image too, and bound on every liquid material
     // for the same reason the map above is: the binding cannot be conditional, so the toggle stays
     // a uniform write rather than a material rebuild.
-    let wake = sim.image.clone();
+    let wake = pass.wake.clone();
     for &(kind, dir, stem, count) in FRAME_SETS {
         let Some((frames, frame_count)) =
             load_frame_array(&mut world_assets, &mut images, kind, dir, stem, count)
@@ -1001,14 +996,14 @@ pub(super) fn setup_liquid(
                 extension: LiquidExt {
                     frames: frames.clone(),
                     ripples: ripples.clone(),
-                    reflection: reflect.image.clone(),
-                    reflection2: reflect.image2.clone(),
-                    scene_color: scene_color.image.clone(),
-                    probe: probe.cube.clone(),
-                    hiz: hiz.image.clone(),
-                    hiz_far: hiz.far.clone(),
+                    reflection: pass.reflection.clone(),
+                    reflection2: pass.reflection2.clone(),
+                    scene_color: pass.scene_color.clone(),
+                    probe: pass.probe.clone(),
+                    hiz: pass.hiz.clone(),
+                    hiz_far: pass.hiz_far.clone(),
                     wake: wake.clone(),
-                    reflect_buf: reflect_buf.0.clone(),
+                    reflect_buf: pass.reflect_buf.clone(),
                     // x = fullbright (the sheet as body, still fogged); y = the ocean swatch;
                     // z = the interior fog block; w = water's sun-sheen exponent.
                     kind: Vec4::new(

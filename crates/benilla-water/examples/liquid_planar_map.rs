@@ -5,12 +5,13 @@
 //! zone id (u32) then its 8 × 8 terrain heights at the cell centres (f32 × 64, NaN without MCVT),
 //! and a text file the zone names. Prints the timings and the cache size. Output is
 //! Blizzard data: never commit it.
-//! `cargo run --release -p benilla-formats --example liquid_planar_map -- <map> <out-prefix>`
+//! `cargo run --release -p benilla-water --example liquid_planar_map -- <map> <out-prefix>`
 
 use std::io::Write;
 use std::time::Instant;
 
-use benilla_formats::{adt_liquids, LiquidMesh, PlanarMap};
+use benilla_formats::{adt_liquids, LiquidMesh};
+use benilla_water::PlanarMap;
 
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();

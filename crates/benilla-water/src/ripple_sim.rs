@@ -636,7 +636,7 @@ pub(super) fn register(app: &mut App) {
                 .after(benilla_assets::AssetSet::Open)
                 // The materials bind this image, and a material built before it exists would have
                 // to be rebuilt to get it — the same ordering the reflection target needs.
-                .before(super::surface::setup_liquid),
+                .before(super::WaterPassSet),
         )
         // After every mover has run for the frame, ahead of the other writer of the lane buffer.
         .add_systems(

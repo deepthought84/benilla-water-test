@@ -135,8 +135,9 @@ run doc-links scripts/doc-links.py
 run pass-span-lint scripts/pass-span-lint.py
 
 # player-build: `benilla` without `dev`, which compiles out the debug panel, perf HUD, inspector,
-# capture harness and probes, so it fails when any other code names one of them.
-run player-build cargo build -p benilla --no-default-features
+# capture harness and probes, so it fails when any other code names one of them. It ships the
+# Improved Water plugin, so that is built without `dev` too.
+run player-build cargo build -p benilla --no-default-features --features improved-water
 
 # player-tests: the unit tests of the `cfg(not(feature = "dev"))` code (the resolver skips the
 # source tree; the state folder sits beside the binary), which no other gate runs. WOW_DATA, which

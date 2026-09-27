@@ -245,7 +245,7 @@ impl LiquidGrid {
 impl WaterChunkInfo {
     /// The grid's highest wet vertex, which `super::real_data` shows is not the surface.
     #[cfg(test)]
-    pub(super) fn chunk_max_z(&self) -> f32 {
+    pub fn chunk_max_z(&self) -> f32 {
         self.grid.fallback_z
     }
 
@@ -335,7 +335,7 @@ impl WaterChunkInfo {
 
     /// The mirror plane each cell votes for, NaN where it does not; `None` lets every cell vote
     /// its own surface.
-    pub(crate) fn with_planes(mut self, planes: Option<Vec<f32>>) -> Self {
+    pub fn with_planes(mut self, planes: Option<Vec<f32>>) -> Self {
         if let Some(p) = planes.filter(|p| p.len() == self.grid.wet.len()) {
             self.planes = p;
         }
@@ -343,7 +343,7 @@ impl WaterChunkInfo {
     }
 
     /// Does any wet cell of this surface vote for a mirror plane?
-    pub(crate) fn votes_any(&self) -> bool {
+    pub fn votes_any(&self) -> bool {
         self.planes.is_empty()
             || self
                 .planes
@@ -353,14 +353,14 @@ impl WaterChunkInfo {
     }
 
     /// Do some wet cells vote for a mirror plane and others not?
-    pub(crate) fn votes_partly(&self) -> bool {
+    pub fn votes_partly(&self) -> bool {
         let mut wet = self.planes.iter().zip(&self.grid.wet).filter(|(_, w)| **w);
         wet.clone().any(|(p, _)| !p.is_nan()) && wet.any(|(p, _)| p.is_nan())
     }
 
     /// The mirror plane the cell under WoW `(x, y)` votes for — its section's height — or `None`
     /// over probe water or dry ground; the surface itself where no planes were given.
-    pub(crate) fn planar_z_at(&self, x: f32, y: f32) -> Option<f32> {
+    pub fn planar_z_at(&self, x: f32, y: f32) -> Option<f32> {
         if self.planes.is_empty() {
             return self.surface_z_at(x, y);
         }
@@ -374,7 +374,7 @@ impl WaterChunkInfo {
 
     /// The surface height (WoW Z) at a WoW-space XY, `None` where dry: the one wet-or-dry question,
     /// answered by the containing cell's bilinear, never by the grid's highest vertex.
-    pub(crate) fn surface_z_at(&self, x: f32, y: f32) -> Option<f32> {
+    pub fn surface_z_at(&self, x: f32, y: f32) -> Option<f32> {
         if !self.contains(x, y) {
             return None; // the bounding box is the cheap reject
         }
@@ -388,13 +388,13 @@ impl WaterChunkInfo {
     }
 
     /// Is this WoW-space XY inside the wet footprint's box?
-    pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
     }
 
     /// The wet footprint's XY box, `None` for an empty grid: what [`super::spatial::WaterIndex`]
     /// buckets by.
-    pub(super) fn xy_bounds(&self) -> Option<[[f32; 2]; 2]> {
+    pub fn xy_bounds(&self) -> Option<[[f32; 2]; 2]> {
         (self.min_x <= self.max_x && self.min_y <= self.max_y)
             .then_some([[self.min_x, self.min_y], [self.max_x, self.max_y]])
     }
@@ -423,12 +423,12 @@ impl WaterChunkInfo {
     }
 
     /// Does this WoW-space XY box overlap the wet footprint's box?
-    pub(crate) fn overlaps(&self, lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32) -> bool {
+    pub fn overlaps(&self, lo_x: f32, hi_x: f32, lo_y: f32, hi_y: f32) -> bool {
         hi_x >= self.min_x && lo_x <= self.max_x && hi_y >= self.min_y && lo_y <= self.max_y
     }
 
     /// Call `f` with every wet cell's four world WoW corners `[tl, tr, bl, br]`, for the foam clip.
-    pub(crate) fn for_each_wet_cell(&self, mut f: impl FnMut([[f32; 3]; 4])) {
+    pub fn for_each_wet_cell(&self, mut f: impl FnMut([[f32; 3]; 4])) {
         let g = &self.grid;
         let Some(cells_x) = g.cols.checked_sub(1) else {
             return;
@@ -443,7 +443,7 @@ impl WaterChunkInfo {
     /// The ambient loop's emitter target: the XY clamped into the footprint's box, at the surface's
     /// height there, or the highest wet vertex over a hole. The reference uses the nearest liquid
     /// cell; this clamp approximates it.
-    pub(crate) fn nearest_point_wow(&self, x: f32, y: f32) -> [f32; 3] {
+    pub fn nearest_point_wow(&self, x: f32, y: f32) -> [f32; 3] {
         let cx = x.clamp(self.min_x, self.max_x);
         let cy = y.clamp(self.min_y, self.max_y);
         [

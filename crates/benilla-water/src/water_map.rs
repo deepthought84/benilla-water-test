@@ -1,4 +1,4 @@
-//! A map's whole water classification (`benilla_formats::PlanarMap`): which water the planar
+//! A map's whole water classification ([`PlanarMap`]): which water the planar
 //! mirrors serve and where the probes stand. Built once per map from every tile's MCLQ at its
 //! first tile load, then read back from the state folder's cache, keyed on the install.
 
@@ -7,35 +7,33 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
-use benilla_formats::{adt_liquids, Chain, LiquidMesh, PlanarMap};
+use benilla_formats::{adt_liquids, Chain, LiquidMesh, WaterClasses};
+
+use crate::PlanarMap;
 use bevy::prelude::*;
 
-static CHAIN: OnceLock<Arc<Chain>> = OnceLock::new();
 static STATE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// One cell per map; the first tile load of a map builds it and every other waits on it.
 type MapCell = Arc<OnceLock<Option<Arc<PlanarMap>>>>;
 static MAPS: LazyLock<Mutex<HashMap<String, MapCell>>> = LazyLock::new(Default::default);
 
-/// The patch chain the classification reads tiles from; set with the `mpq://` source.
-pub(crate) fn set_chain(chain: Arc<Chain>) {
-    let _ = CHAIN.set(chain);
-}
-
 /// Where the classification is cached: the state folder, or `None` to keep nothing (a capture).
-pub fn set_state_dir(dir: Option<PathBuf>) {
+pub(crate) fn set_state_dir(dir: Option<PathBuf>) {
     let _ = STATE_DIR.set(dir);
 }
 
 /// The classification of `map` (its `World\Maps` directory name), built or read on first use.
-pub(crate) fn water_map(map: &str) -> Option<Arc<PlanarMap>> {
+pub(crate) fn water_map(chain: &Chain, map: &str) -> Option<Arc<dyn WaterClasses>> {
     let cell = MAPS
         .lock()
         .ok()?
         .entry(map.to_ascii_lowercase())
         .or_default()
         .clone();
-    cell.get_or_init(|| build(map)).clone()
+    cell.get_or_init(|| build(chain, map))
+        .clone()
+        .map(|m| m as Arc<dyn WaterClasses>)
 }
 
 fn cache_path(map: &str) -> Option<PathBuf> {
@@ -45,8 +43,7 @@ fn cache_path(map: &str) -> Option<PathBuf> {
     })
 }
 
-fn build(map: &str) -> Option<Arc<PlanarMap>> {
-    let chain = CHAIN.get()?;
+fn build(chain: &Chain, map: &str) -> Option<Arc<PlanarMap>> {
     let fingerprint = chain.fingerprint();
     let path = cache_path(map);
     if let Some(bytes) = path.as_ref().and_then(|p| std::fs::read(p).ok()) {

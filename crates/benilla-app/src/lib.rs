@@ -277,8 +277,6 @@ pub fn run(build: BuildId) -> AppExit {
             if let Err(e) = benilla_assets::register_mpq_source(&mut app, &data_dir) {
                 eprintln!("benilla-assets: mpq:// source unavailable ({e:#})");
             }
-            // The map water classification caches under the state folder; none in a capture.
-            benilla_assets::set_state_dir(crate::local_state::home());
         }
         None => eprintln!(
             "benilla: no WoW install found — looked in {:?}",
@@ -379,6 +377,12 @@ pub fn run(build: BuildId) -> AppExit {
     .add_plugins(game_plugins::GamePlugins {
         connect: !capturing,
         start: run_mode::start_state(),
+    });
+    // The Improved Water option's passes; its map classification caches under the state folder,
+    // none in a capture.
+    #[cfg(feature = "improved-water")]
+    app.add_plugins(benilla_water::ImprovedWaterPlugin {
+        cache_dir: crate::local_state::home(),
     });
 
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.
