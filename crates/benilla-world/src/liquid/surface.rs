@@ -931,7 +931,6 @@ pub(super) fn setup_liquid(
     scene_color: Res<super::scene_color::WaterSceneColor>,
     probe: Res<super::probe::WaterProbe>,
     hiz: Res<super::hiz::WaterHiz>,
-    ssr_pip: Res<super::ssr_pip::WaterSsrPip>,
     sim: Res<super::ripple_sim::RippleSim>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
@@ -1008,7 +1007,6 @@ pub(super) fn setup_liquid(
                     probe: probe.cube.clone(),
                     hiz: hiz.image.clone(),
                     hiz_far: hiz.far.clone(),
-                    ssr_pip: ssr_pip.image.clone(),
                     wake: wake.clone(),
                     reflect_buf: reflect_buf.0.clone(),
                     // x = fullbright (the sheet as body, still fogged); y = the ocean swatch;

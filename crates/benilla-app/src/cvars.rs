@@ -1793,13 +1793,7 @@ mod tests {
         assert!(res::<crate::perf::FpsJournalSetting>(&app).0);
         {
             use benilla_world::liquid::WaterStyle;
-            for (value, want) in [
-                ("1", WaterStyle::Stylised),
-                ("2", WaterStyle::StylisedSsr),
-                ("3", WaterStyle::StylisedProbe),
-                ("4", WaterStyle::StylisedSsrProbe),
-                ("0", WaterStyle::Reference),
-            ] {
+            for (value, want) in [("1", WaterStyle::Stylised), ("0", WaterStyle::Reference)] {
                 apply(&mut app, "waterStyle", value);
                 assert_eq!(*res::<WaterStyle>(&app), want);
                 assert_eq!(res::<WaterStyle>(&app).cvar(), value);

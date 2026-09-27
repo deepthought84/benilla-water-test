@@ -363,23 +363,6 @@ impl RippleSim {
         std::mem::swap(&mut self.prev, &mut self.h);
         std::mem::swap(&mut self.h, &mut self.next);
     }
-
-    /// Peak height and peak curvature over the field — the two numbers the encoding's scales are
-    /// guesses about, reported under `$WOW_WAKE_DEBUG` so they can be measured instead.
-    fn peaks(&self) -> (f32, f32) {
-        let at = |x: usize, y: usize| self.h[y * SIM_CELLS + x];
-        let mut peak_h = 0.0f32;
-        let mut peak_lap = 0.0f32;
-        for y in 1..SIM_CELLS - 1 {
-            for x in 1..SIM_CELLS - 1 {
-                peak_h = peak_h.max(at(x, y).abs());
-                let lap =
-                    at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1) - 4.0 * at(x, y);
-                peak_lap = peak_lap.max(lap.abs());
-            }
-        }
-        (peak_h, peak_lap)
-    }
 }
 
 /// One frame's encoded field on its way to the GPU.
@@ -515,8 +498,6 @@ fn drive_ripple_sim(
     mut was: Local<EntityHashMap<Vec3>>,
     // Fractions of a pulse owed to each unit, from distance travelled and from time standing still.
     mut credit: Local<EntityHashMap<f32>>,
-    // Seconds since the last `$WOW_WAKE_DEBUG` line.
-    mut report: Local<f32>,
 ) {
     // x/y = the window's lower corner, z = 1/extent, w = strength.
     let mut params = [0.0f32; 4];
@@ -639,27 +620,10 @@ fn drive_ripple_sim(
         // `Arc` is what the extract clones each frame, so the staging buffer is handed over rather
         // than copied; take a fresh one for the next step.
         *pixels = vec![0u8; SIM_CELLS * SIM_CELLS * 4];
-        if std::env::var_os("WOW_WAKE_DEBUG").is_some() && *report >= 1.0 {
-            *report = 0.0;
-            let (h, lap) = sim.peaks();
-            info!("WAKE peak_h={h:.4} peak_lap={lap:.5} slope_full={WAKE_SLOPE} height_full={WAKE_HEIGHT}");
-        }
-        *report += dt;
     }
 
     let corner = sim.corner();
-    // `$WOW_WAKE_SHOW=1` raises the strength lane past 1 and the shader paints the wave field
-    // itself onto the water instead of shading with it. It exists because the thing this file
-    // produces is *subtle by design*, and subtle is exactly what cannot be verified by looking: the
-    // first live capture of it was reported as a clear V-shaped wake and was the swimmer's shadow.
-    // A view with no interpretation in it settles that in one frame.
-    let show = std::env::var_os("WOW_WAKE_SHOW").is_some();
-    params = [
-        corner.x,
-        corner.y,
-        1.0 / SIM_YARDS,
-        if show { 2.0 } else { 1.0 },
-    ];
+    params = [corner.x, corner.y, 1.0 / SIM_YARDS, 1.0];
     data.0[16..20].copy_from_slice(&params);
 }
 

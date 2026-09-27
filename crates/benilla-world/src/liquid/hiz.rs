@@ -30,8 +30,8 @@
 //! occlusion culling binds the view depth exactly as this does.
 //!
 //! The view depth is only bindable once `liquid::depth` has added `TEXTURE_BINDING` to the world
-//! camera's `depth_texture_usages`, which takes a frame to reach the texture; until then — and under
-//! `$WOW_HIZ_SOURCE=prepass`, the A/B lever — the seed falls back to the prepass depth.
+//! camera's `depth_texture_usages`, which takes a frame to reach the texture; until then the seed
+//! falls back to the prepass depth.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -199,12 +199,9 @@ struct HizPipelines {
     reduce: CachedRenderPipelineId,
 }
 
-/// `$WOW_HIZ_SOURCE=prepass` — seed the pyramid from the depth prepass, as it was before it moved
-/// to the view's depth. The A/B lever for that move: with it, anything the prepass leaves out is
-/// invisible to the march again, which is how to see what the move bought.
+/// Whether the pyramid seeds from the depth prepass rather than the view's depth; it does not.
 fn seed_from_prepass() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_HIZ_SOURCE").as_deref() == Ok("prepass"))
+    false
 }
 
 fn init_hiz_pipelines(

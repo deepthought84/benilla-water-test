@@ -37,7 +37,7 @@
 //!
 //! ## It was off, and the reason was the HORIZON
 //!
-//! For a long time this was behind `$WOW_WATER_DEPTH` and disabled, because arming it punched holes
+//! For a long time this was disabled, because arming it punched holes
 //! in the world: terrain vanished wherever a river or lake ran over it and the sky showed through.
 //! It is on now, and the diagnosis that kept it off was wrong, which is worth recording because it
 //! sent two plausible fixes into the bin before the real one.
@@ -71,8 +71,6 @@
 //! moves MAE 1.786 over 29 % of its pixels, and that is the feature — absorption and the soft edge
 //! reading a true column instead of the authored byte.
 //!
-//! `$WOW_WATER_DEPTH=0` still forces it off, for bisecting a frame against the byte-only look.
-//!
 //! ## What is in it, and what is not
 //!
 //! Terrain is, which is what matters most: the seabed and the banks are what the water's column is
@@ -102,15 +100,6 @@ use bevy::render::render_resource::TextureUsages;
 use super::WaterStyle;
 use crate::view::WorldCamera;
 
-/// Is the prepass armed? **On**, with `$WOW_WATER_DEPTH=0` as the way back to the authored-byte
-/// look — see the module doc for the horizon bug that kept it off, and for what it costs.
-///
-/// Anything other than `0` reads as on, so the `=1` that every recipe in this repo carries keeps
-/// working.
-fn depth_enabled() -> bool {
-    std::env::var("WOW_WATER_DEPTH").as_deref() != Ok("0")
-}
-
 /// Attach the depth prepass while the stylised look is on, and take it away again when it is not.
 ///
 /// Change-gated on both sides: a steady state does nothing at all, and the insert/remove only fire
@@ -123,7 +112,7 @@ fn maintain_depth_prepass(
     // The SSR lane needs this more than the full stylised lane does: the march reads the prepass
     // and there is no planar capture behind it to fall back on, so a prepass-less SSR lane would
     // draw water with no reflection at all beyond the sky mix.
-    let want = style.is_stylised() && depth_enabled();
+    let want = style.is_stylised();
     for (entity, has, mut camera_3d) in &mut cameras {
         // **The view's depth has to be bindable for the march's pyramid** — `liquid::hiz` seeds it
         // from the view depth after the opaque pass, because the prepass is missing everything on
@@ -152,33 +141,4 @@ pub(super) fn register(app: &mut App) {
     // Every frame, but it is a query over one camera and a comparison — the work is the insert,
     // which happens on a style flip and on the first frame a camera exists.
     app.add_systems(Update, maintain_depth_prepass);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The gate's polarity, which has now flipped once. It reads **on** unarmed — the prepass is
-    /// the shipped behaviour — and only the explicit `0` turns it off; anything else, including the
-    /// `=1` every recipe in this repo and its decisions carry, leaves it on.
-    #[test]
-    fn the_prepass_is_on_unless_it_is_explicitly_switched_off() {
-        let restore = std::env::var("WOW_WATER_DEPTH").ok();
-        // SAFETY: single-threaded test, and the variable is restored before it returns.
-        unsafe {
-            std::env::remove_var("WOW_WATER_DEPTH");
-            assert!(depth_enabled(), "the default is armed");
-            std::env::set_var("WOW_WATER_DEPTH", "1");
-            assert!(depth_enabled(), "the historical =1 still means on");
-            std::env::set_var("WOW_WATER_DEPTH", "0");
-            assert!(
-                !depth_enabled(),
-                "and 0 is the way back to the authored byte"
-            );
-            match restore {
-                Some(v) => std::env::set_var("WOW_WATER_DEPTH", v),
-                None => std::env::remove_var("WOW_WATER_DEPTH"),
-            }
-        }
-    }
 }

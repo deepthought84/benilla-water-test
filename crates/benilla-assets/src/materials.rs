@@ -399,9 +399,6 @@ pub struct LiquidExt {
     /// The farthest-depth twin of [`Self::hiz`], which lets the march pass behind a tile.
     #[texture(117, sample_type = "float", filterable = false, visibility(fragment))]
     pub hiz_far: Handle<Image>,
-    /// `$WOW_SSR_PIP`'s image (`benilla_world::liquid::ssr_pip`); 1x1 while it is off.
-    #[storage_texture(116, image_format = Rgba16Float, access = WriteOnly, visibility(fragment))]
-    pub ssr_pip: Handle<Image>,
     /// The reflection's per-frame parameters (`benilla_world::liquid::reflect`), a buffer so the
     /// per-frame write does not rebuild every liquid material's bind group.
     #[storage(107, read_only, buffer, visibility(fragment))]

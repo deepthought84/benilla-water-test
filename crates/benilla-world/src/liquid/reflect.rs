@@ -84,7 +84,7 @@ fn look_reach(farclip: f32) -> f32 {
     farclip.max(REFLECT_RADIUS)
 }
 
-/// The mirror's own far clip, in yards — **not** the world camera's. `$WOW_MIRROR_FAR` overrides it.
+/// The mirror's own far clip, in yards — **not** the world camera's.
 ///
 /// The pass inherited the world lens whole (only its near plane was replaced), and the world lens
 /// reaches about 3000 yd: far beyond `farclip` on purpose, so the coarse WDL horizon can draw
@@ -105,8 +105,7 @@ fn look_reach(farclip: f32) -> f32 {
 /// with `$WOW_MIRROR_FAR` against `$WOW_GPU_MS` before moving the default.
 const MIRROR_FAR_YARDS: f32 = 500.0;
 
-/// How much smaller than the main view the mirror's target is, per side. `$WOW_REFLECT_SCALE`
-/// overrides it.
+/// How much smaller than the main view the mirror's target is, per side.
 ///
 /// Left at the 2 this pass shipped with, because raising it is a *look* change and belongs to
 /// whoever is looking at the water — but named and levered, because it is the cheapest knob here:
@@ -114,31 +113,14 @@ const MIRROR_FAR_YARDS: f32 = 500.0;
 /// third or a quarter of the mirror's fragments.
 const REFLECT_DOWNSCALE: u32 = 2;
 
-/// `$WOW_MIRROR_FAR=<yards>` — the mirror's frustum reach, for sweeping [`MIRROR_FAR_YARDS`]
-/// against the frame meter without a rebuild. Read once, like every other lever in this module.
+/// The mirror cameras' far plane, in yards.
 fn mirror_far() -> f32 {
-    static FAR: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *FAR.get_or_init(|| {
-        std::env::var("WOW_MIRROR_FAR")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or(MIRROR_FAR_YARDS)
-    })
+    MIRROR_FAR_YARDS
 }
 
-/// `$WOW_REFLECT_SCALE=<n>` — the mirror's resolution divisor, for the same reason. Clamped to a
-/// sane range: 1 is the main view's own size (the most this could ever want) and 8 is past the
-/// point where the capture holds a recognisable image at all.
+/// The mirror target's size divisor against the main view.
 fn reflect_downscale() -> u32 {
-    static SCALE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("WOW_REFLECT_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(REFLECT_DOWNSCALE)
-            .clamp(1, 8)
-    })
+    REFLECT_DOWNSCALE
 }
 
 /// How far from the capture plane a surface is still served at **full** reflection strength, in
@@ -189,8 +171,6 @@ const PLANE_TOLERANCE: f32 = 10.0;
 /// camera and a lower `clip_at` raises it. The existing value worked because `clip_at == plane`
 /// was the only case ever exercised. Correcting the sign is a separate change that has to be
 /// re-validated against Booty Bay, which is what the oblique clip exists for.
-///
-/// `$WOW_CLIP_DROP=<yards>` overrides it for that investigation.
 const MAX_CLIP_DROP: f32 = 0.0;
 
 /// The share of the most prominent body's score a surface needs before it may lower the clip.
@@ -281,8 +261,8 @@ const PROBE_LANES: std::ops::Range<usize> = 48..48 + super::probe::PROBE_SLOT_MA
 /// Where the dome's seven rows sit in [`WaterReflectData`] — `sky0..sky4`, `fog`, `warp`, as
 /// [`crate::sky::dome_uniforms`] hands them to the dome itself. The shader's `WaterReflect::dome`.
 const DOME_LANES: std::ops::Range<usize> = PROBE_LANES.end..PROBE_LANES.end + 28;
-/// The march's own switches — the shader's `WaterReflect::march`: `x` = rays may pass behind tiles
-/// (`$WOW_SSR_PASS_BEHIND=0` turns it off), `yzw` reserved.
+/// The march's own switches — the shader's `WaterReflect::march`: `x` rays may pass behind tiles,
+/// `y` the ripple's origin shift, `z` the probe's softening, `w` probes bound to fixed spots.
 const MARCH_LANES: std::ops::Range<usize> = DOME_LANES.end..DOME_LANES.end + 4;
 /// The whole block's length in floats.
 /// The second mirror's row: plane, strength, distortion, tolerance — the same four as the first
@@ -291,47 +271,24 @@ const MIRROR2_LANES: std::ops::Range<usize> = MARCH_LANES.end..MARCH_LANES.end +
 /// The whole block's length in floats.
 const REFLECT_FLOATS: usize = MIRROR2_LANES.end;
 
-/// `$WOW_RIPPLE_ORIGIN=<yards>` (default 3) — how far the wave moves each reflection ray's
-/// starting point on the water (`liquid.wgsl`'s `RIPPLE_ORIGIN_YD` explains why the origin);
-/// `march.y`.
+/// How far the ripple shifts the reflected ray's origin, in yards.
 fn ripple_origin() -> f32 {
-    static Y: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *Y.get_or_init(|| {
-        std::env::var("WOW_RIPPLE_ORIGIN")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 20.0))
-            .unwrap_or(3.0)
-    })
+    3.0
 }
 
-/// `$WOW_PROBE_SOFT=<texels>` — the probe's softening radius in cube texels (`liquid.wgsl`'s
-/// `sample_probe`), 0 for none; `march.z`.
+/// The probe's softening radius, in taps.
 fn probe_soft() -> f32 {
-    static Y: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *Y.get_or_init(|| {
-        std::env::var("WOW_PROBE_SOFT")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 16.0))
-            .unwrap_or(2.0)
-    })
+    2.0
 }
 
-/// `$WOW_SSR_PASS_BEHIND=0` — rays may no longer pass behind a tile once they are behind the
-/// thickness slab of its farthest surface; the traversal is FFX SSSR's again, and a ray that goes
-/// behind anything is judged against it alone. The A/B lever for the min-max traversal.
+/// Whether the march's rays may pass behind a tile past its thickness slab.
 fn pass_behind() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_SSR_PASS_BEHIND").as_deref() != Ok("0"))
+    true
 }
 
-/// `$WOW_SSR_SKY_READ=snapshot` — the march's sky hits read the colour buffer where the ray left
-/// the geometry, as they did before they asked the dome law. The A/B lever for that change; rides
-/// the dome's reserved `warp.z`.
+/// Whether the march's sky hits read the colour buffer rather than the dome law; they do not.
 fn sky_read_snapshot() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_SSR_SKY_READ").as_deref() == Ok("snapshot"))
+    false
 }
 
 /// Hand-written because `Default` for arrays stops at 32 elements, and this row count passed that
@@ -387,10 +344,6 @@ pub(super) fn register(app: &mut App) {
                 .before(super::surface::setup_liquid),
         )
         .add_systems(Update, stamp_world_camera_layers)
-        .add_systems(
-            Last,
-            trace_reflection.run_if(resource_exists::<WaterReflect>),
-        )
         .add_systems(
             PostUpdate,
             (
@@ -539,48 +492,6 @@ fn no_reflect() -> bool {
     *OFF.get_or_init(|| std::env::var_os("WOW_NO_REFLECT").is_some())
 }
 
-/// `$WOW_SSR=1` — the screen-space march **on top of the planar capture**, off by default.
-///
-/// This lever is about the *hybrid*, and only about the hybrid. [`WaterStyle::StylisedSsr`] does not
-/// consult it: on that lane the march is the only reflection there is, so there is nothing for a
-/// kill switch to fall back to and choosing the lane is already the request. What follows is the
-/// case against layering the march over a capture that is also running, which is a different
-/// question from whether the march is worth having alone.
-///
-/// The march traces `reflect(-V, N)` on the fragment's own normal, which has the ambient ripple and
-/// the wave field already summed into it. Neighbouring pixels therefore get meaningfully different
-/// ray directions, land on unrelated geometry or leave the frame, and the hit/miss flips pixel to
-/// pixel — so the blend between the march's colour and the mirror's flickers at pixel scale and the
-/// reflection tears into horizontal streaks. Measured at a grazing Stranglethorn lake: the march's
-/// own confidence flips between vertically adjacent pixels on 14% of pairs while only 20% of pixels
-/// get an answer at all, i.e. the hits are one or two pixels tall.
-///
-/// The later ray-traced work reached this conclusion independently and designed around it — rays
-/// cast flat, the ripple applied where the traced image is *read* — and **that fix has now been
-/// carried back**: `liquid.wgsl`'s `ssr_trace` casts on the geometric facet normal and displaces
-/// the read by `SSR_READ_DISTORT`. It is what turned the march from 11.8% of water pixels answered
-/// in a pixel-scale confetti into coherent regions of reflection, and it is why the SSR-only lane
-/// is offerable at all. The tearing described above was measured before that change. Neither reference does what this does: the sandbox this water was ported from
-/// (`/data/games/water-test`) has no march at all, and in the Cataclysm spec screen-space
-/// reflection is `reflectionMode` **0**, the cheapest of four modes, below sky and sky+terrain —
-/// the fallback for a machine that cannot afford a mirror, not the top of the range.
-///
-/// Kept rather than deleted because the problem it was written for is real: one horizontal plane is
-/// wrong by twice the tilt on a sloped stream. The per-fragment plane reprojection added after it
-/// addresses much of that without a march, which is the measurement to make before removing this.
-///
-/// Note that the tearing above is a *blend* artefact — the march's answer and the mirror's flipping
-/// against each other pixel to pixel — so it is specific to running both. With the capture stood
-/// down there is no second image to flicker against, and what the march misses fades to the sky mix
-/// over `SSR_EDGE_FADE` (`liquid.wgsl`) instead of to a different reflection. That is the argument for offering
-/// the SSR-only lane and not for turning this on.
-///
-/// Read once, like every lever here.
-fn ssr_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_SSR").as_deref() == Ok("1"))
-}
-
 /// How far the mirror capture is blurred before the water reads it, in **capture texels**.
 ///
 /// The reference pipeline blurs: Cataclysm's Ultra water renders the mirror into a downscaled
@@ -590,35 +501,17 @@ fn ssr_enabled() -> bool {
 /// See `sample_mirror` in `liquid.wgsl` for the kernel and why its average is premultiplied.
 ///
 /// One texel by default, which at [`REFLECT_DOWNSCALE`] is two of the main view's. It is a *look*
-/// number and belongs to whoever is looking at the water; `$WOW_REFLECT_BLUR=0` turns it off and
-/// gives back the image every capture before this was graded against.
+/// number and belongs to whoever is looking at the water.
 const REFLECT_BLUR_TEXELS: f32 = 1.0;
 
-/// `$WOW_REFLECT_BLUR=<texels>` — [`REFLECT_BLUR_TEXELS`], for sweeping the softness without a
-/// rebuild. Clamped: past a few texels the capture stops holding an image at all.
+/// The mirror capture's blur radius, in capture texels.
 fn reflect_blur() -> f32 {
-    static BLUR: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *BLUR.get_or_init(|| {
-        std::env::var("WOW_REFLECT_BLUR")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| *v >= 0.0)
-            .unwrap_or(REFLECT_BLUR_TEXELS)
-            .clamp(0.0, 8.0)
-    })
+    REFLECT_BLUR_TEXELS
 }
 
-/// `$WOW_REFLECT_DEBUG=1` — draw the mirrored camera's image **to the window** instead of into the
-/// water, over the top of the world view.
-///
-/// A reflection is the hardest thing in this module to reason about from the outside: what reaches
-/// the water is a mirrored image sampled by screen UV through a rippling normal, so an artefact in
-/// it (the plane a yard off, geometry that should have been clipped away, a flipped axis) arrives
-/// as "the water looks wrong" and every one of those causes looks the same. This shows the image
-/// itself. Read once, like every other lever here.
+/// Whether the mirror image is shown unmixed (a debug view); off.
 fn reflect_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_DEBUG").is_some())
+    false
 }
 
 /// `$WOW_REFLECT_PLANE=<height>` — serve this capture plane instead of the one
@@ -642,50 +535,9 @@ fn pinned_plane() -> Option<f32> {
     })
 }
 
-/// `$WOW_REFLECT_SURFACES=1` — one line per water surface per frame: its height, footprint, depth
-/// and the share of the frame it covers, plus a `DROP` line naming why a surface was not scored at
-/// all. The drops are the half worth reading: a body can only lose the capture to arithmetic, and a
-/// surface that never reaches the sum is invisible in the total it is missing from.
-///
-/// Separate from `$WOW_REFLECT_TRACE` because it is a different order of noise — a coastal view
-/// carries seventy surfaces, so this is thousands of lines a second and is meant to be captured
-/// once and read, not watched.
-///
-/// It earns its place by being the only view of *why* a plane won. Twice now the frame-level trace
-/// showed a plane changing with nothing in the world changing, and both times the answer was in
-/// these numbers and nowhere else: first a single point crossing the frame edge (fixed by
-/// a fade), then one chunk's `area / depth²` running away as it neared the eye, and then the whole
-/// body underfoot being dropped as off-screen because the point chosen to stand for it was the one
-/// nearest the eye. All three are gone now that [`Frame::footprint_share`] measures the footprint
-/// instead of sampling it. A plane is chosen from a sum over surfaces, and a sum is not debuggable
-/// from its total.
+/// Whether the plane election logs each surface it weighs; off.
 fn trace_surfaces() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("WOW_REFLECT_SURFACES").is_some())
-}
-
-/// `$WOW_REFLECT_TRACE=1` — one line a frame: the plane, whether the pass ran, and the target's
-/// size. It exists because everything this module decides is invisible in the frame it decides it
-/// (a reflection that is not drawn looks exactly like water that is not reflective), and because
-/// the line rate is also this feature's frame-rate meter — the viewer has no FPS readout.
-fn trace_reflection(
-    data: Res<WaterReflectData>,
-    reflect: Res<WaterReflect>,
-    eye: Query<&GlobalTransform, With<WorldCamera>>,
-    chunks: Query<&WaterChunkInfo>,
-) {
-    if std::env::var_os("WOW_REFLECT_TRACE").is_some() {
-        let at = eye.single().map(|e| bevy_to_wow(e.translation()));
-        info!(
-            "reflect: plane {:.2} strength {:.0} size {}x{} eye {:?} surfaces {}",
-            data.0[0],
-            data.0[1],
-            reflect.size.x,
-            reflect.size.y,
-            at.map(|[x, y, z]| [x.round(), y.round(), z.round()]),
-            chunks.iter().count()
-        );
-    }
+    false
 }
 
 /// An HDR colour target with an alpha channel — the same `Rgba16Float` the world camera renders,
@@ -863,16 +715,6 @@ fn plane_near(
             info!("  surf z {z:.2} area {area:.0} depth {depth:.1} share {share:.4}");
         }
         seen.add(z, share);
-    }
-    if std::env::var_os("WOW_REFLECT_TRACE").is_some() {
-        info!(
-            "plane_near: reach {reach:.0} fov {fov_y:.2} aspect {aspect:.2} \
-             seen {} best {:?} nearest {:?} slots {:?}",
-            seen.used,
-            seen.best(),
-            nearest.map(|(_, z)| z),
-            &seen.slots[..seen.used],
-        );
     }
     let plane = seen.best_sticky(held).or(nearest.map(|(_, z)| z))?;
     // The lowest surface actually on screen, which is what the mirror's clip has to spare — see
@@ -1357,7 +1199,7 @@ fn strength_lane() -> f32 {
 }
 
 pub(super) fn drive_reflection(
-    style: Res<WaterStyle>,
+    (style, dev): (Res<WaterStyle>, Res<crate::dev_state::DebugState>),
     light: Res<crate::lighting::WowLighting>,
     sun_visible: Res<crate::sun::SunVisibility>,
     moon_visible: Res<crate::sun::MoonVisibility>,
@@ -1379,72 +1221,13 @@ pub(super) fn drive_reflection(
     let to_sun = light.celestial_dir.normalize_or_zero();
     data.0[4..8].copy_from_slice(&[to_sun.x, to_sun.y, to_sun.z, sun_visible.0]);
     let to_moon = light.moon_dir_white.normalize_or_zero();
-    // `$WOW_SCENE_SHOW` rides the moon lane's spare headroom, the way `$WOW_WAKE_SHOW` rides the
-    // sim's: the visibility term is a 0..1 fraction, so anything past 1.5 is unambiguous.
-    let moon_w = if std::env::var_os("WOW_SCENE_SHOW").is_some() {
-        2.0
-    } else {
-        moon_visible.0
-    };
-    data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_w]);
-    // The flag row. `x` = the mirror capture's blur radius in capture texels (`$WOW_REFLECT_BLUR`).
-    // It held `$WOW_NO_SSR` until the march was gated off, and the shader never read it even then —
-    // the gate it actually reads is `z`. The row is four lanes and the buffer is sized to it, so a
-    // dead lane is the cheapest place to put the blur.
-    // `y` = `$WOW_SSR_SHOW`, which paints the march's confidence instead of the water.
-    // A small enum rather than a flag: 1 the march's confidence, 2 its RAW colour with nothing
-    // done to it, 3 that colour scaled by confidence — what actually reaches the composite, 5 the hierarchical depth
-    // itself, 6 how each traversal ended. Bare
-    // presence still means 1, so every script that set it before keeps working.
-    let ssr_show = std::env::var("WOW_SSR_SHOW")
-        .ok()
-        .map(|v| v.parse::<f32>().unwrap_or(1.0).clamp(0.0, 8.0))
-        .unwrap_or(0.0);
-    // `z` = **the march's own strength, deliberately not the mirror's.** It used to have none: the
-    // march was gated on, and scaled by, `params.y`, which is the MIRROR's strength — so every path
-    // that stood the mirror down (no water within [`REFLECT_RADIUS`], the eye under the surface, no
-    // plane elected, `$WOW_NO_REFLECT`) took the screen-space tier with it. A tier that only runs
-    // when the tier it is meant to cover for is already running cannot be the general answer, and
-    // the composition below has it taking precedence, which made the coupling a plain contradiction.
-    //
-    // What it legitimately depends on is the look and its own kill switch, and that is all. The
-    // shader adds the two conditions that are genuinely per-fragment — a depth prepass to march
-    // against, and an eye above the surface.
-    //
-    // On [`WaterStyle::StylisedSsr`] the march is not a knob at all: it is the ONLY reflection that
-    // lane has, so `$WOW_SSR` does not gate it and cannot turn it off. Choosing that lane IS asking
-    // for the march. `$WOW_SSR=1` keeps its old meaning of adding the march on top of the full
-    // stylised lane's capture.
-    let ssr_on = f32::from(match *style {
-        WaterStyle::Reference => false,
-        WaterStyle::Stylised => ssr_enabled(),
-        // The SSR lane marches unconditionally: it is the only reflection that lane has, so a kill
-        // switch there would leave nothing but the sky mix.
-        WaterStyle::StylisedSsr => true,
-        // The PROBE lane has a second tier to fall back on, so it honours the switch — and that is
-        // worth having for more than symmetry. With the march on, most of what the water shows is
-        // the march, and the probe only fills the gaps it leaves; `$WOW_SSR=0` here is the only way
-        // to see what the probe alone is contributing, which is the difference between "the probe
-        // does nothing" and "the probe agrees with the march at this camera".
-        WaterStyle::StylisedProbe => ssr_enabled(),
-        // The HYBRID lane marches unconditionally, for the same reason the SSR lane does: the march
-        // is not an addition here, it is the tier that carries the near field. Turning it off would
-        // leave a deliberately blurred probe holding the whole reflection on its own, which is not
-        // a configuration this lane is ever meant to be in — `$WOW_WATER_STYLE=3` is how to see the
-        // probe alone.
-        WaterStyle::StylisedSsrProbe => true,
-    });
-    // `w` = `$WOW_REFLECT_LAYER=1`, which restores the composite the tiers used to have, where each
-    // of them mixed OVER a water that had already had its full Fresnel share of sky mixed in. That
-    // layering is what made a river read as unreflective: the sky mix and the tier mix carry the
-    // same Fresnel weight `s`, so a tier at full coverage only ever displaced `s` of the sky and
-    // left `s(1 - s)` of it standing — bright sky painted across a reflection of a dark valley,
-    // holding the tier to about half the contrast it should have had. It costs nothing at a coast,
-    // where the tier is *looking at* the sky and the two agree; it is most of the reflection on a
-    // river in a gorge, where they do not. Kept as a knob because it is the image every capture
-    // before this was graded against.
-    let layer = f32::from(std::env::var("WOW_REFLECT_LAYER").as_deref() == Ok("1"));
-    data.0[24..28].copy_from_slice(&[reflect_blur(), ssr_show, ssr_on, layer]);
+    data.0[20..24].copy_from_slice(&[to_moon.x, to_moon.y, to_moon.z, moon_visible.0]);
+    // The flag row: `x` the mirror capture's blur radius in capture texels, `y` a debug view of the
+    // march (off), `z` the march's strength, `w` the old layered composite (off).
+    // `z` = the march's own strength: the debug panel's "screen-space reflection", off by
+    // default, on Improved Water only.
+    let ssr_on = f32::from(style.is_stylised() && dev.water.ssr);
+    data.0[24..28].copy_from_slice(&[reflect_blur(), 0.0, ssr_on, 0.0]);
     // The probe's own two rows (`liquid::probe`) — centre + proxy radius, then strength, the two
     // falloff reaches and its debug switch. Written here rather than by the probe itself because
     // this buffer has ONE writer; a second system reaching into it is how two tiers end up
@@ -1457,7 +1240,7 @@ pub(super) fn drive_reflection(
     // x = how much ripple the CUBE lookup sees; the rest of the row is spare.
     data.0[44..48].copy_from_slice(&[
         super::probe::probe_normal(),
-        // y = which slot the lat-long debug unwraps — `$WOW_PROBE_SLOT`.
+        // y = which slot the lat-long debug unwraps.
         super::probe::probe_debug_slot(),
         // z = use the cube's stored distances rather than the analytic proxy; w = its step count.
         super::probe::probe_depth_proxy(),
@@ -1465,12 +1248,7 @@ pub(super) fn drive_reflection(
     ]);
     // One slot's three rows per probe, from 48 on — see [`WaterReflectData`].
     data.0[PROBE_LANES].copy_from_slice(&super::probe::probe_slot_lanes(probe.as_deref()));
-    // `$WOW_NO_SKY_REFL=1` blacks out the sky gradient every tier falls back on, so what is left on
-    // the water is only what a tier actually found — a miss reads black instead of as a plausible
-    // sky. A test lever: these two lanes feed `sky_reflection` and nothing else. The march's own
-    // SKY hits are untouched, because those read the real dome from the scene snapshot.
-    // The dome's own rows, for the march's sky hits — deliberately NOT subject to
-    // `$WOW_NO_SKY_REFL` below: a sky hit is something the march found, not the fallback.
+    // The march's switches; the dome's rows below are for its sky hits.
     data.0[MARCH_LANES].copy_from_slice(&[
         f32::from(pass_behind()),
         ripple_origin(),
@@ -1484,17 +1262,10 @@ pub(super) fn drive_reflection(
         data.0[DOME_LANES.start + 4 * row..DOME_LANES.start + 4 * row + 4]
             .copy_from_slice(&v.to_array());
     }
-    let (zenith, horizon) = if std::env::var_os("WOW_NO_SKY_REFL").is_some() {
-        ([0.0; 3], [0.0; 3])
-    } else {
-        (light.sky[0], light.sky[4])
-    };
-    // `$WOW_WATER_DEPTH_SHOW` paints the water column instead of the water — see the shader.
-    let show_depth = f32::from(std::env::var_os("WOW_WATER_DEPTH_SHOW").is_some());
-    data.0[8..12].copy_from_slice(&[zenith[0], zenith[1], zenith[2], show_depth]);
-    // `$WOW_WATER_TILT_SHOW` paints the geometric tilt instead of the water — see the shader.
-    let show_tilt = f32::from(std::env::var_os("WOW_WATER_TILT_SHOW").is_some());
-    data.0[12..16].copy_from_slice(&[horizon[0], horizon[1], horizon[2], show_tilt]);
+    // The sky gradient every tier falls back on; `w` lanes are debug views, off.
+    let (zenith, horizon) = (light.sky[0], light.sky[4]);
+    data.0[8..12].copy_from_slice(&[zenith[0], zenith[1], zenith[2], 0.0]);
+    data.0[12..16].copy_from_slice(&[horizon[0], horizon[1], horizon[2], 0.0]);
     let mut first = None;
     let mut second_cam = None;
     for (tf, cam, proj, target, which) in mirror.iter_mut() {
@@ -1517,10 +1288,8 @@ pub(super) fn drive_reflection(
         // The mirror's lanes only — see [`WaterReflectData`].
         data.0[..4].copy_from_slice(&[0.0; 4]);
     };
-    // **[`WaterStyle::StylisedSsr`] leaves by this door**, and that is the whole of what makes it
-    // cheap: `off` writes the mirror's four uniform lanes to zero, which is the same state the
-    // shader already reads as "no capture" (`water_reflect.params.y > 0.0` fails), and it
-    // deactivates the camera so the second view is never queued, never culled and never drawn.
+    // The reference water leaves here: `off` zeroes the mirror's lanes (the shader's "no capture")
+    // and deactivates the camera, so the second view is never queued, culled or drawn.
     if !style.wants_mirror() || no_reflect() {
         off(&mut mirror_cam, &mut data);
         return;
@@ -1593,10 +1362,7 @@ pub(super) fn drive_reflection(
     // The clip: see [`aim_mirror`]. Dropped to the lowest water on screen so a lower body the
     // first mirror serves through reprojection keeps its reflection — unless that body has the
     // second mirror, which serves it exactly, in which case the first clips at its own plane.
-    let drop = std::env::var("WOW_CLIP_DROP")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(MAX_CLIP_DROP);
+    let drop = MAX_CLIP_DROP;
     let clip_at = if second.is_some_and(|z| z < plane) {
         plane
     } else {
@@ -1648,8 +1414,8 @@ pub(super) fn drive_reflection(
     // 1.7 % and costs the judder, so there is no knob here — a choice that cheap is not a choice.
     mirror_cam.is_active = true;
     *held_plane = Some(plane);
-    // `$WOW_MIRROR_SHOW` rides the strength lane's spare headroom, exactly as `$WOW_SCENE_SHOW`
-    // rides the moon's and `$WOW_WAKE_SHOW` the sim's: strength is a 0..1 fraction, so anything past
+    // `$WOW_MIRROR_SHOW` rides the strength lane's spare headroom: strength is a 0..1 fraction, so
+    // anything past
     // 1.5 is unambiguous. It paints the capture the water is about to sample — its colour where the
     // mirror drew something, red where its alpha says it drew nothing — which is the only way to
     // tell "the capture has no sky in it" apart from "the capture has sky and the composite is
@@ -2183,37 +1949,13 @@ mod tests {
         assert!((mf.x - f.x).abs() < 1e-5 && (mf.z - f.z).abs() < 1e-5);
     }
 
-    /// The SSR lane is defined by exactly two answers, and they are opposite to the full stylised
-    /// lane's: the march is armed unconditionally, and the mirror camera is not driven at all.
-    ///
-    /// Worth pinning because the second half is invisible in this file — it is a `!wants_mirror()`
-    /// taking the same early return that `$WOW_NO_REFLECT` takes, so a refactor that folded the two
-    /// stylised lanes back together would cost a millisecond a frame and change no test.
+    /// Improved Water drives the mirrors and the probes; the reference water neither, and the
+    /// checkbox's two values survive the round trip the options page reads them back through.
     #[test]
-    fn the_ssr_lane_marches_and_never_mirrors() {
-        assert!(!WaterStyle::StylisedSsr.wants_mirror());
-        assert!(WaterStyle::Stylised.wants_mirror());
-        assert!(!WaterStyle::Reference.wants_mirror());
-        // Both of benilla's own looks share the surface — the ripple sim, the scene snapshot and
-        // the depth prepass all gate on this and all are needed by the march.
-        assert!(WaterStyle::StylisedSsr.is_stylised());
-        assert!(WaterStyle::Stylised.is_stylised());
-        assert!(!WaterStyle::Reference.is_stylised());
-        // The probe serves the water the mirrors stand down over, and is the probe lanes' tier.
-        assert!(WaterStyle::StylisedProbe.wants_probe());
-        assert!(WaterStyle::Stylised.wants_probe());
-        assert!(!WaterStyle::StylisedSsr.wants_probe());
-        assert!(!WaterStyle::Reference.wants_probe());
-        // ...and it brings no second camera with it, which is the whole point of the lane.
-        assert!(!WaterStyle::StylisedProbe.wants_mirror());
-        assert!(WaterStyle::StylisedProbe.is_stylised());
-        // And the dropdown's values survive the round trip the options page reads them back through.
-        for style in [
-            WaterStyle::Reference,
-            WaterStyle::Stylised,
-            WaterStyle::StylisedSsr,
-            WaterStyle::StylisedProbe,
-        ] {
+    fn improved_water_is_mirrors_and_probes() {
+        assert!(WaterStyle::Stylised.wants_mirror() && WaterStyle::Stylised.wants_probe());
+        assert!(!WaterStyle::Reference.wants_mirror() && !WaterStyle::Reference.wants_probe());
+        for style in [WaterStyle::Reference, WaterStyle::Stylised] {
             let back = WaterStyle::from_cvar(style.cvar().parse::<f32>().unwrap());
             assert_eq!(back, style, "{style:?} did not survive its own CVar string");
         }

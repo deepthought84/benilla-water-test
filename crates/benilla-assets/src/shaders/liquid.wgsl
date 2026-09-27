@@ -57,7 +57,7 @@ const PROBE_SLOT_MAX: i32 = 16;
 
 // The most probes that may be blended into one fragment. Three is the recommendation and four is the
 // ceiling the fixed-size arrays above are built for; the taps actually used come from
-// `$WOW_PROBE_TAPS`. More than this does not make the reflection more correct — averaging cubes
+// More than this does not make the reflection more correct — averaging cubes
 // whose errors point in different directions ghosts rather than converges, which is why Unity caps
 // its own blend at two — it makes the HANDOVER smoother, which is the thing worth buying here.
 const PROBE_TAPS_MAX: i32 = 3;
@@ -73,8 +73,6 @@ const PROBE_TAPS_MAX: i32 = 3;
 // where the ray is behind a tile's nearest surface; see `liquid::hiz` for why it is a separate image.
 @group(#{MATERIAL_BIND_GROUP}) @binding(117) var hiz_far_tex: texture_2d<f32>;
 
-// `$WOW_SSR_PIP`'s image — see `liquid::ssr_pip`. 1x1 while the lever is off.
-@group(#{MATERIAL_BIND_GROUP}) @binding(116) var ssr_pip_tex: texture_storage_2d<rgba16float, write>;
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var reflection_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var reflection_samp: sampler;
@@ -215,13 +213,13 @@ struct WaterReflect {
     // through. Water reflects moonlight as readily as sunlight and the first pass had it reflecting
     // none.
     moon: vec4<f32>,
-    /// `x` = the mirror capture's blur radius in capture texels (`$WOW_REFLECT_BLUR`, 0 = off —
+    /// `x` = the mirror capture's blur radius in capture texels (0 = off —
     /// see [`sample_mirror`]); `y` = paint the march's confidence instead of the water
-    /// (`$WOW_SSR_SHOW`); `z` = the march's OWN strength — 0 unless `$WOW_SSR=1` asks for it, and
+    /// (off); `z` = the march's OWN strength — 0 unless the debug toggle asks for it, and
     /// pointedly independent of `params.y`, which is the mirror's; `w` = composite the tiers the
-    /// old layered way (`$WOW_REFLECT_LAYER`).
+    /// old layered way (off).
     ///
-    /// `x` carried `$WOW_NO_SSR` until the march was gated off, and was dead weight even then: the
+    /// `x` once carried a march kill switch and was dead weight even then: the
     /// gate the shader actually reads is `z`. The row is full at four lanes and the params buffer
     /// is sized to it, so a dead lane is the cheapest place for the blur to live.
     flags: vec4<f32>,
@@ -230,12 +228,12 @@ struct WaterReflect {
     probe_at: vec4<f32>,
     // x = strength (0 until every face has been captured, and on the reference lane); y = the
     // horizontal reach its weight fades out over; z = the VERTICAL reach, which is much tighter and
-    // is what stops a stream sixty yards uphill reading a lake's cube; w = `$WOW_PROBE_SHOW`.
+    // is what stops a stream sixty yards uphill reading a lake's cube; w = the probe debug view.
     probe_cfg: vec4<f32>,
     // The projection box in world yards, `w` unused on both. Its walls are the water body's own
     // footprint and its ceiling is authored — see `liquid::probe`'s `PROBE_BOX_UP`.
     // `probe_box_min.w` is the surface ripple scale. `probe_box_max.x` is the probe tier's Fresnel
-    // boost (`$WOW_PROBE_STRENGTH`); the proxy boxes themselves are per-slot and live in `probes`.
+    // boost; the proxy boxes themselves are per-slot and live in `probes`.
     probe_box_min: vec4<f32>,
     probe_box_max: vec4<f32>,
     // x = how much of the water's ripple the CUBE lookup sees; y/z/w spare.
@@ -247,10 +245,10 @@ struct WaterReflect {
     // The sky dome's own colours (`sky::dome_uniforms`), for the march's sky hits: where the depth
     // it walks holds nothing, the answer is the sky along the reflected ray by the dome's own law —
     // never the colour buffer, which may hold something drawn there that the depth does not.
-    // `warp.z` = `$WOW_SSR_SKY_READ=snapshot`, the A/B lever back to reading the colour buffer.
+    // `warp.z` = read the colour buffer for the march's sky hits instead of the dome law (off).
     dome: DomeColors,
     // The march's own switches. `x` = rays may pass BEHIND a tile once they are behind the
-    // thickness slab of its farthest surface (`$WOW_SSR_PASS_BEHIND=0` turns it off — see
+    // thickness slab of its farthest surface (see
     // [`ssr_trace`]); `y` = the ripple's shift of the ray origin; `z` = the probe's softening; `w` = 1
     // when the probes stand on fixed spots and each fragment reads its own region's (the planar lane).
     march: vec4<f32>,
@@ -487,7 +485,7 @@ const PLANE_FADE: f32 = 2.5;
 /// one 33.33 yd chunk, measured), which the old band trusted **completely** — at a 10.4 deg ray
 /// error.
 ///
-/// Screen-space reflection is exact at any orientation and, measured with `$WOW_SSR_SHOW`, is
+/// Screen-space reflection is exact at any orientation and, measured, is
 /// confident over nearly all of that same stream. So the capture no longer has to cover for it, and
 /// can be honest about where a horizontal mirror stops describing the surface: 5.22 deg now keeps
 /// about 0.71 of it and the rest comes from the tiers that are right.
@@ -613,7 +611,7 @@ fn plane_trust(err: f32, trusted: f32, tilt: f32) -> f32 {
 /// see its use.
 const REFLECT_MAX: f32 = 0.44;
 
-/// The most of the pixel the CUBE PROBE tier may take, however far `$WOW_PROBE_STRENGTH` is pushed.
+/// The most of the pixel the CUBE PROBE tier may take, however far its strength is pushed.
 /// Above [`REFLECT_MAX`] because this knob exists to make the tier legible, but short of 1.0 so the
 /// surface keeps some of its own body and does not read as a mirror.
 const PROBE_REFLECT_CEIL: f32 = 0.85;
@@ -878,7 +876,7 @@ const SSR_READ_BLUR: f32 = 2.0;
 /// A wave displaces the water by a distance, so this is in yards and needs no conversion. Raising
 /// it deepens the wobble without any risk of the repeats coming back — the failure mode it
 /// replaces is not on this axis at all.
-// Default 3, carried in `water_reflect.march.y` (`$WOW_RIPPLE_ORIGIN`).
+// Default 3, carried in `water_reflect.march.y` 
 const RIPPLE_ORIGIN_YD: f32 = 3.0;
 
 
@@ -1024,7 +1022,7 @@ fn probe_dir(p: vec3<f32>, d: vec3<f32>, centre: vec3<f32>, lo: vec3<f32>, hi: v
 }
 
 /// The same correction against a **sphere** — the environment painted on a shell at one distance,
-/// with the water showing that shell's inside. `$WOW_PROBE_SPHERE` picks the radius.
+/// with the water showing that shell's inside.
 ///
 /// Where the box assumes flat walls at a different distance per bearing, this assumes one distance
 /// in every direction, which is the better fit when a body of water is ringed at a roughly even
@@ -1186,7 +1184,7 @@ fn probe_lod(d_probe: f32, d_geom: f32) -> f32 {
 
 fn sample_probe(sl: ProbeSlot, idx: i32, p: vec3<f32>, r: vec3<f32>, steps: i32) -> vec3<f32> {
     // `probe_extra.z` picks the proxy: the depth correction by default, the old analytic shapes
-    // under `$WOW_PROBE_PROXY` so the two can be compared in one build rather than across two.
+    // so the two can be compared in one build rather than across two.
     var dir: vec3<f32>;
     if (water_reflect.probe_extra.z > 1.5) {
         dir = probe_dir_march(p, r, sl.at.xyz, idx);
@@ -1205,7 +1203,7 @@ fn sample_probe(sl: ProbeSlot, idx: i32, p: vec3<f32>, r: vec3<f32>, steps: i32)
     let d_geom = textureSampleLevel(probe_tex, probe_samp, dir, idx, 0.0).a;
     let lod = probe_lod(distance(p, sl.at.xyz), d_geom);
     let centre = textureSampleLevel(probe_tex, probe_samp, dir, idx, lod).rgb;
-    // A small softening (`march.z`, in cube texels, `$WOW_PROBE_SOFT`): four more reads a fixed
+    // A small softening (`march.z`, in cube texels): four more reads a fixed
     // angle around the direction, averaged with it, so the capture's texels do not read as pixels
     // on the water.
     let spread = water_reflect.march.z * water_reflect.probe_box_min.y;
@@ -1375,13 +1373,6 @@ fn behind_slab(ray: f32, depth: f32, near: f32) -> bool {
     return ray * (near + SSR_THICKNESS * depth) < near * depth;
 }
 
-// What `$WOW_SSR_SHOW=6`/`=7` paint: how the traversal ended (0 never traced, 1 hit, 2 sky, 3 off
-// the frame, 5 budget, 6 rejected by thickness) and how many of its skips failed to leave a cell.
-var<private> hiz_exit: i32 = 0;
-var<private> hiz_stalls: i32 = 0;
-// What `$WOW_SSR_SHOW=8` paints: how far behind the surface an accepted hit landed, in yards.
-var<private> hiz_gap: f32 = 0.0;
-
 /// Project a world point to the traversal's space: `xy` the screen UV, `z` reverse-Z device depth.
 fn hiz_screen(p: vec3<f32>) -> vec3<f32> {
     let ndc = position_world_to_ndc(p);
@@ -1426,7 +1417,6 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
     var out: SsrHit;
     out.rgb = vec3<f32>(0.0);
     out.conf = 0.0;
-    hiz_exit = 5;
 
     // The direction as the difference of two projected points. The second point has to be in
     // front of the eye for the difference to mean anything; `clip.w` is view depth, so a ray
@@ -1468,16 +1458,13 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
     // water's pass at Mirror Lake against 0.09 for the pass-behind work itself.
     let pass_behind = water_reflect.march.x > 0.5;
     let near_plane = perspective_camera_near();
-    let show_stalls = water_reflect.flags.y > 6.5;
 
     var i = 0;
     for (; i < HIZ_MAX_STEPS && level >= 0; i = i + 1) {
         if (any(p.xy < vec2<f32>(0.0)) || any(p.xy >= vec2<f32>(1.0))) {
-            hiz_exit = 3;
             return out; // off the frame: the screen cannot say
         }
         if (p.z <= 0.0) {
-            hiz_exit = 3;
             return out; // past the far plane
         }
         let res = vec2<f32>(textureDimensions(hiz_tex, level));
@@ -1508,7 +1495,6 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
         // The edge fade stays keyed to where the ray left the frame's geometry, so the hand-over
         // to the tier underneath at the screen border is exactly what it was.
         if (surface <= 0.0) {
-            hiz_exit = 2;
             if (water_reflect.dome.warp.z > 0.5) {
                 return ssr_read(p.xy);
             }
@@ -1582,12 +1568,6 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
         // and its cost is instructions per step — written as two branches each recomputing the
         // position, the compiler ran both and merged them with selects.
         let t_next = select(select(t, t_wall, behind), t_min, in_front);
-        // The `$WOW_SSR_SHOW=7` stall count, only when that view is on: a debug check left on the
-        // hot path is a floor and a compare on every skip of every ray in production.
-        if (show_stalls && skipped && in_front
-            && all(floor((o.xy + t_next * d.xy) * res) == cell)) {
-            hiz_stalls = hiz_stalls + 1;
-        }
         t = t_next;
         p = o + t * d;
         level = select(level - 1, min(level + 1, top), skipped);
@@ -1599,7 +1579,6 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
     // FFX_SSSR_ValidateHit, the parts that apply. Off the frame is no hit; neither is a ray that
     // never really left its own texel.
     if (any(p.xy < vec2<f32>(0.0)) || any(p.xy >= vec2<f32>(1.0))) {
-        hiz_exit = 3;
         return out;
     }
     // Against the texel's NEAREST surface when rays cannot pass behind — the test as it was. When
@@ -1613,12 +1592,9 @@ fn ssr_trace(origin: vec3<f32>, dir: vec3<f32>) -> SsrHit {
         let far0 = textureLoad(hiz_far_tex, texel0, 0).r;
         gap = depth_ndc_to_view_z(far0) - depth_ndc_to_view_z(p.z);
     }
-    hiz_gap = abs(gap);
     if (abs(gap) > SSR_THICKNESS) {
-        hiz_exit = 6;
         return out;
     }
-    hiz_exit = 1;
     return ssr_read(p.xy);
 }
 #endif
@@ -1805,7 +1781,6 @@ fn stylised_water(
     // Distance to the nearest edge of the window, in window fractions — the fade the far side of
     // [`WAKE_EDGE_FADE`] describes.
     let sim_edge = min(min(sim_uv.x, 1.0 - sim_uv.x), min(sim_uv.y, 1.0 - sim_uv.y));
-    // Clamped, because the lane doubles as the `$WOW_WAKE_SHOW` debug switch below.
     let sim_w = min(water_reflect.sim.w, 1.0)
         * inside
         * smoothstep(0.0, WAKE_EDGE_FADE, sim_edge);
@@ -1813,11 +1788,6 @@ fn stylised_water(
     // The wave's own height, signed — how much water the disturbance has put under this pixel.
     let wake_height = (sim_tex.b * 2.0 - 1.0) * sim_w;
     let wake_foam = saturate((length(wake_slope) - WAKE_FOAM_FLOOR) * WAKE_FOAM_GAIN);
-    // `$WOW_WAKE_SHOW` — the field, painted flat, with the window's own extent as the black border.
-    // Nothing to read into: either there are waves on the screen or the simulation is not arriving.
-    if (water_reflect.sim.w > 1.5) {
-        return vec4<f32>(sim_tex.rgb * inside, 1.0);
-    }
 
     // The map holds slope, so the normal is rebuilt with Y up — no tangent frame, because a liquid
     // surface is a flat axis-aligned plane that never rotates.
@@ -1833,7 +1803,7 @@ fn stylised_water(
     // also break the highlight up, into hard little chips — which is exactly the film-on-water read
     // that complaint was about. Breaking it with the SURFACE instead keeps the lobe broad and the
     // water rough, which is the same thing real water does.
-    // `probe_box_min.w` scales the whole ripple — `$WOW_WATER_RIPPLE`, 1 by default and 0 for a
+    // `probe_box_min.w` scales the whole ripple — 1, and 0 for a
     // dead-flat surface. Flat water is the only way to compare two REFLECTIONS against each other:
     // with waves in, the planar tier's ripple is a small bounded offset into an already-correct
     // image while the cube's goes through `reflect()`, which at a grazing eye swings across a huge
@@ -1912,7 +1882,6 @@ fn stylised_water(
     // sky and leaves `s(1 - s)` standing — so a reflection of a dark gorge arrived with a wash of
     // bright sky still painted over it, the body was robbed to pay for it, and a river read as flat
     // while a coast, where the tier is looking at the sky anyway, read as correct.
-    // `$WOW_REFLECT_LAYER=1` puts the old composite back.
     let fres = mix(0.02, 0.45, fresnel);
     // What is reflected. The sky is the FLOOR, not a layer: it is the answer for a direction no
     // tier has a better one for, and each tier below replaces it over the coverage it actually has.
@@ -1946,7 +1915,7 @@ fn stylised_water(
     // march — five cube reads at the default march depth. That is why the answer to "how many
     // probes blend" is "look at all of them, read the best few": `PROBE_TAPS + 1` are tracked, the
     // extra one never sampled, existing only to supply the weight every tap is measured above.
-    // `$WOW_PROBE_FORCE` pins every fragment to one slot, so two renders can be differenced to
+    // `probe_box_min.x` pins every fragment to one slot, so two renders can be differenced to
     // measure what the blend between those probes actually has to hide. See `probe::probe_force`.
     let forced = i32(water_reflect.probe_box_min.x);
     let taps = select(
@@ -2079,7 +2048,7 @@ fn stylised_water(
         let dir = vec3<f32>(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
         // Slot 0's cube — the debug unwraps ONE probe, because a lat-long of "whichever probe is
         // nearest this fragment" would be a mosaic of several and unreadable as a check on any of
-        // them. `$WOW_PROBE_SLOT` picks which.
+        // them. `probe_extra.y` picks which.
         let texel = textureSampleLevel(
             probe_tex,
             probe_samp,
@@ -2087,24 +2056,6 @@ fn stylised_water(
             i32(water_reflect.probe_extra.y),
             0.0,
         );
-        // `$WOW_PROBE_DIST` — the same unwrap, but painting the DISTANCE the capture stored in
-        // alpha rather than the colour. This is the direct check on the cube's geometry: a cube that
-        // holds the right picture and the wrong distances produces a reflection that is plausible
-        // and misplaced, which is the failure this tier keeps rediscovering. Near is red, far is
-        // blue, and white is "nothing this way" — sky, or past the far clip.
-        if (water_reflect.probe_cfg.w > 3.5) {
-            if (texel.a > 9000.0) {
-                return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-            }
-            // 150 yards over the ramp: past that the projection has nothing useful to say anyway.
-            let t = clamp(texel.a / 150.0, 0.0, 1.0);
-            return vec4<f32>(
-                clamp(1.0 - t * 2.0, 0.0, 1.0),
-                1.0 - abs(t - 0.5) * 2.0,
-                clamp(t * 2.0 - 1.0, 0.0, 1.0),
-                1.0,
-            );
-        }
         return vec4<f32>(texel.rgb, 1.0);
     }
 
@@ -2146,121 +2097,7 @@ fn stylised_water(
             reflect(-to_view, flat_n),
         );
     }
-    // `$WOW_SSR_PIP` — the march's raw colour, stored for the inset (`liquid::ssr_pip`). Magenta
-    // where this look runs no march, as `$WOW_SSR_SHOW=2` paints it. Bounds-gated, and the image is
-    // 1x1 while the lever is off, so off it touches one texel.
-    {
-        let pip_dims = textureDimensions(ssr_pip_tex);
-        // By UV, not by `frag_coord`: at a render scale above 1 the fragment grid is the scaled
-        // target, not the window the image is sized from.
-        let pip_px = vec2<u32>(frag_coord_to_uv(frag_coord) * vec2<f32>(pip_dims));
-        // **Its own depth test.** A fragment that writes storage loses early depth testing, so
-        // water hidden under a beach still runs this far and would store an answer for a pixel
-        // that shows sand. Reverse-Z: in front means a LARGER depth than the opaque world's.
-        let pip_visible = position_world_to_ndc(world_pos).z
-            >= prepass_depth(vec4<f32>(frag_coord, 0.0, 0.0), sample_index);
-        if (pip_dims.x > 1u && all(pip_px < pip_dims) && pip_visible) {
-            let raw = select(vec3<f32>(1.0, 0.0, 1.0), ssr.rgb, water_reflect.flags.z > 0.0);
-            textureStore(ssr_pip_tex, pip_px, vec4<f32>(raw, 1.0));
-        }
-    }
 #endif
-
-    // `$WOW_SSR_SHOW` — green where the march found a hit and how much it is believed, red where
-    // it found nothing. A reflection that is merely faint and one that was never traced look
-    // identical in the final image, which is the confusion this ends.
-#ifdef DEPTH_PREPASS
-    // `$WOW_SSR_SHOW=5` — the hierarchical depth itself, at the fragment's own pixel, so a pyramid
-    // that is empty or mis-seeded is visible as a flat colour instead of being inferred from a
-    // reflection that merely went missing.
-    if (water_reflect.flags.y > 4.5 && water_reflect.flags.y < 5.5) {
-        let uv_dbg = frag_coord_to_uv(frag_coord);
-        let d0 = textureLoad(hiz_tex, vec2<i32>(uv_dbg * vec2<f32>(textureDimensions(hiz_tex, 0))), 0).r;
-        let d4 = textureLoad(hiz_tex, vec2<i32>(uv_dbg * vec2<f32>(textureDimensions(hiz_tex, 4))), 4).r;
-        let lv = f32(textureNumLevels(hiz_tex)) / 16.0;
-        return vec4<f32>(d0 * 20.0, d4 * 20.0, lv, 1.0);
-    }
-    // `$WOW_SSR_SHOW=6` — **how each traversal ended**, one pure hue per exit so a script can
-    // count them through the tonemapper: green a hit, cyan a hit rejected by [`SSR_THICKNESS`], blue
-    // sky, yellow off the frame, red the step budget, white never traced. `=7` paints red wherever a
-    // skip failed to carry the ray out of its cell — which is how the budget exhaustion in the first
-    // version of the traversal was found to be a stall rather than a budget too small.
-    // `$WOW_SSR_SHOW=8` — **how far behind the surface each accepted hit was**. The traversal
-    // takes a depth texel as infinitely thick and accepts a ray up to [`SSR_THICKNESS`] behind it,
-    // so a hit is either a genuine crossing (gap near zero, green) or a ray that passed behind
-    // something and was accepted anyway (yellow to red toward the full six yards). Blue is a sky
-    // hit, black a miss; a REJECTED hit is cyan within twice the thickness, magenta within four
-    // times, white beyond.
-    if (water_reflect.flags.y > 7.5) {
-        if (hiz_exit == 1) {
-            let g = saturate(hiz_gap / SSR_THICKNESS);
-            return vec4<f32>(saturate(2.0 * g), saturate(2.0 - 2.0 * g), 0.0, 1.0);
-        }
-        if (hiz_exit == 2) {
-            return vec4<f32>(0.0, 0.0, 1.0, 1.0);
-        }
-        // Rejected hits, binned by how far behind the surface they were — the difference between a
-        // ray that only just missed the tolerance and one that walked deep behind what the depth
-        // buffer can describe: cyan up to twice the thickness, magenta up to four times, white past.
-        if (hiz_exit == 6) {
-            if (hiz_gap < 2.0 * SSR_THICKNESS) {
-                return vec4<f32>(0.0, 1.0, 1.0, 1.0);
-            }
-            if (hiz_gap < 4.0 * SSR_THICKNESS) {
-                return vec4<f32>(1.0, 0.0, 1.0, 1.0);
-            }
-            return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-        }
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    }
-    if (water_reflect.flags.y > 5.5) {
-        if (water_reflect.flags.y > 6.5) {
-            return select(vec4<f32>(0.0, 1.0, 0.0, 1.0), vec4<f32>(1.0, 0.0, 0.0, 1.0), hiz_stalls > 0);
-        }
-        var col = vec3<f32>(1.0);
-        switch hiz_exit {
-            case 1: { col = vec3<f32>(0.0, 1.0, 0.0); }
-            case 2: { col = vec3<f32>(0.0, 0.0, 1.0); }
-            case 3: { col = vec3<f32>(1.0, 1.0, 0.0); }
-            case 5: { col = vec3<f32>(1.0, 0.0, 0.0); }
-            case 6: { col = vec3<f32>(0.0, 1.0, 1.0); }
-            default: {}
-        }
-        return vec4<f32>(col, 1.0);
-    }
-#endif
-    if (water_reflect.flags.y > 0.5 && water_reflect.flags.y < 1.5) {
-        return vec4<f32>(1.0 - ssr.conf, ssr.conf, 0.0, 1.0);
-    }
-    // `$WOW_SSR_SHOW=2` — **the march's raw output, with nothing done to it.** No Fresnel, no sky
-    // mix, no water tint, no depth fade, no compositing against the tiers below: the colour
-    // `ssr_trace` came back with, painted flat.
-    //
-    // Everything downstream of the march can make a correct reflection look wrong and a wrong one
-    // look plausible — the Fresnel weight alone takes it from 2% to 45% of the surface depending on
-    // the angle — so the only way to judge what the march itself is doing is to see it before any
-    // of that runs. Black here is a MISS, not a dark reflection, and those are the same pixel in
-    // the final image.
-    if (water_reflect.flags.y > 1.5 && water_reflect.flags.y < 2.5) {
-        // **Say so when the march is not running at all.** `flags.z` is the march's own strength
-        // and it is zero on the looks that do not use it — the planar lane, and the probe lane
-        // unless `$WOW_SSR=1` asks for the hybrid. Painting the honest answer there is a flat
-        // black screen, which reads as "the march is producing nothing" when it means "there is no
-        // march". That cost a round trip, so it is magenta instead: no reflection is that colour.
-        if (water_reflect.flags.z <= 0.0) {
-            return vec4<f32>(1.0, 0.0, 1.0, 1.0);
-        }
-        return vec4<f32>(ssr.rgb, 1.0);
-    }
-    // `$WOW_SSR_SHOW=3` — the same, scaled by confidence: what actually reaches the composite. The
-    // difference between this and 2 is entirely the edge fade and the misses, so a reflection that
-    // looks right in 2 and wrong in 3 is being thrown away rather than traced badly.
-    if (water_reflect.flags.y > 2.5 && water_reflect.flags.y < 3.5) {
-        if (water_reflect.flags.z <= 0.0) {
-            return vec4<f32>(1.0, 0.0, 1.0, 1.0);
-        }
-        return vec4<f32>(ssr.rgb * ssr.conf, 1.0);
-    }
 
     // ---- the probe's contribution ------------------------------------------------------------
     //
@@ -2337,14 +2174,6 @@ fn stylised_water(
                 mix(0.02, REFLECT_MAX, fresnel) * water_reflect.flags.z * ssr.conf,
             );
         }
-    }
-    // `$WOW_REFL_SHOW` — every tier summed, at full strength, with the body and the Fresnel weight
-    // both out of the way. Placed HERE, after the march has had the last word, so it shows what the
-    // water is actually reflecting rather than what any one tier contributed. See `liquid::probe`'s
-    // `refl_show` for why looking at a reflection through a twentieth of its own strength is a good
-    // way to misdiagnose a tier that is working.
-    if (water_reflect.probe_cfg.w > 1.5) {
-        return vec4<f32>(refl, 1.0);
     }
 
     // **The probe lane draws its reflection and nothing else** (`probe_at.w`). Not a debug switch:
@@ -2443,33 +2272,6 @@ fn stylised_water(
     // interpolating across that flip would collapse the offset to nothing and draw a foam line down
     // the middle of a channel. Inside the near field the two agree to within the mesh's own error;
     // where they do not, the scalar is the conservative answer and is taken.
-    // `$WOW_WATER_DEPTH_SHOW` — the water column in yards, as greyscale (black 0, white 8).
-    //
-    // Kept, not scaffolding. Everything below now depends on a quantity that is invisible in the
-    // final image and wrong in ways that look like art problems: too little and the water is flat,
-    // too much and the shallows vanish. Being able to look at the number directly is what separated
-    // "the soft edge is too wide" from "the absorption is wrong" the first time they were confused
-    // for each other.
-    if (water_reflect.sky_zenith.w > 0.5) {
-        let t = max(thickness, 0.0) / 8.0;
-        return vec4<f32>(vec3<f32>(saturate(t)), 1.0);
-    }
-    // `$WOW_SCENE_SHOW` — paint the scene snapshot straight onto the water at this fragment's own
-    // screen position. If the copy is landing, the water becomes a window showing the world behind
-    // the camera's own view of it, seamlessly continuous with the frame around it; if the node
-    // never ran, it is black. Nothing downstream can distinguish those two, which is why this
-    // exists before the march that will depend on it.
-    if (water_reflect.moon.w > 1.5) {
-        let suv = frag_coord_to_uv(frag_coord);
-        return vec4<f32>(textureSample(scene_tex, scene_samp, suv).rgb, 1.0);
-    }
-    // `$WOW_WATER_TILT_SHOW` — the geometric tilt this fragment thinks it has, as greyscale, black
-    // flat and white at [`SLOPE_LIMIT`]. The trust term reads this number and nothing in the final
-    // image shows it directly, so a tilt that is wrong looks exactly like a reflection that is
-    // wrong — which is the confusion this exists to end.
-    if (water_reflect.sky_horizon.w > 0.5) {
-        return vec4<f32>(vec3<f32>(saturate(tilt / SLOPE_LIMIT)), 1.0);
-    }
     let exact = length(shore_offset);
     var to_shore = shore;
     if (shore < SHORE_EXACT_REACH && abs(exact - shore) < SHORE_EXACT_TRUST) {
