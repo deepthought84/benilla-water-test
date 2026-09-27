@@ -1,4 +1,4 @@
-# Water Shader
+# Benilla Water Shader
 
 A fork of [benilla](https://github.com/samwhosung/benilla), the World of Warcraft 1.12.1 client
 written from scratch in Rust and Bevy, that adds **Improved Water**: an optional water look for the
