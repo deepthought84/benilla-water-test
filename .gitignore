@@ -47,3 +47,6 @@ ideas.md
 
 # The run log.
 /benilla.log
+
+# The local session handoff.
+/summary.md
