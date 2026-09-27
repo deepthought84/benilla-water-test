@@ -1,8 +1,11 @@
-# benilla · Improved Water
+# Water Shader
 
 A fork of [benilla](https://github.com/samwhosung/benilla), the World of Warcraft 1.12.1 client
 written from scratch in Rust and Bevy, that adds **Improved Water**: an optional water look for the
 client's lakes, rivers, falls and sea.
+
+It aims to give the world reflective water **without ray tracing**: every reflection is rasterized,
+from planar mirrors and cube probes, so it needs no ray-tracing hardware.
 
 ## Improved Water
 
